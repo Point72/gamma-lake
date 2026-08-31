@@ -47,6 +47,8 @@ dependencies = [
 
 [project.optional-dependencies]
 develop = [
+    "asv",
+    "boto3",
     "build",
     "bump-my-version",
     "check-dist",
