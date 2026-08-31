@@ -48,7 +48,10 @@ roles. The benchmark harness does not fetch or configure credentials.
 
 - `GammaLakeWriteSuite`: six sequential merge writes covering existing and new
   symbols, future dates, and new feature groups.
+- `GammaLakeOverlapWriteSuite`: eight sequential writes covering full and
+  partial temporal overlaps, new feature columns, and full re-merges.
 - `GammaLakeReadSuite`: 1, 7, and 30 day windows across 1 or 3 feature groups.
 
-The write scenarios use 3 features, 5 to 20 symbols, and 10-day windows. The
-read suite uses 200 symbols, 50 features per group, and 30 days.
+The sequential write scenarios use 3 features, 5 to 20 symbols, and 10-day
+windows. The overlap and read suites use 200 symbols, 50 features per group,
+and 30-day base windows.
