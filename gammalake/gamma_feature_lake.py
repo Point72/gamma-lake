@@ -1016,6 +1016,71 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     @ensure_deltalake_is_initialized
     @trace(always=True)
+    def consolidate_feature_groups(self, features: list[str]) -> str | None:
+        """Merge the current FeatureGroup tables for the given features into one table.
+
+        Only ``"feature"`` and ``"target"`` signal types may be consolidated.
+
+        Args:
+            features: Feature names to consolidate. They should share an update cadence.
+
+        Returns:
+            The new table address, or ``None`` if the features are already consolidated.
+
+        Raises:
+            MissingFeaturesException: If any requested feature does not exist.
+            ValueError: If any requested feature has a non-consolidatable signal type.
+        """
+        candidates = (
+            self.feature_metadata_frame()
+            .collect()
+            .sort("version", descending=True)
+            .group_by("feature_name")
+            .agg(pl.all().first())
+            .filter(pl.col("feature_name").is_in(features))
+        )
+        if missing := set(features) - set(candidates["feature_name"]):
+            raise MissingFeaturesException(f"Features not found in lake: {missing}")
+        if (bad := candidates.filter(~pl.col("signal_type").is_in({"feature", "target"}))).height:
+            raise ValueError(f"Non-consolidatable signal types: {list(zip(bad['feature_name'], bad['signal_type']))}")
+        if candidates["table_addr"].n_unique() <= 1:
+            return None
+
+        new_addr = self.gen_table_addr()
+        writer_options = {"writer_properties": WriterProperties(compression=self.compression)}
+        merged_last_updated = (
+            self.table_metadata_frame()
+            .collect()
+            .sort("update_timestamp", descending=True)
+            .group_by("table_addr")
+            .agg(pl.col("last_updated").first())
+            .filter(pl.col("table_addr").is_in(candidates["table_addr"].unique().to_list()))["last_updated"]
+            .max()
+        )
+        consolidated = (
+            self._load_features_from_tables_in_parallel(candidates) if self.run_on_ray_cluster else self._load_features_from_tables(candidates)
+        )
+        self.io.write_delta(consolidated, self.get_path(new_addr), mode="append", delta_write_options=writer_options)
+        self.io.write_delta(
+            pl.DataFrame().with_columns(
+                table_addr=pl.lit(new_addr),
+                last_updated=pl.lit(merged_last_updated),
+                update_timestamp=_get_timestamp(),
+            ),
+            self.table_metadata,
+            mode="append",
+            delta_write_options=writer_options,
+        )
+        self.io.write_delta(
+            candidates.with_columns(version=pl.col("version") + 1, table_addr=pl.lit(new_addr)),
+            self.feature_metadata,
+            mode="append",
+            delta_write_options=writer_options,
+        )
+        return new_addr
+
+    @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_as_of_features(
         self,
         df: pl.DataFrame | ray.ObjectRef,
