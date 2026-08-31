@@ -120,6 +120,7 @@ Two overlap modes are supported via the ``overlap_mode`` parameter on :meth:`add
 
 import io
 import json
+import logging
 import os
 import traceback
 import uuid
@@ -149,7 +150,9 @@ from gammalake.abstract import (
 )
 from gammalake.io import FrameIO, PolarsIO
 
-__all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index")
+__all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
     pa.schema(
@@ -191,7 +194,7 @@ def update_feature_tables(
     signal_type: str,
     overlap_mode: str = "copy",
     feature_params: dict | None = None,
-) -> None:
+) -> tuple[pa.Table, pa.Table | None]:
     """
     Processes step 1 of the Gamma Lake add operation for new input frames. Index modification happens outside this function, in parallel, and only once.
 
@@ -258,6 +261,12 @@ def update_feature_tables(
                                         | I9     | V9'      |           | I9     | V9'      |
                                         +-------------------+           +-------------------+
 
+    Returns:
+        A 2-tuple ``(table_metadata_row, feature_metadata_row)`` where ``table_metadata_row`` is
+        always a ``pa.Table`` containing a single-row ``table_metadata`` record, and
+        ``feature_metadata_row`` is a ``pa.Table`` or ``None`` (``None`` when no feature metadata
+        update is required, e.g. append-only path with no version increment).
+
     """
     try:
         if table_addr is None:
@@ -279,28 +288,17 @@ def update_feature_tables(
                     "target_file_size": feature_store.target_file_size,
                 },
             )
-            feature_store.io.write_delta(
-                pl.DataFrame().with_columns(
-                    table_addr=pl.lit(table_addr), last_updated=pl.lit(input_comparable_max), update_timestamp=_get_timestamp()
-                ),
-                feature_store.table_metadata,
-                mode="append",
-                delta_write_options={"writer_properties": WriterProperties(compression=feature_store.compression)},
+            return (
+                pl.DataFrame()
+                .with_columns(table_addr=pl.lit(table_addr), last_updated=pl.lit(input_comparable_max), update_timestamp=_get_timestamp())
+                .to_arrow(),
+                new_feature_metadata_row.to_arrow(),
             )
-            # Write feature_metadata last so a failure in the data or table_metadata writes
-            # does not leave a stale entry that would cause null last_updated on retry.
-            feature_store.io.write_delta(
-                new_feature_metadata_row,
-                feature_store.feature_metadata,
-                mode="append",
-                delta_write_options={"writer_properties": WriterProperties(compression=feature_store.compression), "schema_mode": "merge"},
-            )
-
-            return
 
         feature_df = feature_store._get_latest_feature_tables(columns).filter(pl.col("table_addr") == table_addr)
         columns = feature_store.sort_keys + feature_df["feature_name"].to_list()
         last_updated = feature_store._get_last_updated(table_addr)
+        feature_metadata_row = None
 
         if input_length == new_index_rows_ref.height:
             # All input rows are new to the index. Write them to the feature table directly.
@@ -360,17 +358,12 @@ def update_feature_tables(
                         delta_write_options={"writer_properties": writer_props, "target_file_size": feature_store.target_file_size},
                     )
 
-                feature_store.io.write_delta(
-                    feature_df.with_columns(
-                        version=pl.lit(next_rank, dtype=pl.Int64),
-                        table_addr=pl.lit(table_addr),
-                        owner=pl.lit(owner),
-                        signal_type=pl.lit(signal_type),
-                        feature_params=pl.lit(json.dumps(feature_params)) if feature_params is not None else pl.col("feature_params"),
-                    ),
-                    feature_store.feature_metadata,
-                    mode="append",
-                    delta_write_options={"writer_properties": writer_props, "schema_mode": "merge"},
+                feature_metadata_row = feature_df.with_columns(
+                    version=pl.lit(next_rank, dtype=pl.Int64),
+                    table_addr=pl.lit(table_addr),
+                    owner=pl.lit(owner),
+                    signal_type=pl.lit(signal_type),
+                    feature_params=pl.lit(json.dumps(feature_params)) if feature_params is not None else pl.col("feature_params"),
                 )
 
             else:
@@ -390,20 +383,54 @@ def update_feature_tables(
                     },
                 )
 
-        feature_store.io.write_delta(
-            pl.DataFrame().with_columns(
-                table_addr=pl.lit(table_addr),
-                last_updated=pl.lit(input_comparable_max),
-                update_timestamp=_get_timestamp(),
-            ),
-            feature_store.table_metadata,
-            mode="append",
-            delta_write_options={"writer_properties": WriterProperties(compression=feature_store.compression)},
+        return (
+            pl.DataFrame()
+            .with_columns(table_addr=pl.lit(table_addr), last_updated=pl.lit(input_comparable_max), update_timestamp=_get_timestamp())
+            .to_arrow(),
+            feature_metadata_row.to_arrow() if feature_metadata_row is not None else None,
         )
 
     except Exception as e:
         print(columns, e, traceback.format_exc())
         raise
+
+
+def write_metadata(
+    feature_store,
+    table_path,
+    *rows,
+    schema_mode=None,
+    _ray_ordering_dep: ray.ObjectRef | None = None,
+) -> None:
+    """Batch-write metadata rows as a single Delta commit.
+
+    Concatenates all non-``None`` Arrow tables in ``rows`` into one frame and
+    appends it to ``table_path`` in a single ``write_delta`` call, avoiding
+    concurrent Delta commit failures when many tasks run in parallel.
+
+    Args:
+        feature_store: the GammaFeatureLake whose IO and compression settings to use
+        table_path: destination Delta table path (e.g. ``feature_store.table_metadata``)
+        *rows: Arrow tables to write; ``None`` entries are silently skipped
+        schema_mode: forwarded to ``delta_write_options`` (e.g. ``"merge"`` for schema evolution)
+        _ray_ordering_dep: pass a Ray ObjectRef here to enforce task-graph execution ordering.
+            Ray resolves the ref before scheduling this task, ensuring e.g. ``table_metadata``
+            is committed before ``feature_metadata``
+
+    Returns:
+        None
+
+    """
+    filtered = [row for row in rows if row is not None]
+    if not filtered:
+        _logger.debug(f"write_metadata: all rows are None for {table_path} — skipping write")
+        return
+    unified = pa.unify_schemas([table.schema for table in filtered])
+    merged = pa.concat_tables([table.cast(unified) for table in filtered])
+    options = {"writer_properties": WriterProperties(compression=feature_store.compression)}
+    if schema_mode is not None:
+        options["schema_mode"] = schema_mode
+    feature_store.io.write_delta(pl.from_arrow(merged), table_path, mode="append", delta_write_options=options)
 
 
 def align_feature_tables(feature_store, new_index_rows_ref, row, input_comparable_min):
@@ -841,9 +868,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     @ensure_deltalake_is_initialized
     def _get_latest_feature_tables(self, feature_columns):
-        return _latest_per_feature(self.feature_metadata_frame().collect()).join(
-            pl.DataFrame(pl.Series(list(set(feature_columns) - set(self.sort_keys))).alias("feature_name")), how="right", on="feature_name"
-        )
+        pure_feature_columns = pl.Series("feature_name", list(set(feature_columns) - set(self.sort_keys)), dtype=pl.String)
+        return _latest_per_feature(self.feature_metadata_frame().collect()).join(pure_feature_columns.to_frame(), how="right", on="feature_name")
 
     @ensure_deltalake_is_initialized
     def _write_new_feature_table(self, feature_df, owner, signal_type, feature_params) -> tuple[str, pl.DataFrame]:
@@ -960,26 +986,41 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         # Step 1: Append-only if no overlap; otherwise merge in-place into the existing DeltaTable (upsert).
         # New index rows are inserted; overlapping rows are updated. Alignment rows (index rows absent from the
         # input, with null feature values) are merged in to maintain index alignment across all tables.
-        for (table_addr,), feature_df in feature_tables.group_by("table_addr"):
+        feature_table_update_refs = [
+            self.switch(update_feature_tables, num_returns=2)(
+                feature_store=self,
+                table_addr=table_addr,
+                input_length=input_length,
+                inner_join_ref=inner_join_ref,
+                new_index_rows_ref=new_index_rows_ref,
+                missing_index_rows_ref=missing_index_rows_ref,
+                input_comparable_max=primary_sort_key_max,
+                input_comparable_min=primary_sort_key_min,
+                columns=columns,
+                owner=owner,
+                signal_type=signal_type,
+                feature_params=feature_params,
+                overlap_mode=overlap_mode,
+            )
+            for table_addr in feature_tables["table_addr"].unique()
+        ]
+        if feature_table_update_refs:
+            # Write table_metadata first so a partial failure cannot leave stale feature_metadata.
+            # Ray resolves _ray_ordering_dep before scheduling the feature_metadata write.
+            table_metadata_rows, feature_metadata_rows = zip(*feature_table_update_refs)
+            table_metadata_ref = self.switch(write_metadata)(self, self.table_metadata, *table_metadata_rows)
+            refs.append(table_metadata_ref)
             refs.append(
-                self.switch(update_feature_tables)(
-                    feature_store=self,
-                    table_addr=table_addr,
-                    input_length=input_length,
-                    inner_join_ref=inner_join_ref,
-                    new_index_rows_ref=new_index_rows_ref,
-                    missing_index_rows_ref=missing_index_rows_ref,
-                    input_comparable_max=primary_sort_key_max,
-                    input_comparable_min=primary_sort_key_min,
-                    columns=columns,
-                    owner=owner,
-                    signal_type=signal_type,
-                    feature_params=feature_params,
-                    overlap_mode=overlap_mode,
+                self.switch(write_metadata)(
+                    self,
+                    self.feature_metadata,
+                    *feature_metadata_rows,
+                    schema_mode="merge",
+                    _ray_ordering_dep=table_metadata_ref,
                 )
             )
 
-        # Step 2: In the case of overlaps between the index and input table we must we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
+        # Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
         # This step identifies the qualified tables (all feature tables which contain no features found in the input table, OR contain a non-latest version of a feature found in the input table).
         # This preserves index alignment across all our delta tables, and we can do this in parallel.
         for row in tables_to_update.iter_rows(named=True):

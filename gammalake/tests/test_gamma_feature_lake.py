@@ -11,6 +11,7 @@ from polars.testing import assert_frame_equal
 from pydantic import ValidationError
 
 from gammalake import GammaFeatureLake, MissingFeaturesException
+from gammalake.gamma_feature_lake import write_metadata
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
@@ -462,3 +463,52 @@ def test_failed_write_does_not_corrupt_feature_metadata(tmp_path):
     # A retry must succeed without crashing on a null last_updated comparison.
     fs.add_features(df, owner="test-owner")
     assert fs.read([f"feature_{i}" for i in range(2)]).height > 0
+
+
+def test_write_metadata_single_commit(tmp_path):
+    """write_metadata must issue exactly one write_delta call for any number of rows."""
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    row1 = pa.table({"col_a": [1], "col_b": ["x"]})
+    row2 = pa.table({"col_a": [2], "col_b": ["y"]})
+    with patch.object(fs.io, "write_delta") as mock_write:
+        write_metadata(fs, fs.table_metadata, row1, None, row2)
+        assert mock_write.call_count == 1
+
+
+def test_add_features_empty_table_no_crash(tmp_path):
+    """_get_latest_feature_tables must return an empty frame when feature_columns contains only sort keys."""
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    df = generate_test_data(n_symbols=3, n_days=5).select(["timestamp", "symbol"])
+    fs.add_features(df, owner="test")
+    assert fs._get_latest_feature_tables(fs.sort_keys).is_empty()
+    assert fs.feature_metadata_frame().collect().is_empty()
+
+
+def test_write_metadata_all_none_skips_write(tmp_path):
+    """write_metadata must not call write_delta when every row is None."""
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    with patch.object(fs.io, "write_delta") as mock_write:
+        write_metadata(fs, fs.table_metadata, None, None)
+        assert mock_write.call_count == 0
+
+
+def test_write_metadata_schema_mode_forwarded(tmp_path):
+    """write_metadata must pass schema_mode through to delta_write_options."""
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    row = pa.table({"col_a": [1], "col_b": ["x"]})
+    with patch.object(fs.io, "write_delta") as mock_write:
+        write_metadata(fs, fs.table_metadata, row, schema_mode="merge")
+        assert mock_write.call_count == 1
+        _, kwargs = mock_write.call_args
+        assert kwargs["delta_write_options"].get("schema_mode") == "merge"
+
+
+def test_add_features_single_commit_per_metadata_table(tmp_path):
+    """add_features must batch metadata rows into one commit per non-empty metadata table."""
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    df = generate_test_data(n_symbols=5, n_days=3)
+    with patch.object(fs.io, "write_delta") as mock_write:
+        fs.add_features(df, owner="test")
+        metadata_paths = [call.args[1] for call in mock_write.call_args_list if call.args[1] in (fs.table_metadata, fs.feature_metadata)]
+        assert metadata_paths.count(fs.table_metadata) == 1
+        assert metadata_paths.count(fs.feature_metadata) == 1
