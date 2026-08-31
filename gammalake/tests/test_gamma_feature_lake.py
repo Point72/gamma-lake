@@ -12,8 +12,9 @@ from pydantic import ValidationError
 
 from gammalake import GammaFeatureLake
 from gammalake._multi_source import scan_aligned_sources as original_scan_aligned_sources
+from gammalake.abstract import BaseFeatureLake
 from gammalake.gamma_feature_lake import write_metadata
-from gammalake.io import PolarsIO
+from gammalake.io import FrameIO, PolarsIO
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
@@ -672,6 +673,29 @@ def test_write_metadata_schema_mode_forwarded(tmp_path):
         assert mock_write.call_count == 1
         _, kwargs = mock_write.call_args
         assert kwargs["delta_write_options"].get("schema_mode") == "merge"
+
+
+def test_failed_index_write_does_not_publish_metadata(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    df = generate_test_data(n_features=2, n_symbols=3, n_days=5)
+
+    with (
+        patch("gammalake.gamma_feature_lake.update_index", side_effect=RuntimeError("simulated index failure")),
+        pytest.raises(RuntimeError, match="simulated index failure"),
+    ):
+        fs.add_features(df, owner="test-owner")
+
+    assert fs.index_frame().collect().is_empty()
+    assert fs.table_metadata_frame().collect().is_empty()
+    assert fs.feature_metadata_frame().collect().is_empty()
+
+    fs.add_features(df, owner="test-owner")
+    assert fs.read(["feature_0", "feature_1"]).height == fs.index_frame().collect().height
+
+
+def test_optional_backend_extensions_remain_compatible():
+    assert {"annotate_table", "describe_table", "restore_to_timestamp"}.isdisjoint(FrameIO.__abstractmethods__)
+    assert "add_index_rows" not in BaseFeatureLake.__abstractmethods__
 
 
 def test_polars_io_forwards_delta_configuration():

@@ -405,7 +405,7 @@ def write_metadata(
     table_path,
     *rows,
     schema_mode=None,
-    _ray_ordering_dep: ray.ObjectRef | None = None,
+    _ray_ordering_deps: list[ray.ObjectRef] | None = None,
 ) -> None:
     """Batch non-null metadata rows into one Delta commit."""
     filtered = [row for row in rows if row is not None]
@@ -1103,11 +1103,28 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             )
             for table_addr in feature_tables["table_addr"].unique()
         ]
+        # Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
+        # This step identifies the qualified tables (all feature tables which contain no features found in the input table, OR contain a non-latest version of a feature found in the input table).
+        # This preserves index alignment across all our delta tables, and we can do this in parallel.
+        alignment_refs = []
+        for row in tables_to_update.iter_rows(named=True):
+            alignment_refs.append(self.switch(align_feature_tables)(self, new_index_rows_ref, row, primary_sort_key_min))
+        refs.extend(alignment_refs)
+
+        # Step 3: Append the results of an anti-join between the new data and the index back into the master index.
+        # This can also be done in parallel.
+        index_ref = self.switch(update_index)(self, new_index_rows_ref)
+        refs.append(index_ref)
+
         if feature_table_update_refs:
-            # Write table_metadata first so a partial failure cannot leave stale feature_metadata.
-            # Ray resolves _ray_ordering_dep before scheduling the feature_metadata write.
+            # Metadata becomes visible only after all data and index writes succeed.
             table_metadata_rows, feature_metadata_rows = zip(*feature_table_update_refs)
-            table_metadata_ref = self.switch(write_metadata)(self, self.table_metadata, *table_metadata_rows)
+            table_metadata_ref = self.switch(write_metadata)(
+                self,
+                self.table_metadata,
+                *table_metadata_rows,
+                _ray_ordering_deps=[*alignment_refs, index_ref],
+            )
             refs.append(table_metadata_ref)
             refs.append(
                 self.switch(write_metadata)(
@@ -1115,19 +1132,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                     self.feature_metadata,
                     *feature_metadata_rows,
                     schema_mode="merge",
-                    _ray_ordering_dep=table_metadata_ref,
+                    _ray_ordering_deps=[table_metadata_ref],
                 )
             )
 
-        # Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
-        # This step identifies the qualified tables (all feature tables which contain no features found in the input table, OR contain a non-latest version of a feature found in the input table).
-        # This preserves index alignment across all our delta tables, and we can do this in parallel.
-        for row in tables_to_update.iter_rows(named=True):
-            refs.append(self.switch(align_feature_tables)(self, new_index_rows_ref, row, primary_sort_key_min))
-
-        # Step 3: Append the results of an anti-join between the new data and the index back into the master index.
-        # This can also be done in parallel.
-        refs.append(self.switch(update_index)(self, new_index_rows_ref))
         return self.get(refs) if self.run_on_ray_cluster else refs
 
     @ensure_deltalake_is_initialized

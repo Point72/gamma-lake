@@ -55,15 +55,13 @@ class FrameIO(ABC):
         """
         ...
 
-    @abstractmethod
     def annotate_table(self, table_addr: str, annotations: pl.DataFrame) -> None:
         """Persist comment-level annotations and string tags for features in one table."""
-        ...
+        raise NotImplementedError
 
-    @abstractmethod
     def describe_table(self, table_addr: str, feature_names: list[str]) -> pl.DataFrame:
         """Fetch comments and tags for the named features in one table."""
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def is_deltatable(self, target: str) -> bool:
@@ -101,7 +99,6 @@ class FrameIO(ABC):
         """
         ...
 
-    @abstractmethod
     def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
         """Restore a Delta table to its state as of ``timestamp``.
 
@@ -110,7 +107,7 @@ class FrameIO(ABC):
             timestamp: Timezone-aware cutoff; commits after it are reverted.
 
         """
-        ...
+        raise NotImplementedError
 
 
 class PolarsIO(FrameIO):
