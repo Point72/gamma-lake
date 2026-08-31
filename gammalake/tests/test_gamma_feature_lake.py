@@ -480,8 +480,23 @@ def test_add_features_empty_table_no_crash(tmp_path):
     fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
     df = generate_test_data(n_symbols=3, n_days=5).select(["timestamp", "symbol"])
     fs.add_features(df, owner="test")
-    assert fs._get_latest_feature_tables(fs.sort_keys).is_empty()
+    assert fs._get_latest_feature_tables(fs.sort_keys, fs.feature_metadata_frame().collect()).is_empty()
     assert fs.feature_metadata_frame().collect().is_empty()
+
+
+def test_add_features_scans_index_and_metadata_once(tmp_path):
+    """Each add must reuse one snapshot of the index and metadata tables."""
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    df = generate_test_data(n_features=2, n_symbols=3, n_days=5)
+    fs.add_features(df, owner="test")
+
+    with patch.object(fs.io, "scan_delta", wraps=fs.io.scan_delta) as mock_scan:
+        fs.add_features(df.with_columns(pl.col("feature_0") + 1), owner="test")
+
+    scanned_paths = [call.args[0] for call in mock_scan.call_args_list]
+    assert scanned_paths.count(fs.index) == 1
+    assert scanned_paths.count(fs.feature_metadata) == 1
+    assert scanned_paths.count(fs.table_metadata) == 1
 
 
 def test_write_metadata_all_none_skips_write(tmp_path):
