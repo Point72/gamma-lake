@@ -120,7 +120,6 @@ Two overlap modes are supported via the ``overlap_mode`` parameter on :meth:`add
 
 import io
 import json
-import logging
 import os
 import traceback
 import uuid
@@ -152,8 +151,6 @@ from gammalake.abstract import (
 from gammalake.io import FrameIO, PolarsIO
 
 __all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
-
-_logger = logging.getLogger(__name__)
 
 _DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
     pa.schema(
@@ -410,28 +407,9 @@ def write_metadata(
     schema_mode=None,
     _ray_ordering_dep: ray.ObjectRef | None = None,
 ) -> None:
-    """Batch-write metadata rows as a single Delta commit.
-
-    Concatenates all non-``None`` Arrow tables in ``rows`` into one frame and
-    appends it to ``table_path`` in a single ``write_delta`` call, avoiding
-    concurrent Delta commit failures when many tasks run in parallel.
-
-    Args:
-        feature_store: the GammaFeatureLake whose IO and compression settings to use
-        table_path: destination Delta table path (e.g. ``feature_store.table_metadata``)
-        *rows: Arrow tables to write; ``None`` entries are silently skipped
-        schema_mode: forwarded to ``delta_write_options`` (e.g. ``"merge"`` for schema evolution)
-        _ray_ordering_dep: pass a Ray ObjectRef here to enforce task-graph execution ordering.
-            Ray resolves the ref before scheduling this task, ensuring e.g. ``table_metadata``
-            is committed before ``feature_metadata``
-
-    Returns:
-        None
-
-    """
+    """Batch non-null metadata rows into one Delta commit."""
     filtered = [row for row in rows if row is not None]
     if not filtered:
-        _logger.debug(f"write_metadata: all rows are None for {table_path} — skipping write")
         return
     unified = pa.unify_schemas([table.schema for table in filtered])
     merged = pa.concat_tables([table.cast(unified) for table in filtered])
@@ -1074,7 +1052,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             single append. Prefer wide-and-shallow writes over tall-and-skinny writes: batch related
             value columns and all secondary-key values for each primary-sort-key period instead of
             splitting the same period across calls. For backfills, write blocks of complete periods
-            sized to fit memory. See ``docs/best_practices.md``.
+            sized to fit memory. See the ``Best-Practices`` wiki page.
         """
 
         if isinstance(df, ray.ObjectRef) and not self.run_on_ray_cluster:
@@ -1165,7 +1143,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
         Each call scans and appends to the global index once, so batch related columns and
         complete primary-sort-key periods rather than splitting them across calls. See ``_add``
-        and ``docs/best_practices.md`` for write-shape and backfill guidance.
+        and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
         """
         return self._add(df=df, signal_type="target", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
@@ -1182,7 +1160,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
         Each call scans and appends to the global index once, so batch related columns and
         complete primary-sort-key periods rather than splitting them across calls. See ``_add``
-        and ``docs/best_practices.md`` for write-shape and backfill guidance.
+        and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
         """
         return self._add(df=df, signal_type="feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
