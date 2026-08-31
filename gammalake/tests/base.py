@@ -11,6 +11,7 @@ import inspect
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import numpy as np
 import polars as pl
@@ -3162,6 +3163,117 @@ class GammaFeatureLakeTestsMixin:
             .select("timestamp", "symbol", "event_cleaned")
         )
         assert_frame_equal(expected_df.sort(fs.sort_keys), df2.select("timestamp", "symbol", "event_cleaned").sort(fs.sort_keys))
+
+    def _test_runtime_transforms(self, fs: GammaFeatureLake, use_remote_data: bool = False):
+        """Register the supported row-local transforms and verify their semantics."""
+        fs.enable_runtime_computed_features = True
+        timestamps = pl.datetime_range(
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 5, tzinfo=UTC),
+            interval="1d",
+            eager=True,
+        )
+        df = pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": ["A"] * 5,
+                "value": [-2.0, 0.0, 3.0, None, float("nan")],
+                "value2": [1.0, 2.0, None, 4.0, 5.0],
+                "label": ["a", "b", "c", "d", "e"],
+            }
+        )
+        if use_remote_data:
+            import ray
+
+            input_df = ray.put(df)
+        else:
+            input_df = df
+        transforms = ["missing", "nan", "abs", "sign", "squared", "signed_log1p", "positive", "negative", "nonzero", "reciprocal"]
+        fs.add_features(input_df, owner="tbg")
+        fs.add_runtime_transforms(features=["value"], transforms=transforms, owner="tbg")
+
+        derived_names = [f"value__{transform}" for transform in transforms]
+        metadata = fs.feature_metadata_frame().collect()
+        assert set(metadata["feature_name"]) == {"value", "value2", "label", *derived_names}
+
+        nan = float("nan")
+        expected = df.with_columns(
+            pl.Series("value__missing", [False, False, False, True, False], dtype=pl.Boolean),
+            pl.Series("value__nan", [False, False, False, None, True], dtype=pl.Boolean),
+            pl.Series("value__abs", [2.0, 0.0, 3.0, None, nan], dtype=pl.Float64),
+            pl.Series("value__sign", [-1.0, 0.0, 1.0, None, nan], dtype=pl.Float64),
+            pl.Series("value__squared", [4.0, 0.0, 9.0, None, nan], dtype=pl.Float64),
+            pl.Series("value__signed_log1p", [-1.0986122886681098, 0.0, 1.3862943611198906, None, nan], dtype=pl.Float64),
+            pl.Series("value__positive", [0.0, 0.0, 3.0, None, nan], dtype=pl.Float64),
+            pl.Series("value__negative", [2.0, 0.0, 0.0, None, nan], dtype=pl.Float64),
+            pl.Series("value__nonzero", [True, False, True, None, True], dtype=pl.Boolean),
+            pl.Series("value__reciprocal", [-0.5, None, 0.3333333333333333, None, nan], dtype=pl.Float64),
+        )
+        actual = fs.read(derived_names).sort(fs.sort_keys)
+        assert_frame_equal(
+            actual.select(derived_names + fs.sort_keys),
+            expected.select(derived_names + fs.sort_keys).sort(fs.sort_keys),
+        )
+
+        fs.add_runtime_transforms(features=["value2", "label"], transforms=["missing"], owner="run_owner")
+        cross_names = ["value2__missing", "label__missing"]
+        cross_metadata = fs.feature_metadata_frame().collect().filter(pl.col("feature_name").is_in(cross_names))
+        assert set(cross_metadata["feature_name"]) == set(cross_names)
+        assert set(cross_metadata["owner"]) == {"run_owner"}
+        cross_expected = df.with_columns(
+            pl.Series("value2__missing", [False, False, True, False, False], dtype=pl.Boolean),
+            pl.Series("label__missing", [False, False, False, False, False], dtype=pl.Boolean),
+        )
+        cross_actual = fs.read(cross_names).sort(fs.sort_keys)
+        assert_frame_equal(
+            cross_actual.select(cross_names + fs.sort_keys),
+            cross_expected.select(cross_names + fs.sort_keys).sort(fs.sort_keys),
+        )
+
+        fs.add_runtime_transforms(features=["label"], transforms=["squared"], owner="tbg")
+        with pytest.raises(pl.exceptions.PolarsError):
+            fs.read(["label__squared"])
+
+    def _test_runtime_transform_validation(self, fs: GammaFeatureLake):
+        """Reject invalid transform registrations and preserve numeric compatibility."""
+        fs.enable_runtime_computed_features = True
+        df = generate_test_data(n_features=1, n_symbols=2, n_days=3)
+        fs.add_features(df)
+
+        with pytest.raises(ValueError, match="Unknown runtime transforms"):
+            fs.add_runtime_transforms(features=["feature_0"], transforms=["unknown"])
+        with pytest.raises(ValueError, match="non-empty"):
+            fs.add_runtime_transforms(features=["feature_0"], transforms=[])
+        with pytest.raises(ValueError, match="non-empty"):
+            fs.add_runtime_transforms(features=[], transforms=["abs"])
+        with pytest.raises(ValueError, match="without duplicates"):
+            fs.add_runtime_transforms(features=["feature_0"], transforms=["abs", "abs"])
+        with pytest.raises(ValueError, match="without duplicates"):
+            fs.add_runtime_transforms(features=["feature_0", "feature_0"], transforms=["abs"])
+        with pytest.raises(ValueError, match="not yet stored"):
+            fs.add_runtime_transforms(features=["not_a_feature"], transforms=["abs"])
+
+        fs.add_runtime_computed_features([pl.col("feature_0").alias("feature_0__abs")])
+        with pytest.raises(ValueError, match="already registered"):
+            fs.add_runtime_transforms(features=["feature_0"], transforms=["abs"])
+
+    def _test_runtime_transforms_cast_numeric_inputs(self, fs: GammaFeatureLake):
+        """Cast supported numeric input types to Float64."""
+        fs.enable_runtime_computed_features = True
+        frame = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
+                "symbol": ["A"],
+                "unsigned": pl.Series([255], dtype=pl.UInt16),
+                "decimal": pl.Series([Decimal("2.50")], dtype=pl.Decimal(10, 2)),
+            }
+        )
+        fs.add_features(frame)
+        fs.add_runtime_transforms(features=["unsigned"], transforms=["squared", "negative"])
+        fs.add_runtime_transforms(features=["decimal"], transforms=["nan", "squared", "reciprocal"])
+
+        derived = ["unsigned__squared", "unsigned__negative", "decimal__nan", "decimal__squared", "decimal__reciprocal"]
+        assert fs.read(derived).select(derived).row(0) == (65025.0, 0.0, False, 6.25, 0.4)
 
     def _test_consolidate_feature_groups(self, fs: GammaFeatureLake):
         """Consolidate feature groups without changing reads or index alignment."""

@@ -401,6 +401,23 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, enable_runtime_computed_features=True).initialize()
         self._test_runtime_computed_features(fs, use_remote_data=use_remote_data)
 
+    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
+    def test_runtime_transforms(self, use_remote_data, use_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, enable_runtime_computed_features=True).initialize()
+        self._test_runtime_transforms(fs, use_remote_data=use_remote_data)
+
+    def test_runtime_transform_rejects_sort_key_collision(self, tmp_path):
+        fs = GammaFeatureLake(
+            base_path=str(tmp_path),
+            run_on_ray_cluster=False,
+            primary_sort_key="value__abs",
+            enable_runtime_computed_features=True,
+        ).initialize(ArrowSchema.make(pa.schema([("value__abs", pa.int64()), ("symbol", pa.string())])))
+        fs.add_features(pl.DataFrame({"value__abs": [1], "symbol": ["A"], "value": [2.0]}))
+
+        with pytest.raises(ValueError, match="conflict with sort keys"):
+            fs.add_runtime_transforms(features=["value"], transforms=["abs"])
+
     def test_runtime_computed_features_require_opt_in(self, tmp_path):
         fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
         df = generate_test_data(n_features=2, n_symbols=2, n_days=2)
@@ -409,15 +426,23 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
         with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
             fs.add_runtime_computed_features([runtime_expr])
+        with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
+            fs.add_runtime_transforms(["feature_0"], ["abs"])
 
         enabled_fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, enable_runtime_computed_features=True)
         enabled_fs.add_runtime_computed_features([runtime_expr])
+        enabled_fs.add_runtime_transforms(["feature_0"], ["abs"])
         runtime_metadata = enabled_fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "runtime_feature")
+        transform_metadata = enabled_fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "feature_0__abs")
 
         with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
             fs.read(["runtime_feature"])
         with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
             fs.read(runtime_metadata)
+        with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
+            fs.read(["feature_0__abs"])
+        with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
+            fs.read(transform_metadata)
 
     # --- inline test not in mixin: tests Polars compression field ---
 

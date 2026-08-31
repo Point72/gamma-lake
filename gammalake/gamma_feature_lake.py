@@ -1367,6 +1367,59 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         )
         self.io.write_delta(new_features, self.feature_metadata, mode="append", delta_write_options={"schema_mode": "merge"})
 
+    @ensure_deltalake_is_initialized
+    @trace(always=True)
+    def add_runtime_transforms(self, features: list[str], transforms: list[str], owner: str = "missing_owner") -> None:
+        """Register row-local transforms over stored features as runtime features.
+
+        This convenience wrapper over :meth:`add_runtime_computed_features` registers every
+        ``(feature, transform)`` pair as ``<feature>__<transform>``. Numeric outputs use
+        ``Float64`` and propagate nulls; ``reciprocal`` also returns null for zero. ``missing``,
+        ``nan``, and ``nonzero`` return booleans. ``positive`` and ``negative`` clamp to the
+        non-negative part of the value and its negation, respectively, rather than returning
+        sign predicates. ``sign`` returns ``-1``, ``0``, or ``1``, and ``signed_log1p`` computes
+        ``sign(x) * log1p(abs(x))``.
+
+        Args:
+            features: Names of registered features to transform. Except when only ``missing`` is
+                requested, each feature must be numeric when read.
+            transforms: Transform names applied to every feature. Supported names are ``abs``,
+                ``missing``, ``nan``, ``negative``, ``nonzero``, ``positive``, ``reciprocal``,
+                ``sign``, ``signed_log1p``, and ``squared``.
+            owner: Owner recorded for each generated runtime feature.
+
+        Raises:
+            ValueError: If either list is empty or contains duplicates, a transform is unknown,
+                a generated name conflicts with a sort key, runtime-computed features are
+                disabled, a root feature is unregistered, or an output name is already registered.
+
+        """
+        for name, values in (("features", features), ("transforms", transforms)):
+            if not values or len(values) != len(set(values)):
+                raise ValueError(f"{name} must be a non-empty list without duplicates")
+
+        builders = {
+            "abs": lambda column: column.cast(pl.Float64).abs(),
+            "missing": lambda column: column.is_null(),
+            "nan": lambda column: column.cast(pl.Float64).is_nan(),
+            "negative": lambda column: (-column.cast(pl.Float64)).clip(lower_bound=0),
+            "nonzero": lambda column: column.cast(pl.Float64) != 0,
+            "positive": lambda column: column.cast(pl.Float64).clip(lower_bound=0),
+            "reciprocal": lambda column: pl.when(column.cast(pl.Float64) != 0).then(1 / column.cast(pl.Float64)),
+            "sign": lambda column: column.cast(pl.Float64).sign(),
+            "signed_log1p": lambda column: column.cast(pl.Float64).sign() * column.cast(pl.Float64).abs().log1p(),
+            "squared": lambda column: column.cast(pl.Float64).pow(2),
+        }
+        if unknown := sorted(set(transforms) - set(builders)):
+            raise ValueError(f"Unknown runtime transforms: {unknown}. Supported transforms: {sorted(builders)}")
+
+        generated_names = {f"{feature}__{transform}" for feature in features for transform in transforms}
+        if conflicts := sorted(generated_names & set(self.sort_keys)):
+            raise ValueError(f"Runtime transform feature names conflict with sort keys: {conflicts}")
+
+        expressions = [builders[transform](pl.col(feature)).alias(f"{feature}__{transform}") for feature in features for transform in transforms]
+        self.add_runtime_computed_features(expressions, owner=owner)
+
     @staticmethod
     def merge(
         left: "GammaFeatureLake",

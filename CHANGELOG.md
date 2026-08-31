@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* [CCRT-7089] Add `GammaFeatureLake.add_runtime_transforms` for deterministic row-local runtime transforms with Float64 numeric semantics, validation, and opt-in runtime-computed-feature security.
 * [CCRT-7088] Coordinate local sort-key predicate pushdown across GammaLake sources using `polars-io-tools`, while preserving alignment and runtime/as-of context.
 * [CCRT-7087] Add strict aligned-source concatenation using `polars-io-tools` coordinated predicate pushdown.
 * [CCRT-7086] Modernize GammaLake Ruff hygiene, including independent `FeatureMetadata` version lists and `TypeError` for unsupported read inputs.
