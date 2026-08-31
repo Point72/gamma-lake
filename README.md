@@ -83,6 +83,16 @@ with tempfile.TemporaryDirectory() as tmp:
 
 Run the full annotated demo: [`examples/quickstart.py`](examples/quickstart.py)
 
+## Documentation
+
+| Document                                                                    | Description                                                 |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| [Architecture](https://github.com/Point72/gamma-lake/wiki/Overview)         | Index design, feature groups, and append/merge semantics    |
+| [Best practices](https://github.com/Point72/gamma-lake/wiki/Best-Practices) | Recommended versioning, update, and parallel-write patterns |
+| [Performance](https://github.com/Point72/gamma-lake/wiki/Performance)       | Benchmark comparison against per-day Parquet files          |
+| [docs/benchmarking.md](docs/benchmarking.md)                                | Running the portable ASV read/write benchmarks              |
+| [examples/quickstart.py](examples/quickstart.py)                            | Runnable end-to-end demo                                    |
+
 ## Core API
 
 ```python
