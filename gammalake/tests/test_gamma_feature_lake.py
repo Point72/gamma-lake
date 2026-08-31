@@ -1,5 +1,5 @@
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import polars as pl
@@ -10,7 +10,7 @@ from ccflow import ArrowSchema
 from polars.testing import assert_frame_equal
 from pydantic import ValidationError
 
-from gammalake import GammaFeatureLake
+from gammalake import GammaFeatureLake, MissingFeaturesException
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
@@ -191,8 +191,6 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
     @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
     def test_updating_old_features_while_changing_write_compression_level(self, use_remote_data, use_ray_cluster, tmp_path):
-        from datetime import datetime, timedelta
-
         fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
         n_symbols = 10
         n_days = 10
@@ -276,6 +274,144 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
         with pytest.raises(ValidationError):
             GammaFeatureLake(base_path=str(tmp_path), compression="MIDDLE_OUT", run_on_ray_cluster=use_ray_cluster)
+
+    @pytest.mark.parametrize("use_ray_cluster", [True, False])
+    def test_consolidate_feature_groups(self, use_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+        n_symbols = 5
+        n_days = 10
+        start_date = datetime(2020, 6, 20, tzinfo=UTC)
+
+        for week, feature_ids_start in enumerate(range(0, 9, 3)):
+            df = generate_test_data(
+                n_features=3,
+                n_symbols=n_symbols,
+                n_days=n_days,
+                start_date=start_date + timedelta(days=week * n_days),
+                feature_ids_start=feature_ids_start,
+            )
+            fs.add_features(df)
+
+        all_features = [f"feature_{i}" for i in range(9)]
+        pre_consolidation_read = fs.read(all_features)
+        assert fs.table_metadata_frame().collect()["table_addr"].n_unique() == 3
+
+        new_addr = fs.consolidate_feature_groups(all_features)
+        assert new_addr is not None
+
+        latest_metadata = fs.feature_metadata_frame().collect().sort("version", descending=True).group_by("feature_name").agg(pl.all().first())
+        assert latest_metadata["table_addr"].unique().to_list() == [new_addr]
+        assert latest_metadata["version"].unique().to_list() == [1]
+        assert fs.table_metadata_frame().collect().filter(pl.col("table_addr") == new_addr).select(pl.col("last_updated").is_not_null()).item()
+
+        post_consolidation_read = fs.read(all_features)
+        assert_frame_equal(pre_consolidation_read.sort(fs.sort_keys), post_consolidation_read.sort(fs.sort_keys), check_column_order=False)
+        self.verify_index_alignment(fs)
+        assert fs.consolidate_feature_groups(all_features) is None
+
+        fs.add_features(
+            generate_test_data(
+                n_features=3,
+                n_symbols=n_symbols,
+                n_days=n_days,
+                start_date=start_date + timedelta(days=3 * n_days),
+                feature_ids_start=0,
+            )
+        )
+        assert fs.read(all_features).height == pre_consolidation_read.height + n_symbols * n_days
+        self.verify_index_alignment(fs)
+
+    @pytest.mark.parametrize("use_ray_cluster", [True, False])
+    def test_consolidate_independent_groups_stay_separate(self, use_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+        n_days = 10
+        start_date = datetime(2020, 6, 20, tzinfo=UTC)
+
+        for week, feature_ids_start in enumerate(range(0, 9, 3)):
+            fs.add_features(
+                generate_test_data(
+                    n_features=3,
+                    n_symbols=5,
+                    n_days=n_days,
+                    start_date=start_date + timedelta(days=week * n_days),
+                    feature_ids_start=feature_ids_start,
+                )
+            )
+
+        all_features = [f"feature_{i}" for i in range(9)]
+        pre_consolidation_read = fs.read(all_features)
+        new_addr = fs.consolidate_feature_groups(all_features[:6])
+        assert new_addr is not None
+
+        latest_metadata = fs.feature_metadata_frame().collect().sort("version", descending=True).group_by("feature_name").agg(pl.all().first())
+        assert latest_metadata["table_addr"].n_unique() == 2
+        assert_frame_equal(
+            pre_consolidation_read.sort(fs.sort_keys),
+            fs.read(all_features).sort(fs.sort_keys),
+            check_column_order=False,
+        )
+        self.verify_index_alignment(fs)
+
+    @pytest.mark.parametrize("use_ray_cluster", [True, False])
+    def test_consolidate_rejects_non_consolidatable_signal_types(self, use_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(
+            base_path=str(tmp_path),
+            run_on_ray_cluster=use_ray_cluster,
+            enable_runtime_computed_features=True,
+        ).initialize()
+        n_days = 10
+        start_date = datetime(2020, 6, 20, tzinfo=UTC)
+        df1 = generate_test_data(n_features=3, n_symbols=5, n_days=n_days, start_date=start_date)
+        fs.add_features(df1)
+        fs.add_features(
+            generate_test_data(
+                n_features=3,
+                n_symbols=5,
+                n_days=n_days,
+                start_date=start_date + timedelta(days=n_days),
+                feature_ids_start=3,
+            )
+        )
+        fs.add_runtime_computed_features([(pl.col("feature_0") + pl.col("feature_1")).alias("runtime_feat")])
+        event_df = (
+            df1.unique(fs.sort_keys)
+            .sample(fraction=0.1, with_replacement=False)
+            .with_columns(pl.lit(1).alias("event"))
+            .select(fs.sort_keys + ["event"])
+        )
+        fs.add_as_of_features(event_df, params={"tolerance": "1h"})
+        fs.add_sparse_features(event_df.rename({"event": "sparse_event"}))
+        feature_metadata_before = fs.feature_metadata_frame().collect()
+
+        with pytest.raises(ValueError, match="runtime_computed"):
+            fs.consolidate_feature_groups(["feature_0", "feature_1", "runtime_feat"])
+        with pytest.raises(ValueError, match="as_of_feature"):
+            fs.consolidate_feature_groups(["feature_0", "feature_1", "event"])
+        with pytest.raises(ValueError, match="sparse_feature"):
+            fs.consolidate_feature_groups(["feature_0", "feature_1", "sparse_event"])
+        with pytest.raises(MissingFeaturesException):
+            fs.consolidate_feature_groups(["feature_0", "does_not_exist"])
+
+        assert_frame_equal(feature_metadata_before, fs.feature_metadata_frame().collect())
+        assert fs.consolidate_feature_groups([f"feature_{i}" for i in range(6)]) is not None
+
+    @pytest.mark.parametrize("use_ray_cluster", [True, False])
+    def test_consolidate_features_and_targets(self, use_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+        features = generate_test_data(n_features=2, n_symbols=3, n_days=5)
+        targets = generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_suffix="target")
+        fs.add_features(features)
+        fs.add_targets(targets)
+
+        expected = fs.read(["feature_0", "feature_1"], targets=["target_0"])
+        new_addr = fs.consolidate_feature_groups(["feature_0", "feature_1", "target_0"])
+
+        assert new_addr is not None
+        assert_frame_equal(
+            expected.sort(fs.sort_keys),
+            fs.read(["feature_0", "feature_1"], targets=["target_0"]).sort(fs.sort_keys),
+            check_column_order=False,
+        )
 
 
 def test_primary_sort_key_not_in_schema_raises(tmp_path):
