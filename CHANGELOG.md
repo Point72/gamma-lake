@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* [CCRT-7087] Add strict aligned-source concatenation using `polars-io-tools` coordinated predicate pushdown.
 * [CCRT-7086] Modernize GammaLake Ruff hygiene, including independent `FeatureMetadata` version lists and `TypeError` for unsupported read inputs.
 * [CCRT-7085] Resolve `feature_metadata` once per `GammaFeatureLake.read` and pipe it through read helpers to avoid repeated Delta-table scans.
 * [CCRT-7084] Breaking API cleanup: remove the unused `debug` parameter from `GammaFeatureLake.read`; reads now always return requested features plus sort keys.
