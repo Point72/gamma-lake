@@ -82,6 +82,11 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
         self._test_non_unique_index_data(fs)
 
+    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
+    def test_add_index_rows(self, use_remote_data, use_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+        self._test_add_index_rows(fs, use_remote_data=use_remote_data)
+
     @pytest.mark.parametrize("overlap_mode", ["copy", "merge"])
     def test_parametrized_overlap_modes_read_correctness(self, overlap_mode, fs):
         self._test_parametrized_overlap_modes_read_correctness(fs, overlap_mode=overlap_mode)

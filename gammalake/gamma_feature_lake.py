@@ -1139,6 +1139,29 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     @ensure_deltalake_is_initialized
     @trace(always=True)
+    def add_index_rows(self, df: pl.DataFrame | ray.ObjectRef) -> list:
+        """Extend the global index without adding features.
+
+        Equivalent to :meth:`add_features` with only the sort-key columns retained. No
+        feature or table metadata is created. Dense feature tables are padded only where
+        the new rows overlap their covered range. Non-overlapping dense tables, as-of
+        tables, and sparse tables are left untouched.
+
+        Args:
+            df: A DataFrame or Ray object reference containing the sort-key columns.
+                Non-sort-key DataFrame columns are dropped. Object references are
+                forwarded unchanged and should contain only sort-key columns.
+
+        Returns:
+            The list returned by the underlying add operation.
+
+        """
+        if isinstance(df, pl.DataFrame):
+            df = df.select(self.sort_keys)
+        return self._add(df=df, signal_type="feature")
+
+    @ensure_deltalake_is_initialized
+    @trace(always=True)
     def consolidate_feature_groups(self, features: list[str]) -> str | None:
         """Merge the current FeatureGroup tables for the given features into one table.
 
