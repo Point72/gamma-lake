@@ -25,7 +25,7 @@ _ORIGIN = datetime(2024, 1, 1, tzinfo=UTC)
 _SYMBOLS = [f"SYM_{i:04d}" for i in range(N_SYMBOLS)]
 _ALL_DAYS = [_ORIGIN + timedelta(days=day) for day in range(N_DAYS)]
 _GENERATED_DIR = "gammalake-asv"
-_SCOPES = {"read", "write"}
+_SCOPES = {"overlap-write", "read", "write"}
 _RUN_NAME = re.compile(r"^\d{8}T\d{6}_[0-9a-f]{8}$")
 
 
@@ -195,6 +195,64 @@ class GammaLakeWriteSuite:
             "step_5": step_5 - step_4,
             "step_6": finished - step_5,
         }
+
+    def teardown(self) -> None:
+        _delete_generated_path(self._storage_path)
+
+
+class GammaLakeOverlapWriteSuite:
+    """Benchmark ``add_features`` with heavily overlapping time intervals."""
+
+    timeout = 600
+
+    def setup(self) -> None:
+        self._storage_path = _new_run_path("overlap-write")
+        try:
+            self._lake = GammaFeatureLake(base_path=self._storage_path, run_on_ray_cluster=False).initialize()
+        except Exception:
+            _delete_generated_path(self._storage_path)
+            raise
+
+    def track_overlapping_add_features(self) -> dict[str, float]:
+        """Track latency for full, partial, and new-feature overlaps."""
+        n_f, n_s, n_d = N_FEATURES, N_SYMBOLS, N_DAYS
+        base = datetime(2020, 6, 20, tzinfo=UTC)
+        timings: dict[str, float] = {}
+        steps: list[tuple[str, dict]] = [
+            ("fwd_d0_f0", {"n_features": n_f, "n_symbols": n_s, "n_days": n_d, "start_date": base}),
+            ("overlap_d0_f0", {"n_features": n_f, "n_symbols": n_s, "n_days": n_d, "start_date": base}),
+            (
+                "new_feat_d0",
+                {"n_features": n_f, "n_symbols": n_s, "n_days": n_d, "start_date": base, "feature_ids_start": n_f},
+            ),
+            ("fwd_d10_f0", {"n_features": n_f, "n_symbols": n_s, "n_days": n_d, "start_date": base + timedelta(days=n_d)}),
+            (
+                "partial_d5_f0",
+                {"n_features": n_f, "n_symbols": n_s, "n_days": n_d, "start_date": base + timedelta(days=n_d // 2)},
+            ),
+            (
+                "new_feat_d5",
+                {
+                    "n_features": n_f,
+                    "n_symbols": n_s,
+                    "n_days": n_d,
+                    "start_date": base + timedelta(days=n_d // 2),
+                    "feature_ids_start": n_f,
+                },
+            ),
+            ("full_remerge", {"n_features": n_f, "n_symbols": n_s, "n_days": 2 * n_d, "start_date": base}),
+            (
+                "new_sym_d0",
+                {"n_features": n_f, "n_symbols": n_s, "n_days": 2 * n_d, "start_date": base, "symbols_id_start": n_s},
+            ),
+        ]
+
+        for name, kwargs in steps:
+            started = time.perf_counter()
+            self._lake.add_features(generate_test_data(**kwargs), owner="benchmark", overlap_mode="merge")
+            timings[name] = time.perf_counter() - started
+
+        return timings
 
     def teardown(self) -> None:
         _delete_generated_path(self._storage_path)
