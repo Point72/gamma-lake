@@ -138,6 +138,7 @@ from deltalake.writer.properties import Compression
 from packaging import version
 from pydantic import ConfigDict, Field, model_validator
 
+from gammalake._multi_source import scan_aligned_sources
 from gammalake._telemetry import trace
 from gammalake._topo import with_columns_topo
 from gammalake._types import RayObjectReference
@@ -538,18 +539,14 @@ def read_table(feature_store, table_meta: dict, features: list[str], start, end,
         )
 
     elif table_meta["signal_type"] == "sparse_feature":
-        index_filter = pl.col(feature_store.primary_sort_key) >= start if start is not None else pl.lit(True)
-        sparse_max = table.select(pl.col(feature_store.primary_sort_key).max()).collect().item()
-        if sparse_max is not None:
-            index_filter &= pl.col(feature_store.primary_sort_key) <= sparse_max
-        left_lf = feature_store.index_frame().filter(index_filter).sort(feature_store.sort_keys)
+        left_lf = feature_store.index_frame().filter(flt).sort(feature_store.sort_keys)
         right_lf = table.sort(feature_store.sort_keys)
-        if version.parse(pl.__version__) >= version.parse("1.37.0"):
+        if feature_store.sort_keys[0] == feature_store.primary_sort_key and version.parse(pl.__version__) >= version.parse("1.37.0"):
             left_lf = left_lf.set_sorted(feature_store.primary_sort_key)
             right_lf = right_lf.set_sorted(feature_store.primary_sort_key)
-        table = left_lf.join(right_lf, on=feature_store.sort_keys, how="left", coalesce=True).collect(engine="streaming").lazy()
+        table = left_lf.join(right_lf, on=feature_store.sort_keys, how="left", coalesce=True)
 
-    result = table.sort(feature_store.sort_keys).rename({key: f"{key}_{table_meta['table_addr']}" for key in feature_store.sort_keys})
+    result = table.sort(feature_store.sort_keys)
     return result.collect() if materialize else result
 
 
@@ -828,23 +825,18 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return tables
 
     def _load_features_from_tables(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
-        frames = [
-            read_table(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end)
-            for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")
-        ]
-        addresses = tables.filter(pl.col("signal_type") != "runtime_computed")["table_addr"].unique()
-        root_features = (
-            pl.concat(frames, how="horizontal")
-            .lazy()
-            .with_columns([pl.coalesce(pl.col([f"{key}_{addr}" for addr in addresses]).alias(key)) for key in self.sort_keys])
-        )
-        return self._compute_runtime_features(tables, root_features).select(tables["feature_name"].to_list() + self.sort_keys)
+        groups = [frame for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")]
+        sources = {
+            "index": self.index_frame(start, end).sort(self.sort_keys),
+            **{
+                frame["table_addr"].first(): read_table(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end)
+                for frame in groups
+            },
+        }
+        return self._scan_feature_sources(tables, sources)
 
     def _load_features_from_tables_in_parallel(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         groups = [frame for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")]
-        addresses = tables.filter(pl.col("signal_type") != "runtime_computed")["table_addr"].unique()
-        table_addr_coalesce_statements = [pl.coalesce(pl.col([f"{key}_{addr}" for addr in addresses]).alias(key)) for key in self.sort_keys]
-
         table_load_refs = [
             self.switch(read_table)(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end, self.run_on_ray_cluster)
             for frame in groups
@@ -854,8 +846,34 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             ready, table_load_refs = self.wait(table_load_refs)
             frames.append(self.get(ready[0]))
 
-        root_features = pl.concat(frames, how="horizontal").lazy().with_columns(table_addr_coalesce_statements)
-        return self._compute_runtime_features(tables, root_features).select(tables["feature_name"].to_list() + self.sort_keys)
+        sources = {
+            "index": self.index_frame(start, end).sort(self.sort_keys),
+            **{f"feature_{index}": frame.lazy() for index, frame in enumerate(frames)},
+        }
+        return self._scan_feature_sources(tables, sources, predicate_pushdown=False)
+
+    def _scan_feature_sources(
+        self,
+        tables: pl.DataFrame,
+        sources: dict[str, pl.LazyFrame],
+        *,
+        predicate_pushdown: bool = True,
+    ) -> pl.LazyFrame:
+        """Combine canonical index keys with aligned feature values."""
+        columns = tables["feature_name"].to_list() + self.sort_keys
+        has_runtime = tables.filter(pl.col("signal_type") == "runtime_computed").height > 0
+        if has_runtime:
+            return scan_aligned_sources(
+                sources,
+                alignment_columns=self.sort_keys,
+                postprocess=lambda root_features: self._compute_runtime_features(tables, root_features).select(columns),
+                predicate_pushdown=False,
+            )
+        return scan_aligned_sources(
+            sources,
+            alignment_columns=self.sort_keys,
+            predicate_pushdown=predicate_pushdown,
+        ).select(columns)
 
     def _compute_runtime_features(self, feature_table, root_features):
         runtime_computed_features = feature_table.filter(pl.col("signal_type") == "runtime_computed")
@@ -922,7 +940,14 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     ) -> pl.DataFrame:
         """
         Given a list of features, identifies the delta tables with the most up-to-date versions of those features,
-        and reads/sorts/horizontally concatenates those tables.
+        and reads/sorts/horizontally concatenates those tables. Pass ``materialized=False`` to apply downstream
+        filters lazily. Local sort-key filters are coordinated across the bounded global index and each feature
+        scan; Ray reads retain their materialized feature-table path. As-of joins retain right-hand carry-forward
+        context, while runtime-computed reads apply downstream filters after computation so neighbouring-row
+        semantics are preserved.
+
+        Projection-only aggregations such as ``select(pl.len())`` cannot yet prune whole feature sources, so they
+        may scan more data than a direct single-source aggregation.
         """
         targets = targets or []
         feature_metadata = self.feature_metadata_frame().collect()
