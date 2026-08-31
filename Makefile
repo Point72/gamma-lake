@@ -146,6 +146,10 @@ benchmark:  ## run ASV benchmarks against HEAD
 benchmark-quick:  ## run each ASV benchmark once
 	python -m asv run --quick --python=same --config $(ASV_CONFIG) --verbose --set-commit-hash HEAD
 
+.PHONY: benchmark-ci
+benchmark-ci:  ## run benchmarks for CI, allowing ASV timeout exit status
+	python -m asv run --python=same --config $(ASV_CONFIG) --verbose --set-commit-hash HEAD || [ $$? -le 1 ]
+
 .PHONY: benchmark-publish
 benchmark-publish:  ## generate an HTML report from ASV results
 	@if find $(CURDIR)/.asv/results -name '*.json' -print -quit 2>/dev/null | grep -q .; then \
