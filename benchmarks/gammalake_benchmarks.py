@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import time
 import uuid
 import warnings
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ import numpy as np
 import polars as pl
 
 from gammalake import GammaFeatureLake
+from gammalake.tests.base import generate_test_data
 
 N_SYMBOLS = 200
 N_FEATURES = 50
@@ -117,25 +119,84 @@ def _delete_generated_path(storage_path: str) -> None:
 
 
 class GammaLakeWriteSuite:
-    """Benchmark ``GammaFeatureLake.add_features`` at several column counts."""
+    """Benchmark sequential ``GammaFeatureLake.add_features`` merge scenarios."""
 
-    params: ClassVar[list[int]] = [10, 50, 100]
-    param_names: ClassVar[list[str]] = ["n_features"]
-    timeout = 600
-
-    def setup(self, n_features: int) -> None:
+    def setup(self) -> None:
         self._storage_path = _new_run_path("write")
         try:
             self._lake = GammaFeatureLake(base_path=self._storage_path, run_on_ray_cluster=False).initialize()
         except Exception:
             _delete_generated_path(self._storage_path)
             raise
-        self._frame = _make_feature_df(0, n_features)
 
-    def time_add_features(self, n_features: int) -> None:
-        self._lake.add_features(self._frame, owner="benchmark")
+    def track_add_features(self) -> dict[str, float]:
+        """Track latency for overlapping symbols, future dates, and new features."""
+        n_features = 3
+        n_symbols = 5
+        n_days = 10
+        start_date = datetime(2020, 6, 20, tzinfo=UTC)
 
-    def teardown(self, n_features: int) -> None:
+        started = time.perf_counter()
+        frame = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date)
+        self._lake.add_features(frame, owner="benchmark", overlap_mode="merge")
+
+        step_1 = time.perf_counter()
+        frame = generate_test_data(n_features=n_features, n_symbols=2 * n_symbols, n_days=n_days, start_date=start_date)
+        self._lake.add_features(frame, owner="benchmark", overlap_mode="merge")
+
+        step_2 = time.perf_counter()
+        frame = generate_test_data(
+            n_features=n_features,
+            n_symbols=10,
+            symbols_id_start=10,
+            n_days=n_days,
+            start_date=start_date,
+        )
+        self._lake.add_features(frame, owner="benchmark", overlap_mode="merge")
+
+        step_3 = time.perf_counter()
+        frame = generate_test_data(
+            n_features=n_features,
+            n_symbols=20,
+            symbols_id_start=20,
+            n_days=n_days,
+            start_date=start_date + timedelta(days=20),
+        )
+        self._lake.add_features(frame, owner="benchmark", overlap_mode="merge")
+
+        step_4 = time.perf_counter()
+        frame = generate_test_data(
+            n_features=n_features,
+            n_symbols=20,
+            symbols_id_start=40,
+            feature_ids_start=n_features,
+            n_days=n_days,
+            start_date=start_date + timedelta(days=20),
+        )
+        self._lake.add_features(frame, owner="benchmark", overlap_mode="merge")
+
+        step_5 = time.perf_counter()
+        frame = generate_test_data(
+            n_features=n_features,
+            n_symbols=2 * n_symbols,
+            symbols_id_start=55,
+            feature_ids_start=2 * n_features,
+            n_days=n_days,
+            start_date=start_date + timedelta(days=20),
+        )
+        self._lake.add_features(frame, owner="benchmark", overlap_mode="merge")
+        finished = time.perf_counter()
+
+        return {
+            "step_1": step_1 - started,
+            "step_2": step_2 - step_1,
+            "step_3": step_3 - step_2,
+            "step_4": step_4 - step_3,
+            "step_5": step_5 - step_4,
+            "step_6": finished - step_5,
+        }
+
+    def teardown(self) -> None:
         _delete_generated_path(self._storage_path)
 
 

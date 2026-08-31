@@ -18,6 +18,9 @@ make benchmark
 make benchmark-quick
 ```
 
+CI can use `make benchmark-ci`, which runs the full suite while treating ASV's
+timeout status as non-fatal and still failing on other errors.
+
 Results and reports are generated under `.asv/`. Use `make benchmark-publish`
 to build the HTML report, `make benchmark-view` to preview it, and
 `make benchmark-clean` to remove generated benchmark data and reports.
@@ -43,7 +46,9 @@ roles. The benchmark harness does not fetch or configure credentials.
 
 ## Suite parameters
 
-- `GammaLakeWriteSuite`: 10, 50, and 100 feature columns.
+- `GammaLakeWriteSuite`: six sequential merge writes covering existing and new
+  symbols, future dates, and new feature groups.
 - `GammaLakeReadSuite`: 1, 7, and 30 day windows across 1 or 3 feature groups.
 
-The data scale is 200 symbols, 50 features per group, and 30 days.
+The write scenarios use 3 features, 5 to 20 symbols, and 10-day windows. The
+read suite uses 200 symbols, 50 features per group, and 30 days.
