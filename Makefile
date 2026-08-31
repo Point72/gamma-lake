@@ -23,16 +23,16 @@ install:  ## install library
 .PHONY: lint-py lint-docs fix-py fix-docs lint lints fix format
 
 lint-py:  ## lint python with ruff
-	python -m ruff check gammalake
-	python -m ruff format --check gammalake
+	python -m ruff check gammalake benchmarks
+	python -m ruff format --check gammalake benchmarks
 
 lint-docs:  ## lint docs with mdformat and codespell
 	python -m mdformat --check README.md docs/wiki/
 	python -m codespell_lib README.md docs/wiki/
 
 fix-py:  ## autoformat python code with ruff
-	python -m ruff check --fix gammalake
-	python -m ruff format gammalake
+	python -m ruff check --fix gammalake benchmarks
+	python -m ruff format gammalake benchmarks
 
 fix-docs:  ## autoformat docs with mdformat and codespell
 	python -m mdformat README.md docs/wiki/
@@ -127,3 +127,37 @@ help:
 
 print-%:
 	@echo '$*=$($*)'
+
+ASV_CONFIG := $(CURDIR)/benchmarks/asv.conf.json
+
+.PHONY: benchmark-init
+benchmark-init:  ## initialize ASV machine information
+	python -m asv machine --config $(ASV_CONFIG) --verbose --yes
+
+.PHONY: benchmark-check
+benchmark-check:  ## check ASV benchmark discovery
+	python -m asv check --python=same --config $(ASV_CONFIG)
+
+.PHONY: benchmark
+benchmark:  ## run ASV benchmarks against HEAD
+	python -m asv run --python=same --config $(ASV_CONFIG) --verbose --set-commit-hash HEAD
+
+.PHONY: benchmark-quick
+benchmark-quick:  ## run each ASV benchmark once
+	python -m asv run --quick --python=same --config $(ASV_CONFIG) --verbose --set-commit-hash HEAD
+
+.PHONY: benchmark-publish
+benchmark-publish:  ## generate an HTML report from ASV results
+	@if find $(CURDIR)/.asv/results -name '*.json' -print -quit 2>/dev/null | grep -q .; then \
+		python -m asv publish --config $(ASV_CONFIG); \
+	else \
+		echo "No benchmark results found, skipping publish"; \
+	fi
+
+.PHONY: benchmark-view
+benchmark-view: benchmark-publish  ## preview the ASV HTML report
+	python -m asv preview --config $(ASV_CONFIG)
+
+.PHONY: benchmark-clean
+benchmark-clean:  ## remove generated benchmark data and reports
+	rm -rf $(CURDIR)/.asv/benchmark-data $(CURDIR)/.asv/results $(CURDIR)/.asv/html
