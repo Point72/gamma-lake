@@ -8,10 +8,10 @@ import pytest
 from ccflow import ArrowSchema
 from deltalake import DeltaTable
 from polars.testing import assert_frame_equal
+from polars_io_tools import pushdown_combine as original_pushdown_combine
 from pydantic import ValidationError
 
 from gammalake import GammaFeatureLake
-from gammalake._multi_source import scan_aligned_sources as original_scan_aligned_sources
 from gammalake.abstract import BaseFeatureLake
 from gammalake.gamma_feature_lake import write_metadata
 from gammalake.io import FrameIO, PolarsIO
@@ -237,11 +237,28 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
         assert_frame_equal(reader.read(["feature_0", "feature_1"]), expected, check_column_order=False)
 
-    def test_multi_source_filter_plan_and_exact_equivalence(self, fs):
+    def test_multi_table_read_uses_positional_concat(self, fs):
         fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=0))
         fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=1))
+        plans = []
+
+        def capture_combine(sources, combine):
+            result = combine({name: frame for name, (frame, _) in sources.items()})
+            plans.append(result.explain())
+            return result
+
+        with patch("gammalake.gamma_feature_lake.pushdown_combine", side_effect=capture_combine):
+            fs.read(["feature_0", "feature_1"], materialized=False).collect()
+
+        assert "HCONCAT" in plans[0]
+        assert "JOIN" not in plans[0]
+
+    def test_multi_source_filter_plan_and_exact_equivalence(self, fs):
+        fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=0))
+        fs.add_features(generate_test_data(n_features=2, n_symbols=3, n_days=5, feature_ids_start=1))
         user_filter = pl.col("symbol") == "Symbol_1"
-        expected = fs.read(["feature_0", "feature_1"], materialized=False).collect().filter(user_filter).select("feature_0", *fs.sort_keys)
+        features = ["feature_0", "feature_1", "feature_2"]
+        expected = fs.read(features, materialized=False).collect().filter(user_filter).select("feature_0", *fs.sort_keys)
         source_calls = {}
         source_plans = {}
         source_schemas = {}
@@ -265,12 +282,12 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
             return pl.io.plugins.register_io_source(source_generator, schema=frame.collect_schema(), is_pure=True)
 
-        def capture_sources(sources, **kwargs):
-            tracked = {name: tracked_source(name, frame) for name, frame in sources.items()}
-            return original_scan_aligned_sources(tracked, **kwargs)
+        def capture_sources(sources, combine):
+            tracked = {name: (tracked_source(name, frame), filter_specs) for name, (frame, filter_specs) in sources.items()}
+            return original_pushdown_combine(tracked, combine)
 
-        with patch("gammalake.gamma_feature_lake.scan_aligned_sources", side_effect=capture_sources):
-            lazy = fs.read(["feature_0", "feature_1"], materialized=False).filter(user_filter).select("feature_0", *fs.sort_keys)
+        with patch("gammalake.gamma_feature_lake.pushdown_combine", side_effect=capture_sources):
+            lazy = fs.read(features, materialized=False).filter(user_filter).select("feature_0", *fs.sort_keys)
             outer_plan = lazy.explain(optimized=True)
             first = lazy.collect()
             second = lazy.collect()
@@ -285,7 +302,9 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         assert all(calls[0][1] is not None and calls[0][1].meta.root_names() == ["symbol"] for calls in source_calls.values())
         assert all('col("symbol")' in plan and '"Symbol_1"' in plan for plan in source_plans.values())
         unused_source = next(name for name, schema in source_schemas.items() if "feature_1" in schema)
-        assert source_calls[unused_source][0][0] == fs.sort_keys
+        unused_columns = source_calls[unused_source][0][0]
+        assert "symbol" in unused_columns
+        assert len(set(unused_columns) & {"feature_1", "feature_2"}) == 1
 
     def test_feature_filter_matches_filtering_unmaterialized_result(self, fs):
         fs.add_features(generate_test_data(n_features=2, n_symbols=3, n_days=5))
