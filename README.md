@@ -83,11 +83,157 @@ with tempfile.TemporaryDirectory() as tmp:
 
 Run the full annotated demo: [`examples/quickstart.py`](examples/quickstart.py)
 
+## How Gamma Lake Works
+
+### The index and feature groups
+
+Gamma Lake assumes each feature row has a unique, strictly ordered tuple key. In finance, `(timestamp, symbol)` is a
+common choice. A lake stores one master index Delta table and one Delta table per feature group:
+
+![Gamma Lake index and feature groups](docs/assets/gammalake/20250728092757.png)
+
+Dense feature groups persist rows in canonical index order over their covered range. Missing rows inside that range
+are stored explicitly for alignment, while a group may remain shorter when the index grows only beyond its latest
+update. Reads never need keyed joins: Polars pads any missing trailing values during horizontal concatenation. Delta
+files are not assumed to be physically ordered; each source is sorted by the configured sort keys before assembly.
+
+As-of and sparse feature tables are intentionally not padded. Their read paths first align them to the bounded master
+index with as-of and left joins, respectively, before they enter the same positional assembly path.
+
+### Reading features
+
+A read:
+
+1. Resolves the minimum set of feature-group tables containing the requested features.
+1. Applies range and supported sort-key predicates to the master index and each source.
+1. Sorts each source by the same key order.
+1. Takes keys from the master index, drops duplicate keys from feature groups, and concatenates the feature values
+   horizontally.
+
+![Reading aligned feature groups using the index](docs/assets/gammalake/20250728093051.png)
+
+This positional concatenation is the central Gamma Lake invariant: it avoids repeated key hashing and multi-way joins
+as feature groups accumulate.
+
+Feature groups do not need to end at the same index value:
+
+![Partially updated feature groups](docs/assets/gammalake/20250728093638.png)
+
+Polars pads shorter groups with implicit trailing nulls during horizontal concatenation:
+
+![Concatenated feature groups with implicit nulls](docs/assets/gammalake/20250728093712.png)
+
+The nulls are not stored in the shorter Delta tables. A useful mental model separates persisted values from the
+implicit aligned tail:
+
+![Persisted and implicit Gamma Lake values](docs/assets/gammalake/20250728093901.png)
+
+### Adding new rows and feature groups
+
+When incoming keys extend beyond the current range, Gamma Lake writes the feature values and appends the keys to the
+master index once. Untouched dense groups may remain shorter because their missing trailing values are implicit.
+Adding or updating a dense group writes explicit alignment rows for gaps inside that group's covered range.
+
+For example, appending values that continue a partially updated group requires no other table changes:
+
+![New values that continue an existing feature group](docs/assets/gammalake/20250728093926.png)
+
+![Feature group after a straightforward append](docs/assets/gammalake/20250728094124.png)
+
+If an append skips index values inside the group's covered range, Gamma Lake stores null alignment rows for those
+internal gaps:
+
+![New values with gaps in the covered range](docs/assets/gammalake/20250728094155.png)
+
+![Feature group padded across internal gaps](docs/assets/gammalake/20250728094204.png)
+
+Independent updates to multiple groups can run together:
+
+![Simultaneous updates to multiple feature groups](docs/assets/gammalake/20250728094723.png)
+
+![Feature groups after simultaneous updates](docs/assets/gammalake/20250728094834.png)
+
+The resulting read remains positionally aligned:
+
+![Concatenated result after simultaneous updates](docs/assets/gammalake/20250728094920.png)
+
+New keys can also fall inside the existing master-index range:
+
+![New index values inside the existing range](docs/assets/gammalake/20250728095001.png)
+
+Groups covering that range receive explicit alignment rows where needed. Groups whose covered prefix ends before the
+new key remain untouched:
+
+![Feature groups after inserting a new index value](docs/assets/gammalake/20250728095036.png)
+
+The read result combines stored values with implicit trailing nulls:
+
+![Read result after inserting a new index value](docs/assets/gammalake/20250728095341.png)
+
+![Stored and implicit null values after the update](docs/assets/gammalake/20250728100128.png)
+
+Backfills can therefore be expensive. Adding a new secondary-key value across historical primary-key periods may
+require alignment updates to many feature groups; adding it only for future periods does not.
+
+If incoming rows overlap existing rows, `overlap_mode="copy"` creates a new versioned Delta table, while
+`overlap_mode="merge"` performs an in-place Delta merge. Both paths preserve the alignment invariant.
+
+Consider an update to a partially populated feature group:
+
+![Partially populated feature group before an overlap](docs/assets/gammalake/20250728100359.png)
+
+![Overlapping feature values](docs/assets/gammalake/20250728100441.png)
+
+The default copy mode creates a new version while retaining the previous table:
+
+![Versioned copy of an overlapping feature group](docs/assets/gammalake/20250728100529.png)
+
+Merge mode instead updates the current physical table:
+
+![Merged overlapping feature group](docs/assets/gammalake/20250728100701.png)
+
+Default reads select the latest feature version. Copy mode preserves earlier physical tables that can be selected by
+filtering the metadata frame. Merge mode reuses the current table and does not retain pre-merge values as a separate
+feature version.
+
+### Lazy predicate pushdown
+
+Local lazy reads use `polars-io-tools` to coordinate supported sort-key predicates into the bounded index and every
+feature source before positional concatenation. Runtime-computed reads defer downstream predicates until after
+computation to preserve neighbour context. As-of reads retain the right-hand history required for carry-forward
+semantics.
+
+Projection-only aggregations remain correct, but a requested feature group that is later projected away must still
+read one column to preserve its row count during horizontal concatenation.
+
+### Parallel I/O
+
+With `run_on_ray_cluster=True`, Gamma Lake dispatches feature-group operations independently through Ray. Group writes
+and the single master-index update run in parallel. Metadata becomes visible only after the feature and index writes
+succeed.
+
+### Metadata and versioning
+
+Every feature write records its name, version, owner, table address, signal type, and optional feature parameters.
+`read()` selects the latest version by default; pass a filtered metadata frame to select an owner or historical
+version explicitly.
+
+| Concept               | Implementation                                                    |
+| --------------------- | ----------------------------------------------------------------- |
+| Master index          | One Delta table containing every configured sort-key tuple        |
+| Dense feature group   | Canonically ordered rows; missing trailing index values implicit  |
+| As-of or sparse group | Sparse physical table aligned to the index during reads           |
+| New index rows        | Extend the index once; preserve aligned prefixes                  |
+| Overlapping rows      | Versioned copy or Delta merge                                     |
+| Cross-group assembly  | Predicate-distributed positional horizontal concatenation         |
+| Parallel I/O          | Ray task per feature group                                        |
+| Versioning            | Append-only metadata records owner and version per feature column |
+
 ## Documentation
 
 | Document                                                                    | Description                                                 |
 | --------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| [Architecture](https://github.com/Point72/gamma-lake/wiki/Overview)         | Index design, feature groups, and append/merge semantics    |
+| [Architecture](#how-gamma-lake-works)                                       | Index design, feature groups, and append/merge semantics    |
 | [Best practices](https://github.com/Point72/gamma-lake/wiki/Best-Practices) | Recommended versioning, update, and parallel-write patterns |
 | [Performance](https://github.com/Point72/gamma-lake/wiki/Performance)       | Benchmark comparison against per-day Parquet files          |
 | [docs/benchmarking.md](docs/benchmarking.md)                                | Running the portable ASV read/write benchmarks              |
