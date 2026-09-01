@@ -194,6 +194,8 @@ def update_feature_tables(
     signal_type: str,
     overlap_mode: str = "copy",
     feature_params: dict | None = None,
+    feature_metadata: pl.DataFrame | None = None,
+    table_metadata: pl.DataFrame | None = None,
 ) -> tuple[pa.Table, pa.Table | None]:
     """
     Processes step 1 of the Gamma Lake add operation for new input frames. Index modification happens outside this function, in parallel, and only once.
@@ -272,7 +274,7 @@ def update_feature_tables(
         if table_addr is None:
             # These features have never been seen before. Add them to a new table, address the new/missing index rows where applicable, and return.
             # sparse_feature tables never receive null sentinel rows — only rows with actual values are stored.
-            feature_df = feature_store._get_latest_feature_tables(columns).filter(pl.col("table_addr").is_null())
+            feature_df = feature_store._get_latest_feature_tables(columns, feature_metadata=feature_metadata).filter(pl.col("table_addr").is_null())
             table_addr, new_feature_metadata_row = feature_store._write_new_feature_table(feature_df, owner, signal_type, feature_params)
             rows_to_write = (
                 pl.concat([inner_join_ref, new_index_rows_ref], how="diagonal")
@@ -295,9 +297,9 @@ def update_feature_tables(
                 new_feature_metadata_row.to_arrow(),
             )
 
-        feature_df = feature_store._get_latest_feature_tables(columns).filter(pl.col("table_addr") == table_addr)
+        feature_df = feature_store._get_latest_feature_tables(columns, feature_metadata=feature_metadata).filter(pl.col("table_addr") == table_addr)
         columns = feature_store.sort_keys + feature_df["feature_name"].to_list()
-        last_updated = feature_store._get_last_updated(table_addr)
+        last_updated = feature_store._get_last_updated(table_addr, table_metadata=table_metadata)
         feature_metadata_row = None
 
         if input_length == new_index_rows_ref.height:
@@ -486,44 +488,25 @@ def update_index(feature_store, new_index_rows_ref):
         )
 
 
-def inner_join_compute(feature_store, df):
-    """
-    Computes an inner join between a feature store index and an input frame, and returns metadata about the input frame.
-    """
-    inner_join_ref = (
-        feature_store.index_frame()
-        .filter(pl.col(feature_store.primary_sort_key) >= df[feature_store.primary_sort_key].min())
-        .collect()
-        .join(df, how="inner", on=feature_store.sort_keys)
-        .select(df.columns)
-    )
-    input_comparable_max = df[feature_store.primary_sort_key].max()
-    input_comparable_min = df[feature_store.primary_sort_key].min()
-    return inner_join_ref, input_comparable_max, input_comparable_min, df.height, df.columns
+def compute_index_deltas(feature_store, df):
+    """Compute all index/input relationships needed by ``_add`` with one index scan."""
+    primary_sort_key = feature_store.primary_sort_key
+    input_comparable_max = df[primary_sort_key].max()
+    input_comparable_min = df[primary_sort_key].min()
+    index = feature_store.index_frame().filter(pl.col(primary_sort_key) <= input_comparable_max).collect()
 
-
-def new_index_rows(feature_store, df):
-    """Returns rows in the input frame which are missing from the index."""
-    new_index_rows = df.join(
-        feature_store.index_frame()
-        .filter(
-            (pl.col(feature_store.primary_sort_key) >= df[feature_store.primary_sort_key].min())
-            & (pl.col(feature_store.primary_sort_key) <= df[feature_store.primary_sort_key].max())
-        )
-        .collect(),
-        how="anti",
-        on=feature_store.sort_keys,
-    )
-    return new_index_rows, new_index_rows[feature_store.primary_sort_key].min()
-
-
-def missing_input_rows(feature_store, df):
-    """Returns rows in the index which are missing from the input frame."""
+    inner_join_ref = index.join(df, how="inner", on=feature_store.sort_keys).select(df.columns)
+    new_index_rows = df.join(index, how="anti", on=feature_store.sort_keys)
+    missing_index_rows = index.join(df, how="anti", on=feature_store.sort_keys)
     return (
-        feature_store.index_frame()
-        .filter(pl.col(feature_store.primary_sort_key) <= df[feature_store.primary_sort_key].max())
-        .collect()
-        .join(df, how="anti", on=feature_store.sort_keys)
+        inner_join_ref,
+        input_comparable_max,
+        input_comparable_min,
+        df.height,
+        df.columns,
+        new_index_rows,
+        new_index_rows[primary_sort_key].min(),
+        missing_index_rows,
     )
 
 
@@ -867,9 +850,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return features.collect() if materialized else features
 
     @ensure_deltalake_is_initialized
-    def _get_latest_feature_tables(self, feature_columns):
+    def _get_latest_feature_tables(self, feature_columns, feature_metadata: pl.DataFrame):
         pure_feature_columns = pl.Series("feature_name", list(set(feature_columns) - set(self.sort_keys)), dtype=pl.String)
-        return _latest_per_feature(self.feature_metadata_frame().collect()).join(pure_feature_columns.to_frame(), how="right", on="feature_name")
+        return _latest_per_feature(feature_metadata).join(pure_feature_columns.to_frame(), how="right", on="feature_name")
 
     @ensure_deltalake_is_initialized
     def _write_new_feature_table(self, feature_df, owner, signal_type, feature_params) -> tuple[str, pl.DataFrame]:
@@ -890,7 +873,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return table_addr, feature_df
 
     @ensure_deltalake_is_initialized
-    def _get_tables_to_update(self, feature_columns, min_value, metadata=None) -> pl.DataFrame:
+    def _get_tables_to_update(
+        self,
+        feature_columns,
+        min_value,
+        metadata=None,
+        *,
+        feature_metadata: pl.DataFrame,
+        table_metadata: pl.DataFrame,
+    ) -> pl.DataFrame:
         """
         We need to append antijoined rows between the input frame and index in the following cases:
           - A table has no overlap in columns with the input features AND its last_updated date is more recent than the oldest date in the antijoin.
@@ -904,18 +895,14 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """
         if min_value is None:
             return pl.DataFrame()
-        do_not_update = self._get_latest_feature_tables(feature_columns).filter(pl.col("table_addr").is_not_null()) if metadata is None else metadata
-        excluded_addrs = (
-            self.feature_metadata_frame()
-            .filter(pl.col("signal_type").is_in(["as_of_feature", "sparse_feature"]))
-            .select("table_addr")
-            .unique()
-            .collect()
+        do_not_update = (
+            self._get_latest_feature_tables(feature_columns, feature_metadata=feature_metadata).filter(pl.col("table_addr").is_not_null())
+            if metadata is None
+            else metadata
         )
+        excluded_addrs = feature_metadata.filter(pl.col("signal_type").is_in(["as_of_feature", "sparse_feature"])).select("table_addr").unique()
         return (
-            self.table_metadata_frame()
-            .collect()
-            .join(do_not_update, how="anti", on="table_addr")
+            table_metadata.join(do_not_update, how="anti", on="table_addr")
             .join(excluded_addrs, how="anti", on="table_addr")
             .filter(pl.col("last_updated") >= min_value)
         )
@@ -926,10 +913,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self.feature_metadata_frame().filter(pl.col("signal_type") == "target").collect()["feature_name"].unique().to_list()
 
     @ensure_deltalake_is_initialized
-    def _get_last_updated(self, table_addr):
+    def _get_last_updated(self, table_addr, table_metadata: pl.DataFrame):
         """Shorthand to find the last updated value for a given table address"""
         return (
-            self.table_metadata_frame()
+            table_metadata.lazy()
             .filter(pl.col("table_addr") == table_addr)
             .select(pl.col("last_updated").filter(pl.col("update_timestamp") == pl.col("update_timestamp").max()).first().alias("last_updated"))
             .collect()
@@ -973,14 +960,25 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             raise ValueError("Invalid RayObjectRef input! This class is configured not to use remote functions.")
 
         df = self.switch(preprocess_df)(self, df)
-        inner_join_ref, primary_sort_key_max, primary_sort_key_min, input_length, columns = self.switch(inner_join_compute, num_returns=5)(self, df)
-        new_index_rows_ref, earliest_new_index_rows_ref = self.switch(new_index_rows, num_returns=2)(self, df)
-        missing_index_rows_ref = self.switch(missing_input_rows)(self, df)
-        feature_tables = self._get_latest_feature_tables(self.get(columns))
+        (
+            inner_join_ref,
+            primary_sort_key_max,
+            primary_sort_key_min,
+            input_length,
+            columns,
+            new_index_rows_ref,
+            earliest_new_index_rows_ref,
+            missing_index_rows_ref,
+        ) = self.switch(compute_index_deltas, num_returns=8)(self, df)
+        feature_metadata = self.feature_metadata_frame().collect()
+        table_metadata = self.table_metadata_frame().collect()
+        feature_tables = self._get_latest_feature_tables(self.get(columns), feature_metadata=feature_metadata)
         tables_to_update = self._get_tables_to_update(
             self.get(columns),
             self.get(earliest_new_index_rows_ref),
             metadata if metadata is not None else feature_tables.filter(pl.col("table_addr").is_not_null()),
+            feature_metadata=feature_metadata,
+            table_metadata=table_metadata,
         )
         refs = []
         # Step 1: Append-only if no overlap; otherwise merge in-place into the existing DeltaTable (upsert).
@@ -1001,6 +999,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 signal_type=signal_type,
                 feature_params=feature_params,
                 overlap_mode=overlap_mode,
+                feature_metadata=feature_metadata,
+                table_metadata=table_metadata,
             )
             for table_addr in feature_tables["table_addr"].unique()
         ]
