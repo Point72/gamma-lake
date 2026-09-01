@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 import polars as pl
+import polars_io_tools as piot
 from deltalake import DeltaTable
 
 __all__ = (
@@ -111,16 +112,20 @@ class FrameIO(ABC):
 
 
 class PolarsIO(FrameIO):
-    """An implementation of FrameIO using native polars Delta table I/O."""
+    """An implementation of FrameIO using polars-io-tools Delta I/O."""
 
     def write_delta(self, df, target, *, delta_write_options=None, **kwargs):
-        delta_write_options = delta_write_options or {}
-        if isinstance(df, pl.LazyFrame):
-            df = df.collect()
-        return df.write_delta(target, delta_write_options=delta_write_options, **kwargs)
+        frame = df if isinstance(df, pl.LazyFrame) else df.lazy()
+        return piot.sink_delta(
+            frame,
+            target,
+            chunk_size=-1,
+            delta_write_options=delta_write_options,
+            **kwargs,
+        )
 
     def scan_delta(self, target, **kwargs):
-        return pl.scan_delta(target, **kwargs)
+        return piot.scan_delta(target, **kwargs)
 
     def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
         """Restore a Delta table to ``timestamp`` using deltalake."""

@@ -755,10 +755,31 @@ def test_optional_backend_extensions_remain_compatible():
 
 def test_polars_io_forwards_delta_configuration():
     configuration = {"delta.dataSkippingStatsColumns": "timestamp,symbol"}
-    with patch.object(pl.DataFrame, "write_delta") as mock_write:
+    with patch("gammalake.io.piot.sink_delta") as mock_write:
         PolarsIO().write_delta(pl.DataFrame({"value": [1]}), "unused", delta_write_options={"configuration": configuration})
 
-    mock_write.assert_called_once_with("unused", delta_write_options={"configuration": configuration})
+    frame, target = mock_write.call_args.args
+    assert isinstance(frame, pl.LazyFrame)
+    assert target == "unused"
+    assert mock_write.call_args.kwargs == {
+        "chunk_size": -1,
+        "delta_write_options": {"configuration": configuration},
+    }
+
+
+def test_polars_io_writes_lazy_frames(tmp_path):
+    frame = pl.LazyFrame(
+        {
+            "timestamp": pl.Series([datetime(2024, 1, 1, tzinfo=UTC)]).cast(pl.Datetime("us", "UTC")),
+            "value": [1.0],
+        }
+    )
+    io = PolarsIO()
+    path = str(tmp_path / "lazy_frame")
+
+    io.write_delta(frame, path, mode="overwrite")
+
+    assert_frame_equal(io.scan_delta(path).collect(), frame.collect())
 
 
 def test_add_features_single_commit_per_metadata_table(tmp_path):
