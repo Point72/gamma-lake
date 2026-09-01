@@ -2961,8 +2961,8 @@ class GammaFeatureLakeTestsMixin:
         3. **Read path — nulls for missing rows**: ``fs.read()`` of a sparse feature returns every
            row in the bounded index with ``null`` where the sparse feature has no observation.
 
-        4. **Read path — bounded index scan**: the returned rows are bounded by the max sparse
-           date, so rows in the global index beyond the last sparse observation are not returned.
+        4. **Read path — global index coverage**: rows after the last sparse observation remain in
+           the result with null sparse values.
         """
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         n_symbols, n_days = 4, 20
@@ -3019,9 +3019,11 @@ class GammaFeatureLakeTestsMixin:
         )
         assert_frame_equal(null_keys.sort(fs.sort_keys), expected_null_keys.sort(fs.sort_keys))
 
-        # --- Invariant 4: rows beyond max(sparse date) are not returned ---
+        # --- Invariant 4: rows beyond max(sparse date) remain with null sparse values ---
         beyond_cutoff = result.filter(pl.col(fs.primary_sort_key) > sparse_cutoff)
-        assert beyond_cutoff.height == 0, f"read() returned {beyond_cutoff.height} rows beyond the sparse cutoff date — index scan must be bounded"
+        expected_beyond = fs.index_frame().collect().filter(pl.col(fs.primary_sort_key) > sparse_cutoff)
+        assert_frame_equal(beyond_cutoff.select(fs.sort_keys).sort(fs.sort_keys), expected_beyond.select(fs.sort_keys).sort(fs.sort_keys))
+        assert beyond_cutoff["sparse_val"].is_null().all()
 
     def _test_read_with_filtered_metadata_resolves_runtime_upstream_features(self, fs: GammaFeatureLake):
         """When passing a filtered feature_metadata DataFrame to read(), runtime features whose upstream

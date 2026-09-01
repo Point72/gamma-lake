@@ -11,6 +11,7 @@ from polars.testing import assert_frame_equal
 from pydantic import ValidationError
 
 from gammalake import GammaFeatureLake
+from gammalake._multi_source import scan_aligned_sources as original_scan_aligned_sources
 from gammalake.gamma_feature_lake import write_metadata
 from gammalake.io import PolarsIO
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
@@ -177,6 +178,205 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         assert isinstance(table_meta, dict)
         assert isinstance(features, list)
         assert {"table_addr", "signal_type", "feature_params"} <= table_meta.keys()
+
+    @pytest.mark.parametrize("run_on_ray_cluster", [False, True])
+    def test_multi_table_read_preserves_horizontal_alignment(self, run_on_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+        days = pl.datetime_range(
+            datetime(2020, 1, 1, tzinfo=UTC),
+            datetime(2020, 1, 3, tzinfo=UTC),
+            interval="1d",
+            eager=True,
+            time_zone="UTC",
+        )
+        keys = pl.DataFrame({"timestamp": [day for day in days for _ in ("S0", "S1")], "symbol": ["S0", "S1"] * len(days)})
+        feature_0 = keys.with_columns(pl.Series("feature_0", [10.0, 11.0, 20.0, 21.0, 30.0, 31.0]))
+        feature_1 = keys.with_columns(pl.Series("feature_1", [100.0, 101.0, 200.0, 201.0, 300.0, 301.0]))
+        fs.add_features(feature_0)
+        fs.add_features(feature_1)
+        reader = fs.model_copy(update={"run_on_ray_cluster": run_on_ray_cluster})
+
+        expected = feature_0.join(feature_1, on=fs.sort_keys).select(["feature_0", "feature_1"] + fs.sort_keys)
+
+        assert_frame_equal(reader.read(["feature_0", "feature_1"]), expected, check_column_order=False)
+
+    def test_multi_source_filter_plan_and_exact_equivalence(self, fs):
+        fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=0))
+        fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=1))
+        user_filter = pl.col("symbol") == "Symbol_1"
+        expected = fs.read(["feature_0", "feature_1"], materialized=False).collect().filter(user_filter).select("feature_0", *fs.sort_keys)
+        source_calls = {}
+        source_plans = {}
+        source_schemas = {}
+
+        def tracked_source(name, frame):
+            source_schemas[name] = frame.collect_schema()
+
+            def source_generator(with_columns, predicate, n_rows, batch_size):
+                source_calls.setdefault(name, []).append((with_columns, predicate))
+                query = frame.filter(predicate) if predicate is not None else frame
+                source_plans[name] = query.explain(optimized=True)
+                if n_rows is not None:
+                    query = query.head(n_rows)
+                if with_columns is not None:
+                    query = query.select(with_columns)
+                result = query.collect()
+                if batch_size is None or result.is_empty():
+                    yield result
+                else:
+                    yield from result.iter_slices(n_rows=batch_size)
+
+            return pl.io.plugins.register_io_source(source_generator, schema=frame.collect_schema(), is_pure=True)
+
+        def capture_sources(sources, **kwargs):
+            tracked = {name: tracked_source(name, frame) for name, frame in sources.items()}
+            return original_scan_aligned_sources(tracked, **kwargs)
+
+        with patch("gammalake.gamma_feature_lake.scan_aligned_sources", side_effect=capture_sources):
+            lazy = fs.read(["feature_0", "feature_1"], materialized=False).filter(user_filter).select("feature_0", *fs.sort_keys)
+            outer_plan = lazy.explain(optimized=True)
+            first = lazy.collect()
+            second = lazy.collect()
+
+        assert_frame_equal(first, expected)
+        assert_frame_equal(second, expected)
+        assert "PYTHON SCAN" in outer_plan
+        assert 'col("symbol")' in outer_plan
+        assert '"Symbol_1"' in outer_plan
+        assert len(source_calls) == 3
+        assert all(len(calls) == 2 for calls in source_calls.values())
+        assert all(calls[0][1] is not None and calls[0][1].meta.root_names() == ["symbol"] for calls in source_calls.values())
+        assert all('col("symbol")' in plan and '"Symbol_1"' in plan for plan in source_plans.values())
+        unused_source = next(name for name, schema in source_schemas.items() if "feature_1" in schema)
+        assert source_calls[unused_source][0][0] == fs.sort_keys
+
+    def test_feature_filter_matches_filtering_unmaterialized_result(self, fs):
+        fs.add_features(generate_test_data(n_features=2, n_symbols=3, n_days=5))
+        lazy = fs.read(["feature_0", "feature_1"], materialized=False)
+        user_filter = pl.col("feature_0") > pl.col("feature_0").median()
+
+        expected = lazy.collect().filter(user_filter)
+        result = lazy.filter(user_filter).collect()
+
+        assert_frame_equal(result, expected)
+
+    def test_projection_only_aggregation_remains_correct(self, fs):
+        fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=0))
+        fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=1))
+
+        result = fs.read(["feature_0", "feature_1"], materialized=False).select(pl.len()).collect()
+
+        assert result.item() == fs.index_frame().select(pl.len()).collect().item()
+
+    def test_runtime_features_compute_before_lazy_filter(self, tmp_path):
+        fs = GammaFeatureLake(
+            base_path=str(tmp_path),
+            run_on_ray_cluster=False,
+            enable_runtime_computed_features=True,
+        ).initialize()
+        days = [datetime(2020, 1, day, tzinfo=UTC) for day in range(1, 6)]
+        fs.add_features(pl.DataFrame({"timestamp": days, "symbol": ["S0"] * len(days), "feature_0": [10.0, 20.0, 30.0, 40.0, 50.0]}))
+        fs.add_runtime_computed_features([pl.col("feature_0").shift(1).alias("feature_0_lagged")])
+        user_filter = pl.col("timestamp") == days[2]
+
+        expected = fs.read(["feature_0_lagged"]).filter(user_filter)
+        result = fs.read(["feature_0_lagged"], materialized=False).filter(user_filter).collect()
+
+        assert_frame_equal(result, expected)
+        assert result["feature_0_lagged"].item() == 20.0
+
+    def test_as_of_features_compute_before_lazy_filter(self, fs):
+        days = [datetime(2020, 1, day, tzinfo=UTC) for day in range(1, 5)]
+        fs.add_as_of_features(
+            pl.DataFrame({"timestamp": [days[0], days[2]], "symbol": ["S0", "S0"], "as_of": [10.0, 30.0]}),
+            params={"strategy": "backward"},
+        )
+        fs.add_features(pl.DataFrame({"timestamp": days, "symbol": ["S0"] * len(days), "dense": [1.0, 2.0, 3.0, 4.0]}))
+        user_filter = pl.col("timestamp") == days[1]
+
+        expected = fs.read(["as_of"]).filter(user_filter)
+        result = fs.read(["as_of"], materialized=False).filter(user_filter).collect()
+
+        assert_frame_equal(result, expected)
+        assert result["as_of"].item() == 10.0
+
+    def test_mixed_dense_sparse_read_aligns_values_to_keys(self, fs):
+        start = datetime(2020, 1, 1, tzinfo=UTC)
+        days = [start + timedelta(days=i) for i in range(6)]
+        dense = pl.DataFrame(
+            {
+                "timestamp": [day for day in days for _ in ("S0", "S1")],
+                "symbol": ["S0", "S1"] * len(days),
+                "dense_0": [float(i) for i in range(2 * len(days))],
+            }
+        )
+        fs.add_features(dense)
+        sparse = pl.DataFrame({"timestamp": [days[1], days[3]], "symbol": ["S1", "S0"], "sparse_val": [111.0, 333.0]})
+        fs.add_sparse_features(sparse)
+
+        result = fs.read(["dense_0", "sparse_val"])
+
+        assert_frame_equal(result.select(fs.sort_keys + ["dense_0"]), dense.select(fs.sort_keys + ["dense_0"]), check_dtypes=False)
+        non_null = result.filter(pl.col("sparse_val").is_not_null())
+        assert_frame_equal(non_null.select(fs.sort_keys + ["sparse_val"]).sort(fs.sort_keys), sparse.sort(fs.sort_keys), check_dtypes=False)
+
+    def test_multi_sparse_read_aligns_when_tails_differ(self, fs):
+        start = datetime(2020, 1, 1, tzinfo=UTC)
+        days = [start + timedelta(days=i) for i in range(5)]
+        fs.add_features(pl.DataFrame({"timestamp": days, "symbol": ["S0"] * len(days), "dense_0": [1.0, 2.0, 3.0, 4.0, 5.0]}))
+        fs.add_sparse_features(pl.DataFrame({"timestamp": [days[0], days[1]], "symbol": ["S0", "S0"], "early_val": [10.0, 20.0]}))
+        fs.add_sparse_features(pl.DataFrame({"timestamp": [days[0], days[3]], "symbol": ["S0", "S0"], "late_val": [30.0, 40.0]}))
+
+        result = fs.read(["early_val", "late_val"])
+        by_day = {row["timestamp"]: row for row in result.iter_rows(named=True)}
+
+        assert by_day[days[0]]["early_val"] == 10.0
+        assert by_day[days[0]]["late_val"] == 30.0
+        assert by_day[days[1]]["early_val"] == 20.0
+        assert by_day[days[1]]["late_val"] is None
+        assert by_day[days[3]]["early_val"] is None
+        assert by_day[days[3]]["late_val"] == 40.0
+        assert by_day[days[4]]["early_val"] is None
+        assert by_day[days[4]]["late_val"] is None
+
+    def test_sparse_read_with_no_rows_in_window_stays_bounded_to_end(self, fs):
+        start = datetime(2020, 1, 1, tzinfo=UTC)
+        days = [start + timedelta(days=i) for i in range(6)]
+        fs.add_features(pl.DataFrame({"timestamp": days, "symbol": ["S0"] * len(days), "dense_0": [float(i) for i in range(len(days))]}))
+        fs.add_sparse_features(pl.DataFrame({"timestamp": [days[4], days[5]], "symbol": ["S0", "S0"], "sparse_val": [40.0, 50.0]}))
+
+        result = fs.read(["dense_0", "sparse_val"], [], days[0], days[2])
+
+        assert result.height == 3
+        assert result["timestamp"].to_list() == days[:3]
+        assert result.filter(pl.col("timestamp").is_null()).is_empty()
+        assert result["sparse_val"].to_list() == [None, None, None]
+
+    def test_non_leading_primary_sort_key_preserves_alignment_and_bounds(self, tmp_path):
+        schema = ArrowSchema.make(pa.schema([("symbol", pa.string()), ("timestamp", pa.timestamp("us", tz="UTC"))]))
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, primary_sort_key="timestamp").initialize(schema=schema)
+        days = [datetime(2020, 1, day, tzinfo=UTC) for day in range(1, 4)]
+        full = pl.DataFrame(
+            {
+                "symbol": ["S0"] * 3 + ["S1"] * 3,
+                "timestamp": days * 2,
+                "feature_0": [10.0, 20.0, 30.0, 11.0, 21.0, 31.0],
+            }
+        )
+        partial = pl.DataFrame({"symbol": ["S0", "S0"], "timestamp": days[:2], "feature_1": [100.0, 200.0]})
+        fs.add_features(full)
+        fs.add_features(partial)
+        lazy = fs.read(["feature_0", "feature_1"], materialized=False)
+        user_filter = pl.col("timestamp") == days[1]
+
+        unfiltered = lazy.collect()
+        filtered = lazy.filter(user_filter).collect()
+        bounded = fs.read(["feature_0", "feature_1"], start=days[1], end=days[1])
+
+        assert_frame_equal(filtered, unfiltered.filter(user_filter))
+        assert_frame_equal(bounded, filtered, check_column_order=False)
+        assert filtered["symbol"].to_list() == ["S0", "S1"]
+        assert filtered["feature_1"].to_list() == [200.0, None]
 
     @pytest.mark.parametrize("modes", [["copy", "merge"], ["merge", "copy"], ["copy"], ["merge"]])
     def test_read_equivalence_across_overlap_modes(self, modes, tmp_path):

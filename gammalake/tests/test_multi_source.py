@@ -73,8 +73,8 @@ def test_projects_only_needed_source_columns():
 
     assert result.equals(pl.DataFrame({"right_value": [100, 200, 300]}))
     assert calls["index"][0][0] in (None, ["key"])
-    assert calls["left"][0][0] == ["left_value"]
-    assert calls["right"][0][0] == ["right_value"]
+    assert calls["left"][0][0] == ["key"]
+    assert calls["right"][0][0] in (None, ["key", "right_value"])
 
 
 def test_returns_empty_filtered_result():
@@ -86,11 +86,13 @@ def test_returns_empty_filtered_result():
     assert result.schema == {"key": pl.Int64, "left_value": pl.Int64, "right_value": pl.Int64}
 
 
-def test_rejects_mismatched_filtered_heights():
+def test_aligns_short_source_to_canonical_keys():
     sources, _ = _sources(right_keys=[1, 2])
 
-    with pytest.raises(pl.exceptions.ComputeError, match="aligned sources have mismatched heights"):
-        scan_aligned_sources(sources, alignment_columns=["key"]).collect()
+    result = scan_aligned_sources(sources, alignment_columns=["key"]).collect()
+
+    expected = pl.DataFrame({"key": [1, 2, 3], "left_value": [10, 20, 30], "right_value": [100, 200, None]})
+    assert result.equals(expected)
 
 
 def test_propagates_source_errors():
@@ -118,3 +120,31 @@ def test_is_safe_to_collect_repeatedly():
     assert first.equals(second)
     assert first.equals(pl.DataFrame({"key": [2], "left_value": [20], "right_value": [200]}))
     assert all(len(source_calls) == 2 for source_calls in calls.values())
+
+
+def test_applies_feature_predicate_after_combining():
+    sources, calls = _sources()
+
+    result = scan_aligned_sources(sources, alignment_columns=["key"]).filter(pl.col("left_value") >= 20).collect()
+
+    expected = pl.DataFrame({"key": [2, 3], "left_value": [20, 30], "right_value": [200, 300]})
+    assert result.equals(expected)
+    assert calls["index"][0][1] is None
+    assert calls["left"][0][1] is not None
+    assert calls["left"][0][1].meta.root_names() == ["left_value"]
+    assert calls["right"][0][1] is None
+
+
+def test_postprocess_preserves_neighbor_context():
+    sources, calls = _sources()
+    query = scan_aligned_sources(
+        sources,
+        alignment_columns=["key"],
+        postprocess=lambda frame: frame.with_columns(pl.col("left_value").shift(1).alias("lagged")),
+        predicate_pushdown=False,
+    ).filter(pl.col("key") == 2)
+
+    result = query.collect()
+
+    assert result["lagged"].item() == 10
+    assert all(source_calls[0][1] is None for source_calls in calls.values())

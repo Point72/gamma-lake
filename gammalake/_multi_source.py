@@ -1,6 +1,6 @@
-"""Lazy positional concatenation for aligned Polars sources."""
+"""Lazy canonical-key alignment for multiple Polars sources."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import polars as pl
 from polars_io_tools import FilterSpec, pushdown_combine
@@ -12,25 +12,31 @@ def scan_aligned_sources(
     sources: Mapping[str, pl.LazyFrame],
     *,
     alignment_columns: Sequence[str],
+    postprocess: Callable[[pl.LazyFrame], pl.LazyFrame] | None = None,
+    predicate_pushdown: bool = True,
 ) -> pl.LazyFrame:
-    """Expose aligned lazy sources as one positionally concatenated LazyFrame.
+    """Expose aligned lazy sources as one canonical-key LazyFrame.
 
-    The first source owns shared alignment columns in the output. Other output
-    columns must occur in exactly one source. Supported constraints on alignment
-    columns are applied to every source before collection, and all predicates are
-    applied to the combined result. Projection is restricted to columns needed
-    from each source.
+    The first source owns the alignment columns and row set. Other output
+    columns must occur in exactly one source. Supported alignment-column
+    constraints are pushed into every source before they are joined to the
+    canonical keys. All predicates are reapplied after optional postprocessing.
 
     Args:
         sources: Ordered names and aligned lazy sources.
         alignment_columns: Columns present with equal types in every source.
+        postprocess: Optional transformation applied after source alignment and
+            before the downstream predicate and projection.
+        predicate_pushdown: Whether alignment-column predicates may be applied
+            to the individual sources before collection.
 
     Returns:
-        A lazy outer scan preserving each source's row order.
+        A lazy frame preserving the canonical first source's row order.
 
     Raises:
         ValueError: If the source schemas do not satisfy the alignment contract.
-        polars.exceptions.ShapeError: If filtered source heights differ.
+        polars.exceptions.ComputeError: If a source contains duplicate
+            alignment keys.
 
     """
     if len(sources) < 2:
@@ -48,8 +54,8 @@ def scan_aligned_sources(
     if missing_from_first:
         raise ValueError(f"source {first_name!r} is missing alignment columns: {sorted(missing_from_first)}")
 
-    output_schema = dict(first_schema)
     output_columns_by_source = {first_name: tuple(first_schema)}
+    output_columns = set(first_schema)
     for name, _ in source_items[1:]:
         schema = source_schemas[name]
         missing = set(alignment_columns) - set(schema)
@@ -61,33 +67,28 @@ def scan_aligned_sources(
             raise ValueError(f"source {name!r} has incompatible alignment column types: {mismatched_types}")
 
         source_output_columns = tuple(column for column in schema if column not in alignment_columns)
-        duplicates = set(source_output_columns) & set(output_schema)
+        duplicates = set(source_output_columns) & output_columns
         if duplicates:
             raise ValueError(f"source {name!r} has duplicate output columns: {sorted(duplicates)}")
-        output_schema.update((column, schema[column]) for column in source_output_columns)
+        output_columns.update(source_output_columns)
         output_columns_by_source[name] = source_output_columns
 
-    marker_columns = tuple(f"__gammalake_alignment_{index}" for index in range(len(source_items)))
-    if set(marker_columns) & set(output_schema):
-        raise ValueError("source columns use reserved GammaLake alignment names")
-
-    def validate_alignment(markers: dict[str, bool | None]) -> bool:
-        if not all(markers.values()):
-            raise pl.exceptions.ShapeError("aligned sources have mismatched heights")
-        return True
-
     def combine(filtered_sources: dict[str, pl.LazyFrame]) -> pl.LazyFrame:
-        pieces = [
-            filtered_sources[name].select(output_columns_by_source[name]).with_columns(pl.lit(True).alias(marker))
-            for marker, (name, _) in zip(marker_columns, source_items, strict=True)
-        ]
-        return (
-            pl.concat(pieces, how="horizontal")
-            .filter(pl.struct(marker_columns).map_elements(validate_alignment, return_dtype=pl.Boolean))
-            .drop(marker_columns)
-        )
+        result = filtered_sources[first_name].select(output_columns_by_source[first_name])
+        for name, _ in source_items[1:]:
+            result = result.join(
+                filtered_sources[name].select(*alignment_columns, *output_columns_by_source[name]),
+                on=alignment_columns,
+                how="left",
+                validate="1:1",
+                coalesce=True,
+                maintain_order="left",
+            )
+        return postprocess(result) if postprocess is not None else result
 
-    filter_specs = {column: FilterSpec() for column in alignment_columns}
+    filter_specs = (
+        {column: FilterSpec() for column in alignment_columns if not source_schemas[first_name][column].is_temporal()} if predicate_pushdown else {}
+    )
     return pushdown_combine(
         sources={name: (source, filter_specs) for name, source in source_items},
         combine=combine,
