@@ -112,6 +112,19 @@ overlapping index range but are not being updated receive `null`-padded rows to 
 
 ______________________________________________________________________
 
+## Lazy Read Pushdown
+
+Local reads use the bounded, sorted global index as the canonical source of sort keys and align feature-only values
+from each requested feature group. For context-free reads, a downstream filter on sort keys is coordinated into the
+index and every feature source before the final result is assembled. As-of joins retain right-hand carry-forward
+context, while runtime-computed reads apply downstream filters after computation to preserve neighbour semantics. Ray
+reads retain the materialized per-table path.
+
+Projection-only aggregations remain correct, but the multi-source scan cannot yet prune an entire unused child source,
+so operations such as `select(pl.len())` may scan more data than a direct single-source aggregation.
+
+______________________________________________________________________
+
 ## Parallel Writes
 
 When `run_on_ray_cluster=True` (the default), Gamma Lake dispatches updates to each feature group table as separate

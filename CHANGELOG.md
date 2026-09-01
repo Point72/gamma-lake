@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* Coordinate local sort-key predicate pushdown across GammaLake sources using `polars-io-tools`, while preserving alignment and runtime/as-of context.
 * Add strict aligned-source concatenation using `polars-io-tools` coordinated predicate pushdown.
 * Modernize GammaLake Ruff hygiene, including independent `FeatureMetadata` version lists and `TypeError` for unsupported read inputs.
 * Resolve `feature_metadata` once per `GammaFeatureLake.read` and pipe it through read helpers to avoid repeated Delta-table scans.
