@@ -131,6 +131,53 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
     def test_parametrized_overlap_modes_read_correctness(self, overlap_mode, fs):
         self._test_parametrized_overlap_modes_read_correctness(fs, overlap_mode=overlap_mode)
 
+    @staticmethod
+    def _clean_frame(symbol: str, *feature_ids: int) -> pl.DataFrame:
+        timestamps = pl.datetime_range(
+            datetime(2020, 6, 20, tzinfo=UTC), datetime(2020, 6, 24, tzinfo=UTC), interval="1d", eager=True, time_zone="UTC"
+        )
+        frame = pl.DataFrame({"timestamp": timestamps, "symbol": symbol})
+        return frame.with_columns(*(pl.arange(0, frame.height).cast(pl.Float64).alias(f"feature_{i}") for i in feature_ids))
+
+    def test_feature_metadata_opened_once_per_read(self, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, enable_runtime_computed_features=True).initialize()
+        fs.add_as_of_features(self._clean_frame("A", 0), params={"strategy": "backward"})
+        fs.add_targets(self._clean_frame("A", 1))
+        fs.add_runtime_computed_features([(pl.col("feature_0") + 1).alias("runtime_feature")])
+
+        with patch.object(type(fs), "feature_metadata_frame", autospec=True, side_effect=type(fs).feature_metadata_frame) as spy:
+            fs.read(["runtime_feature"], targets=["feature_1"])
+            fs.read(["runtime_feature"], targets=["feature_1"])
+
+        assert spy.call_count == 2, "feature_metadata Delta table should be opened exactly once per read without a cross-call cache"
+
+    def test_as_of_read_requires_feature_params(self, fs):
+        fs.add_as_of_features(self._clean_frame("A", 0), params={})
+        metadata = fs.feature_metadata_frame().collect().with_columns(pl.lit(None, dtype=pl.String).alias("feature_params"))
+
+        with pytest.raises(ValueError, match="as_of_feature table .* requires feature_params"):
+            fs.read(metadata)
+
+    def test_parallel_read_passes_builtin_metadata_payload(self, fs):
+        fs.add_features(self._clean_frame("A", 0, 1))
+        tables = fs.feature_metadata_frame().collect()
+        calls = []
+
+        def switch(_self, function, **_kwargs):
+            def capture(*args):
+                calls.append(args)
+                return function(*args)
+
+            return capture
+
+        with patch.object(type(fs), "switch", autospec=True, side_effect=switch):
+            fs._load_features_from_tables_in_parallel(tables).collect()
+
+        _, table_meta, features, *_ = calls[0]
+        assert isinstance(table_meta, dict)
+        assert isinstance(features, list)
+        assert {"table_addr", "signal_type", "feature_params"} <= table_meta.keys()
+
     @pytest.mark.parametrize("modes", [["copy", "merge"], ["merge", "copy"], ["copy"], ["merge"]])
     def test_read_equivalence_across_overlap_modes(self, modes, tmp_path):
         def fs_factory():

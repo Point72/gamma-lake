@@ -515,13 +515,15 @@ def compute_index_deltas(feature_store, df):
     )
 
 
-def read_table(feature_store, table_addr, features, start, end, signal_type, materialize=False) -> pl.LazyFrame | pl.DataFrame:
-    """Reads a path for a feature store, and sorts it."""
+def read_table(feature_store, table_meta: dict, features: list[str], start, end, materialize=False) -> pl.LazyFrame | pl.DataFrame:
+    """Read and sort a feature table using metadata resolved by the caller."""
     flt = pl.col(feature_store.primary_sort_key) >= start if start is not None else pl.lit(True)
     flt &= pl.col(feature_store.primary_sort_key) <= end if end is not None else pl.lit(True)
-    table = feature_store.io.scan_delta(feature_store.get_path(table_addr)).filter(flt).select(feature_store.sort_keys + features)
+    table = feature_store.io.scan_delta(feature_store.get_path(table_meta["table_addr"])).filter(flt).select(feature_store.sort_keys + features)
 
-    if signal_type == "as_of_feature":
+    if table_meta["signal_type"] == "as_of_feature":
+        if table_meta["feature_params"] is None:
+            raise ValueError(f"as_of_feature table {table_meta['table_addr']} requires feature_params to be resolved and passed by the caller")
         by_keys = [key for key in feature_store.sort_keys if key != feature_store.primary_sort_key]
         table = (
             feature_store.index_frame()
@@ -531,11 +533,11 @@ def read_table(feature_store, table_addr, features, start, end, signal_type, mat
                 table.sort(by_keys + [feature_store.primary_sort_key]),
                 on=feature_store.primary_sort_key,
                 by=by_keys,
-                **json.loads(feature_store.feature_metadata_frame().filter(pl.col("table_addr") == table_addr).collect()["feature_params"].first()),
+                **json.loads(table_meta["feature_params"]),
             )
         )
 
-    elif signal_type == "sparse_feature":
+    elif table_meta["signal_type"] == "sparse_feature":
         index_filter = pl.col(feature_store.primary_sort_key) >= start if start is not None else pl.lit(True)
         sparse_max = table.select(pl.col(feature_store.primary_sort_key).max()).collect().item()
         if sparse_max is not None:
@@ -547,7 +549,7 @@ def read_table(feature_store, table_addr, features, start, end, signal_type, mat
             right_lf = right_lf.set_sorted(feature_store.primary_sort_key)
         table = left_lf.join(right_lf, on=feature_store.sort_keys, how="left", coalesce=True).collect(engine="streaming").lazy()
 
-    result = table.sort(feature_store.sort_keys).rename({key: f"{key}_{table_addr}" for key in feature_store.sort_keys})
+    result = table.sort(feature_store.sort_keys).rename({key: f"{key}_{table_meta['table_addr']}" for key in feature_store.sort_keys})
     return result.collect() if materialize else result
 
 
@@ -802,10 +804,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             self.io.restore_to_timestamp(self.get_path(table_addr), timestamp)
         return self
 
-    def _get_correct_feature_tables(self, features: list[str]) -> pl.DataFrame:
+    def _get_correct_feature_tables(self, features: list[str], feature_metadata: pl.DataFrame) -> pl.DataFrame:
         """Fetches the tables for the latest version of each feature provided in the input features list"""
-        meta = self.feature_metadata_frame().collect()
-        tables = _latest_per_feature(meta.filter(pl.col("feature_name").is_in(features)))
+        tables = _latest_per_feature(feature_metadata.filter(pl.col("feature_name").is_in(features)))
 
         # Verify that if runtime computed signal types are provided, we also ensure all required root signals are computed too.
         runtime_features = tables.filter(pl.col("signal_type") == "runtime_computed")
@@ -819,7 +820,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                         missing_root_feature_names.append(name)
 
             if len(missing_root_feature_names) > 0:
-                missing_root_features = _latest_per_feature(meta.filter(pl.col("feature_name").is_in(missing_root_feature_names)))
+                missing_root_features = _latest_per_feature(feature_metadata.filter(pl.col("feature_name").is_in(missing_root_feature_names)))
                 tables = pl.concat([tables, missing_root_features])
 
         if tables.height == 0:
@@ -828,8 +829,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     def _load_features_from_tables(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         frames = [
-            read_table(self, table_addr, frame["feature_name"].to_list(), start, end, frame["signal_type"].first())
-            for (table_addr,), frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")
+            read_table(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end)
+            for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")
         ]
         addresses = tables.filter(pl.col("signal_type") != "runtime_computed")["table_addr"].unique()
         root_features = (
@@ -840,16 +841,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._compute_runtime_features(tables, root_features).select(tables["feature_name"].to_list() + self.sort_keys)
 
     def _load_features_from_tables_in_parallel(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
-        groups = [
-            (table_addr, frame["feature_name"].to_list(), frame["signal_type"].first())
-            for (table_addr,), frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")
-        ]
+        groups = [frame for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")]
         addresses = tables.filter(pl.col("signal_type") != "runtime_computed")["table_addr"].unique()
         table_addr_coalesce_statements = [pl.coalesce(pl.col([f"{key}_{addr}" for addr in addresses]).alias(key)) for key in self.sort_keys]
 
         table_load_refs = [
-            self.switch(read_table)(self, table_addr, features, start, end, signal_type, self.run_on_ray_cluster)
-            for table_addr, features, signal_type in groups
+            self.switch(read_table)(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end, self.run_on_ray_cluster)
+            for frame in groups
         ]
         frames = []
         while table_load_refs:
@@ -902,7 +900,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 if name not in features["feature_name"]
             ]
             if missing_root_feature_names:
-                features = pl.concat([features, self._get_correct_feature_tables(missing_root_feature_names)], how="diagonal")
+                feature_metadata = self.feature_metadata_frame().collect()
+                features = pl.concat([features, self._get_correct_feature_tables(missing_root_feature_names, feature_metadata)], how="diagonal")
         result = (
             self._load_features_from_tables(features, start, end)
             if not self.run_on_ray_cluster
@@ -926,12 +925,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         and reads/sorts/horizontally concatenates those tables.
         """
         targets = targets or []
-        missing_targets = [target for target in targets if target not in self._get_target_column_names()]
+        feature_metadata = self.feature_metadata_frame().collect()
+        missing_targets = [target for target in targets if target not in self._get_target_column_names(feature_metadata)]
         if len(missing_targets) > 0:
             raise MissingOrMisregisteredSignalsException(
                 f"The following target values were not found to be registered as target signal types: {missing_targets}"
             )
-        tables = self._get_correct_feature_tables(features + targets)
+        tables = self._get_correct_feature_tables(features + targets, feature_metadata)
         if not self.run_on_ray_cluster:
             features = self._load_features_from_tables(tables, start, end)
         else:
@@ -997,9 +997,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         )
 
     @ensure_deltalake_is_initialized
-    def _get_target_column_names(self) -> pl.Series:
+    def _get_target_column_names(self, feature_metadata: pl.DataFrame) -> pl.Series:
         """Returns the column names of uploaded target signals"""
-        return self.feature_metadata_frame().filter(pl.col("signal_type") == "target").collect()["feature_name"].unique().to_list()
+        return feature_metadata.filter(pl.col("signal_type") == "target")["feature_name"].unique().to_list()
 
     @ensure_deltalake_is_initialized
     def _get_last_updated(self, table_addr, table_metadata: pl.DataFrame):
