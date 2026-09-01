@@ -44,12 +44,18 @@ GammaLake and boto3 use the standard AWS credential chain, including
 environment variables, shared AWS configuration, and instance or workload
 roles. The benchmark harness does not fetch or configure credentials.
 
+Each suite prepares one generated lake through ASV's setup cache. Numbered
+write stages then run once in order against that lake, while read parameters
+reuse one prepared dataset. A final unparameterized cleanup benchmark removes
+the generated path, so cleanup does not depend on read parameter order.
+
 ## Suite parameters
 
-- `GammaLakeWriteSuite`: six sequential merge writes covering existing and new
-  symbols, future dates, and new feature groups.
-- `GammaLakeOverlapWriteSuite`: eight sequential writes covering full and
-  partial temporal overlaps, new feature columns, and full re-merges.
+- `GammaLakeWriteSuite`: six separately reported sequential merge writes
+  covering existing and new symbols, future dates, and new feature groups.
+- `GammaLakeOverlapWriteSuite`: eight separately reported sequential writes
+  covering full and partial temporal overlaps, new feature columns, and full
+  re-merges.
 - `GammaLakeReadSuite`: 1, 7, and 30 day windows across 1 or 3 feature groups.
 
 The sequential write scenarios use 3 features, 5 to 20 symbols, and 10-day
