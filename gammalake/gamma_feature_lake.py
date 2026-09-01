@@ -1036,6 +1036,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         Args:
             overlap_mode: ``"copy"`` (default) creates a new DeltaTable on overlap, preserving the
                 old table as an immutable snapshot.  ``"merge"`` upserts into the existing table in-place.
+
+        Performance:
+            Each call scans the global index once and sends newly discovered index rows through a
+            single append. Prefer wide-and-shallow writes over tall-and-skinny writes: batch related
+            value columns and all secondary-key values for each primary-sort-key period instead of
+            splitting the same period across calls. For backfills, write blocks of complete periods
+            sized to fit memory. See ``docs/best_practices.md``.
         """
 
         if isinstance(df, ray.ObjectRef) and not self.run_on_ray_cluster:
@@ -1122,7 +1129,12 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
     ) -> list:
-        """Calls _add for target signal_types"""
+        """Add target columns to the lake.
+
+        Each call scans and appends to the global index once, so batch related columns and
+        complete primary-sort-key periods rather than splitting them across calls. See ``_add``
+        and ``docs/best_practices.md`` for write-shape and backfill guidance.
+        """
         return self._add(df=df, signal_type="target", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
     @ensure_deltalake_is_initialized
@@ -1134,7 +1146,12 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
     ) -> list:
-        """Calls _add for feature signal_types"""
+        """Add feature columns to the lake.
+
+        Each call scans and appends to the global index once, so batch related columns and
+        complete primary-sort-key periods rather than splitting them across calls. See ``_add``
+        and ``docs/best_practices.md`` for write-shape and backfill guidance.
+        """
         return self._add(df=df, signal_type="feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
     @ensure_deltalake_is_initialized
