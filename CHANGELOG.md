@@ -1,11 +1,12 @@
 # Changelog
 
 ## Unreleased
-* Coordinate local sort-key predicate pushdown across GammaLake sources using `polars-io-tools`, while preserving alignment and runtime/as-of context.
-* Add strict aligned-source concatenation using `polars-io-tools` coordinated predicate pushdown.
-* Modernize GammaLake Ruff hygiene, including independent `FeatureMetadata` version lists and `TypeError` for unsupported read inputs.
-* Resolve `feature_metadata` once per `GammaFeatureLake.read` and pipe it through read helpers to avoid repeated Delta-table scans.
-* Breaking API cleanup: remove the unused `debug` parameter from `GammaFeatureLake.read`; reads now always return requested features plus sort keys.
-* Restrict feature-table data-skipping statistics to `GammaFeatureLake` sort keys.
-* Document efficient `GammaFeatureLake` writes and backfills.
-* Add `GammaFeatureLake.add_index_rows` to extend the index without adding features.
+* [feature] Add `GammaFeatureLake.add_runtime_transforms` for deterministic row-local runtime transforms with validation and opt-in runtime-computed-feature security.
+* [feature] Push sort-key predicates into the global index and eligible feature scans using `polars-io-tools`, while preserving alignment and runtime/as-of context.
+* [feature] Add strict aligned-source concatenation using `polars-io-tools` coordinated predicate pushdown.
+* [cleanup] Modernize GammaLake Ruff hygiene, including independent `FeatureMetadata` version lists and `TypeError` for unsupported read inputs.
+* [cleanup] Resolve `feature_metadata` once per `GammaFeatureLake.read` to avoid repeated Delta-table scans.
+* [cleanup] Remove the unused `debug` parameter from `GammaFeatureLake.read`; reads now always return requested features plus sort keys.
+* [cleanup] Restrict feature-table data-skipping statistics to `GammaFeatureLake` sort keys.
+* [cleanup] Document efficient `GammaFeatureLake` writes and backfills.
+* [feature] Add `GammaFeatureLake.add_index_rows` to extend the index without adding features.

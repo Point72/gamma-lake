@@ -120,7 +120,6 @@ Two overlap modes are supported via the ``overlap_mode`` parameter on :meth:`add
 
 import io
 import json
-import logging
 import os
 import traceback
 import uuid
@@ -152,8 +151,6 @@ from gammalake.abstract import (
 from gammalake.io import FrameIO, PolarsIO
 
 __all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
-
-_logger = logging.getLogger(__name__)
 
 _DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
     pa.schema(
@@ -408,30 +405,11 @@ def write_metadata(
     table_path,
     *rows,
     schema_mode=None,
-    _ray_ordering_dep: ray.ObjectRef | None = None,
+    _ray_ordering_deps: list[ray.ObjectRef] | None = None,
 ) -> None:
-    """Batch-write metadata rows as a single Delta commit.
-
-    Concatenates all non-``None`` Arrow tables in ``rows`` into one frame and
-    appends it to ``table_path`` in a single ``write_delta`` call, avoiding
-    concurrent Delta commit failures when many tasks run in parallel.
-
-    Args:
-        feature_store: the GammaFeatureLake whose IO and compression settings to use
-        table_path: destination Delta table path (e.g. ``feature_store.table_metadata``)
-        *rows: Arrow tables to write; ``None`` entries are silently skipped
-        schema_mode: forwarded to ``delta_write_options`` (e.g. ``"merge"`` for schema evolution)
-        _ray_ordering_dep: pass a Ray ObjectRef here to enforce task-graph execution ordering.
-            Ray resolves the ref before scheduling this task, ensuring e.g. ``table_metadata``
-            is committed before ``feature_metadata``
-
-    Returns:
-        None
-
-    """
+    """Batch non-null metadata rows into one Delta commit."""
     filtered = [row for row in rows if row is not None]
     if not filtered:
-        _logger.debug(f"write_metadata: all rows are None for {table_path} — skipping write")
         return
     unified = pa.unify_schemas([table.schema for table in filtered])
     merged = pa.concat_tables([table.cast(unified) for table in filtered])
@@ -1074,7 +1052,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             single append. Prefer wide-and-shallow writes over tall-and-skinny writes: batch related
             value columns and all secondary-key values for each primary-sort-key period instead of
             splitting the same period across calls. For backfills, write blocks of complete periods
-            sized to fit memory. See ``docs/best_practices.md``.
+            sized to fit memory. See the ``Best-Practices`` wiki page.
         """
 
         if isinstance(df, ray.ObjectRef) and not self.run_on_ray_cluster:
@@ -1125,11 +1103,28 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             )
             for table_addr in feature_tables["table_addr"].unique()
         ]
+        # Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
+        # This step identifies the qualified tables (all feature tables which contain no features found in the input table, OR contain a non-latest version of a feature found in the input table).
+        # This preserves index alignment across all our delta tables, and we can do this in parallel.
+        alignment_refs = []
+        for row in tables_to_update.iter_rows(named=True):
+            alignment_refs.append(self.switch(align_feature_tables)(self, new_index_rows_ref, row, primary_sort_key_min))
+        refs.extend(alignment_refs)
+
+        # Step 3: Append the results of an anti-join between the new data and the index back into the master index.
+        # This can also be done in parallel.
+        index_ref = self.switch(update_index)(self, new_index_rows_ref)
+        refs.append(index_ref)
+
         if feature_table_update_refs:
-            # Write table_metadata first so a partial failure cannot leave stale feature_metadata.
-            # Ray resolves _ray_ordering_dep before scheduling the feature_metadata write.
+            # Metadata becomes visible only after all data and index writes succeed.
             table_metadata_rows, feature_metadata_rows = zip(*feature_table_update_refs)
-            table_metadata_ref = self.switch(write_metadata)(self, self.table_metadata, *table_metadata_rows)
+            table_metadata_ref = self.switch(write_metadata)(
+                self,
+                self.table_metadata,
+                *table_metadata_rows,
+                _ray_ordering_deps=[*alignment_refs, index_ref],
+            )
             refs.append(table_metadata_ref)
             refs.append(
                 self.switch(write_metadata)(
@@ -1137,19 +1132,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                     self.feature_metadata,
                     *feature_metadata_rows,
                     schema_mode="merge",
-                    _ray_ordering_dep=table_metadata_ref,
+                    _ray_ordering_deps=[table_metadata_ref],
                 )
             )
 
-        # Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
-        # This step identifies the qualified tables (all feature tables which contain no features found in the input table, OR contain a non-latest version of a feature found in the input table).
-        # This preserves index alignment across all our delta tables, and we can do this in parallel.
-        for row in tables_to_update.iter_rows(named=True):
-            refs.append(self.switch(align_feature_tables)(self, new_index_rows_ref, row, primary_sort_key_min))
-
-        # Step 3: Append the results of an anti-join between the new data and the index back into the master index.
-        # This can also be done in parallel.
-        refs.append(self.switch(update_index)(self, new_index_rows_ref))
         return self.get(refs) if self.run_on_ray_cluster else refs
 
     @ensure_deltalake_is_initialized
@@ -1165,7 +1151,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
         Each call scans and appends to the global index once, so batch related columns and
         complete primary-sort-key periods rather than splitting them across calls. See ``_add``
-        and ``docs/best_practices.md`` for write-shape and backfill guidance.
+        and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
         """
         return self._add(df=df, signal_type="target", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
@@ -1182,7 +1168,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
         Each call scans and appends to the global index once, so batch related columns and
         complete primary-sort-key periods rather than splitting them across calls. See ``_add``
-        and ``docs/best_practices.md`` for write-shape and backfill guidance.
+        and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
         """
         return self._add(df=df, signal_type="feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
@@ -1366,6 +1352,59 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             .drop("_max_version")
         )
         self.io.write_delta(new_features, self.feature_metadata, mode="append", delta_write_options={"schema_mode": "merge"})
+
+    @ensure_deltalake_is_initialized
+    @trace(always=True)
+    def add_runtime_transforms(self, features: list[str], transforms: list[str], owner: str = "missing_owner") -> None:
+        """Register row-local transforms over stored features as runtime features.
+
+        This convenience wrapper over :meth:`add_runtime_computed_features` registers every
+        ``(feature, transform)`` pair as ``<feature>__<transform>``. Numeric outputs use
+        ``Float64`` and propagate nulls; ``reciprocal`` also returns null for zero. ``missing``,
+        ``nan``, and ``nonzero`` return booleans. ``positive`` and ``negative`` clamp to the
+        non-negative part of the value and its negation, respectively, rather than returning
+        sign predicates. ``sign`` returns ``-1``, ``0``, or ``1``, and ``signed_log1p`` computes
+        ``sign(x) * log1p(abs(x))``.
+
+        Args:
+            features: Names of registered features to transform. Except when only ``missing`` is
+                requested, each feature must be numeric when read.
+            transforms: Transform names applied to every feature. Supported names are ``abs``,
+                ``missing``, ``nan``, ``negative``, ``nonzero``, ``positive``, ``reciprocal``,
+                ``sign``, ``signed_log1p``, and ``squared``.
+            owner: Owner recorded for each generated runtime feature.
+
+        Raises:
+            ValueError: If either list is empty or contains duplicates, a transform is unknown,
+                a generated name conflicts with a sort key, runtime-computed features are
+                disabled, a root feature is unregistered, or an output name is already registered.
+
+        """
+        for name, values in (("features", features), ("transforms", transforms)):
+            if not values or len(values) != len(set(values)):
+                raise ValueError(f"{name} must be a non-empty list without duplicates")
+
+        builders = {
+            "abs": lambda column: column.cast(pl.Float64).abs(),
+            "missing": lambda column: column.is_null(),
+            "nan": lambda column: column.cast(pl.Float64).is_nan(),
+            "negative": lambda column: (-column.cast(pl.Float64)).clip(lower_bound=0),
+            "nonzero": lambda column: column.cast(pl.Float64) != 0,
+            "positive": lambda column: column.cast(pl.Float64).clip(lower_bound=0),
+            "reciprocal": lambda column: pl.when(column.cast(pl.Float64) != 0).then(1 / column.cast(pl.Float64)),
+            "sign": lambda column: column.cast(pl.Float64).sign(),
+            "signed_log1p": lambda column: column.cast(pl.Float64).sign() * column.cast(pl.Float64).abs().log1p(),
+            "squared": lambda column: column.cast(pl.Float64).pow(2),
+        }
+        if unknown := sorted(set(transforms) - set(builders)):
+            raise ValueError(f"Unknown runtime transforms: {unknown}. Supported transforms: {sorted(builders)}")
+
+        generated_names = {f"{feature}__{transform}" for feature in features for transform in transforms}
+        if conflicts := sorted(generated_names & set(self.sort_keys)):
+            raise ValueError(f"Runtime transform feature names conflict with sort keys: {conflicts}")
+
+        expressions = [builders[transform](pl.col(feature)).alias(f"{feature}__{transform}") for feature in features for transform in transforms]
+        self.add_runtime_computed_features(expressions, owner=owner)
 
     @staticmethod
     def merge(

@@ -163,3 +163,16 @@ ______________________________________________________________________
 | `add_as_of_features()`            | Point-in-time safe features (e.g., fundamental data with publication lag) |
 | `add_sparse_features()`           | Infrequently updated features (e.g., quarterly earnings)                  |
 | `add_runtime_computed_features()` | Features derived from stored features at read time (no extra storage)     |
+| `add_runtime_transforms()`        | Standard row-local transforms over stored features at read time           |
+
+### Runtime transforms
+
+Set `enable_runtime_computed_features=True` only when the lake's feature metadata is trusted. The opt-in is required both
+to register runtime transforms and to read them.
+
+`add_runtime_transforms(features, transforms, owner)` creates the cross-product of the supplied lists with deterministic
+`<feature>__<transform>` names. Supported transforms are `abs`, `missing`, `nan`, `negative`, `nonzero`, `positive`,
+`reciprocal`, `sign`, `signed_log1p`, and `squared`. Numeric transforms cast inputs and outputs to `Float64` and propagate
+nulls; reciprocal also maps zero to null. `missing`, `nan`, and `nonzero` are boolean. `positive` and `negative` clamp to
+the non-negative part of the value and its negation, respectively. `sign` returns -1, 0, or 1, and `signed_log1p` computes
+`sign(x) * log1p(abs(x))`.

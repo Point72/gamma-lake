@@ -108,7 +108,11 @@ lake.add_features(df, owner="team-a")          # standard features
 lake.add_targets(df, owner="team-a")           # target/label columns
 lake.add_as_of_features(df, params, owner=...) # point-in-time safe features
 lake.add_sparse_features(df, owner=...)        # sparse / infrequently-updated features
-lake.add_runtime_computed_features(exprs, ...) # features computed at read time
+
+# Runtime features require an explicit opt-in because stored expressions are executable.
+trusted_lake = GammaFeatureLake(base_path="s3://my-bucket/features", enable_runtime_computed_features=True)
+trusted_lake.add_runtime_computed_features(exprs, ...)                     # arbitrary Polars expressions
+trusted_lake.add_runtime_transforms(["feature_a"], ["abs", "reciprocal"])  # named row-local transforms
 
 # Reading
 lake.read(["feature_a", "feature_b"])                        # latest versions
