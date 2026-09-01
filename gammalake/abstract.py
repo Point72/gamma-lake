@@ -188,7 +188,7 @@ class BaseFeatureLake(abc.ABC):
 class FeatureMetadata(BaseModel):
     """A wrapper class with convenience methods for interfacing with onnx serialized models and a GammaFeatureLake"""
 
-    feature_names: list[str] = Field
+    feature_names: list[str] = Field(description="The list of feature names this metadata object describes")
     feature_versions: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
