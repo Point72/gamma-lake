@@ -190,7 +190,7 @@ class FeatureMetadata(BaseModel):
     def get_metadata_frame(self, fs: BaseFeatureLake):
         """filter a feature metadata table based on the names/optional version entries in this object"""
         if len(self.feature_versions) == 0:
-            df = fs._get_latest_feature_tables(self.feature_names)
+            df = fs._get_latest_feature_tables(self.feature_names, fs.feature_metadata_frame().collect())
         else:
             filter_df = pl.DataFrame(
                 [(name, version) for name, version in zip(self.feature_names, self.feature_versions)],
