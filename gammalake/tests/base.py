@@ -2955,3 +2955,42 @@ class GammaFeatureLakeTestsMixin:
             .sort(fs.sort_keys)
         )
         assert_frame_equal(result.sort(fs.sort_keys), expected, check_column_order=False)
+
+    def _test_annotate_and_describe(self, fs: GammaFeatureLake):
+        """Round-trip feature comments and tags through the backend."""
+        fs.add_features(generate_test_data(n_features=4, n_symbols=3, n_days=5), owner="tbg")
+        metadata = fs.feature_metadata_frame().collect().sort("feature_name")
+        fs.annotate(
+            metadata.with_columns(
+                comment=pl.Series(["foo", "bar", None, None]),
+                tags=pl.Series([["highpri", "interesting"], ["lowpri"], [], None], dtype=pl.List(pl.String)),
+            )
+        )
+
+        described_frame = fs.describe(fs.feature_metadata_frame())
+        assert described_frame.columns == fs.feature_metadata_frame().collect_schema().names() + ["comment", "tags"]
+        described = {row["feature_name"]: row for row in described_frame.iter_rows(named=True)}
+        assert described["feature_0"]["comment"] == "foo" and described["feature_0"]["tags"] == ["highpri", "interesting"]
+        assert described["feature_1"]["comment"] == "bar" and described["feature_1"]["tags"] == ["lowpri"]
+        assert described["feature_2"]["comment"] is None and described["feature_2"]["tags"] == []
+        assert described["feature_3"]["comment"] is None and described["feature_3"]["tags"] == []
+        assert described["feature_0"]["table_addr"] == metadata.filter(pl.col("feature_name") == "feature_0")["table_addr"].item()
+
+        feature_0_row = metadata.filter(pl.col("feature_name") == "feature_0")
+        multi_version = pl.concat([feature_0_row, feature_0_row.with_columns(version=pl.col("version") + 1)])
+        described_multi = fs.describe(multi_version.lazy())
+        assert described_multi.height == 2
+        assert described_multi["comment"].to_list() == ["foo", "foo"]
+
+        older = feature_0_row.with_columns(comment=pl.lit("stale"), tags=pl.Series([["old"]], dtype=pl.List(pl.String)))
+        newer = older.with_columns(version=pl.col("version") + 1, comment=pl.lit("fresh"), tags=pl.Series([["new"]], dtype=pl.List(pl.String)))
+        fs.annotate(pl.concat([older, newer]))
+        refreshed = fs.describe(feature_0_row.lazy()).row(0, named=True)
+        assert refreshed["comment"] == "fresh" and refreshed["tags"] == ["new"]
+
+        empty = fs.describe(fs.feature_metadata_frame().filter(pl.lit(False)))
+        assert empty.is_empty()
+        assert empty.columns == metadata.columns + ["comment", "tags"]
+
+        with pytest.raises(ValueError, match="annotations schema"):
+            fs.annotate(metadata.with_columns(comment=pl.lit("x")))

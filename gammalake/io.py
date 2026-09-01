@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from typing import Any
 
 import polars as pl
+from deltalake import DeltaTable
 
 __all__ = (
     "FrameIO",
@@ -50,6 +52,16 @@ class FrameIO(ABC):
             An Any type, typically None
 
         """
+        ...
+
+    @abstractmethod
+    def annotate_table(self, table_addr: str, annotations: pl.DataFrame) -> None:
+        """Persist comment-level annotations and string tags for features in one table."""
+        ...
+
+    @abstractmethod
+    def describe_table(self, table_addr: str, feature_names: list[str]) -> pl.DataFrame:
+        """Fetch comments and tags for the named features in one table."""
         ...
 
     @abstractmethod
@@ -101,8 +113,26 @@ class PolarsIO(FrameIO):
     def scan_delta(self, target, **kwargs):
         return pl.scan_delta(target, **kwargs)
 
+    def annotate_table(self, table_addr: str, annotations: pl.DataFrame) -> None:
+        """Persist comments and tags in Delta column metadata for one table."""
+        dt = DeltaTable(table_addr)
+        for row in annotations.iter_rows(named=True):
+            metadata = {key: value for key, value in {"comment": row["comment"], "tags": json.dumps(row["tags"])}.items() if value is not None}
+            dt.alter.set_column_metadata(row["feature_name"], metadata)
+
+    def describe_table(self, table_addr: str, feature_names: list[str]) -> pl.DataFrame:
+        """Read comments and tags from Delta column metadata for one table."""
+        metadata = {field.name: dict(field.metadata) for field in DeltaTable(table_addr).schema().fields}
+        return pl.DataFrame(
+            {
+                "feature_name": feature_names,
+                "comment": [metadata.get(name, {}).get("comment") for name in feature_names],
+                "tags": [json.loads(metadata.get(name, {}).get("tags", "[]")) for name in feature_names],
+            },
+            schema={"feature_name": pl.String, "comment": pl.String, "tags": pl.List(pl.String)},
+        )
+
     def is_deltatable(self, target):
-        from deltalake import DeltaTable
         from deltalake.exceptions import TableNotFoundError
 
         try:
@@ -125,8 +155,6 @@ class PolarsIO(FrameIO):
         when_not_matched_insert=None,
         **kwargs,
     ):
-        from deltalake import DeltaTable
-
         predicate = " AND ".join(f'target."{col}" = source."{col}"' for col in on)
         dt = DeltaTable(target)
         merger = dt.merge(source=df.to_arrow(), predicate=predicate, source_alias="source", target_alias="target", **kwargs)

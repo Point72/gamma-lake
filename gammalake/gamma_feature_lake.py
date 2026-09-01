@@ -663,6 +663,47 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """Convenience method for generating new table addresses."""
         return f"{self.table_name_prefix}delta_{uuid.uuid4().hex[:8]}"
 
+    def annotate(self, annotations: pl.DataFrame) -> None:
+        """Attach comments and tags to features one physical table at a time.
+
+        ``annotations`` matches the feature metadata schema with a string ``comment``
+        column and a list-of-strings ``tags`` column added.
+        """
+        expected_schema = {**self.feature_metadata_frame().collect_schema(), "comment": pl.String, "tags": pl.List(pl.String)}
+        if dict(annotations.schema) != expected_schema:
+            raise ValueError(
+                "annotations schema does not match the expected annotation schema. Pass the feature_metadata frame "
+                "(from feature_metadata_frame()) for the features you want to annotate, with two columns added: "
+                "a string `comment` column and a list-of-strings `tags` column.\n"
+                f"  expected: {expected_schema}\n  received: {dict(annotations.schema)}"
+            )
+        annotations = (
+            annotations.with_columns(pl.col("tags").fill_null([]))
+            .filter(pl.col("comment").is_not_null() | (pl.col("tags").list.len() > 0))
+            .sort("version", descending=True)
+            .unique(subset=["table_addr", "feature_name"], keep="first", maintain_order=True)
+        )
+        for (table_addr,), group in annotations.group_by(["table_addr"]):
+            self.io.annotate_table(self.get_path(table_addr), group)
+
+    def describe(self, features_metadata: pl.LazyFrame) -> pl.DataFrame:
+        """Return selected feature metadata with physical-table annotations appended.
+
+        Annotations are stored per ``(table_addr, feature_name)``, so feature metadata
+        versions sharing a physical table receive the same annotation.
+        """
+        metadata = features_metadata.collect()
+        frames = [
+            self.io.describe_table(self.get_path(table_addr), group["feature_name"].unique().to_list()).with_columns(table_addr=pl.lit(table_addr))
+            for (table_addr,), group in metadata.group_by(["table_addr"])
+        ]
+        annotations = (
+            pl.concat(frames)
+            if frames
+            else pl.DataFrame(schema={"feature_name": pl.String, "table_addr": pl.String, "comment": pl.String, "tags": pl.List(pl.String)})
+        )
+        return metadata.join(annotations, on=["feature_name", "table_addr"], how="left")
+
     def _ensure_runtime_computed_features_enabled(self) -> None:
         if not self.enable_runtime_computed_features:
             raise ValueError(
