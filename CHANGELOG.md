@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* [feature] Use `polars-io-tools` for native LazyFrame Delta writes.
 * [docs] Move the architecture deep dive and diagrams into the project README.
 * [bugfix] Restore positional concatenation for persisted, aligned GammaLake sources.
 * [bugfix] Preserve out-of-range context required by backward, forward, and nearest as-of reads.
