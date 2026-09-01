@@ -10,7 +10,7 @@ Notes for editors:
 
 **Get Started**
 
-- [Overview](Overview)
+- [Architecture](https://github.com/Point72/gamma-lake#how-gamma-lake-works)
 - [Installation](Installation)
 - [Performance](Performance)
 - [Best Practices](Best-Practices)

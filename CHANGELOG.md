@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* [docs] Move the architecture deep dive and diagrams into the project README.
 * [bugfix] Restore positional concatenation for persisted, aligned GammaLake sources.
 * [bugfix] Preserve out-of-range context required by backward, forward, and nearest as-of reads.
 * [feature] Add `GammaFeatureLake.add_runtime_transforms` for deterministic row-local runtime transforms with validation and opt-in runtime-computed-feature security.
