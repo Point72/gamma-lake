@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 import polars as pl
+import polars_io_tools as piot
 from deltalake import DeltaTable
 
 __all__ = (
@@ -111,13 +112,25 @@ class FrameIO(ABC):
 
 
 class PolarsIO(FrameIO):
-    """An implementation of FrameIO using native polars Delta table I/O."""
+    """An implementation of FrameIO using polars-io-tools Delta I/O."""
 
     def write_delta(self, df, target, *, delta_write_options=None, **kwargs):
-        delta_write_options = delta_write_options or {}
-        if isinstance(df, pl.LazyFrame):
-            df = df.collect()
-        return df.write_delta(target, delta_write_options=delta_write_options, **kwargs)
+        frame = df if isinstance(df, pl.LazyFrame) else df.lazy()
+        timezone_casts = [
+            pl.col(column).cast(pl.Datetime("us", dtype.time_zone))
+            for column, dtype in frame.collect_schema().items()
+            if isinstance(dtype, pl.Datetime) and dtype.time_zone is not None and dtype.time_unit != "us"
+        ]
+        if timezone_casts:
+            frame = frame.with_columns(timezone_casts)
+        return piot.sink_delta(
+            frame,
+            target,
+            chunk_size=-1,
+            translate_logical_types=False,
+            delta_write_options=delta_write_options,
+            **kwargs,
+        )
 
     def scan_delta(self, target, **kwargs):
         return pl.scan_delta(target, **kwargs)
