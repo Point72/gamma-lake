@@ -183,7 +183,7 @@ class GammaFeatureLakeTestsMixin:
         # --- Invariant 2: read() per-table returns only valid, non-duplicate sort keys ---
         for key, frame in features_metadata.group_by("table_addr"):
             feature_names = frame["feature_name"].unique().to_list()
-            read_keys = fs.read(feature_names, debug=True).select(fs.sort_keys).sort(fs.sort_keys)
+            read_keys = fs.read(feature_names).select(fs.sort_keys).sort(fs.sort_keys)
 
             orphans = read_keys.join(index_keys, on=fs.sort_keys, how="anti")
             assert orphans.height == 0, (
@@ -195,7 +195,7 @@ class GammaFeatureLakeTestsMixin:
         # --- Invariant 3: reading all features together reproduces the complete global index ---
         all_features = features_metadata["feature_name"].unique().to_list()
         if all_features:
-            full_read_keys = fs.read(all_features, debug=True).select(fs.sort_keys).sort(fs.sort_keys)
+            full_read_keys = fs.read(all_features).select(fs.sort_keys).sort(fs.sort_keys)
             assert_frame_equal(full_read_keys, index_keys, check_row_order=True)
 
     def verify_delta_version_alignment(self, fs: GammaFeatureLake):

@@ -515,7 +515,7 @@ def compute_index_deltas(feature_store, df):
     )
 
 
-def read_table(feature_store, table_addr, features, start, end, signal_type, debug=False, materialize=False) -> pl.LazyFrame | pl.DataFrame:
+def read_table(feature_store, table_addr, features, start, end, signal_type, materialize=False) -> pl.LazyFrame | pl.DataFrame:
     """Reads a path for a feature store, and sorts it."""
     flt = pl.col(feature_store.primary_sort_key) >= start if start is not None else pl.lit(True)
     flt &= pl.col(feature_store.primary_sort_key) <= end if end is not None else pl.lit(True)
@@ -826,9 +826,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             raise MissingFeaturesException(f"No FeatureTables exist for any of your input features: {features}")
         return tables
 
-    def _load_features_from_tables(self, tables, start: Comparable | None = None, end: Comparable | None = None, debug: bool = False) -> pl.LazyFrame:
+    def _load_features_from_tables(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         frames = [
-            read_table(self, table_addr, frame["feature_name"].to_list(), start, end, frame["signal_type"].first(), debug)
+            read_table(self, table_addr, frame["feature_name"].to_list(), start, end, frame["signal_type"].first())
             for (table_addr,), frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")
         ]
         addresses = tables.filter(pl.col("signal_type") != "runtime_computed")["table_addr"].unique()
@@ -837,11 +837,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             .lazy()
             .with_columns([pl.coalesce(pl.col([f"{key}_{addr}" for addr in addresses]).alias(key)) for key in self.sort_keys])
         )
-        return self._compute_runtime_features(tables, root_features).select("*" if debug else tables["feature_name"].to_list() + self.sort_keys)
+        return self._compute_runtime_features(tables, root_features).select(tables["feature_name"].to_list() + self.sort_keys)
 
-    def _load_features_from_tables_in_parallel(
-        self, tables, start: Comparable | None = None, end: Comparable | None = None, debug: bool = False
-    ) -> pl.LazyFrame:
+    def _load_features_from_tables_in_parallel(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         groups = [
             (table_addr, frame["feature_name"].to_list(), frame["signal_type"].first())
             for (table_addr,), frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")
@@ -850,7 +848,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         table_addr_coalesce_statements = [pl.coalesce(pl.col([f"{key}_{addr}" for addr in addresses]).alias(key)) for key in self.sort_keys]
 
         table_load_refs = [
-            self.switch(read_table)(self, table_addr, features, start, end, signal_type, debug, self.run_on_ray_cluster)
+            self.switch(read_table)(self, table_addr, features, start, end, signal_type, self.run_on_ray_cluster)
             for table_addr, features, signal_type in groups
         ]
         frames = []
@@ -859,7 +857,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             frames.append(self.get(ready[0]))
 
         root_features = pl.concat(frames, how="horizontal").lazy().with_columns(table_addr_coalesce_statements)
-        return self._compute_runtime_features(tables, root_features).select("*" if debug else tables["feature_name"].to_list() + self.sort_keys)
+        return self._compute_runtime_features(tables, root_features).select(tables["feature_name"].to_list() + self.sort_keys)
 
     def _compute_runtime_features(self, feature_table, root_features):
         runtime_computed_features = feature_table.filter(pl.col("signal_type") == "runtime_computed")
@@ -921,7 +919,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         targets: list | None = None,
         start: Comparable | None = None,
         end: Comparable | None = None,
-        debug: bool = False,
         materialized: bool = True,
     ) -> pl.DataFrame:
         """
@@ -936,9 +933,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             )
         tables = self._get_correct_feature_tables(features + targets)
         if not self.run_on_ray_cluster:
-            features = self._load_features_from_tables(tables, start, end, debug)
+            features = self._load_features_from_tables(tables, start, end)
         else:
-            features = self._load_features_from_tables_in_parallel(tables, start, end, debug)
+            features = self._load_features_from_tables_in_parallel(tables, start, end)
         return features.collect() if materialized else features
 
     @ensure_deltalake_is_initialized
