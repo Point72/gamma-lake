@@ -8,6 +8,7 @@ remain backend agnostic.
 from __future__ import annotations
 
 import inspect
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -844,6 +845,49 @@ class GammaFeatureLakeTestsMixin:
             n_unique_versions=2,
             index_height=n_symbols * n_days,
         )
+
+    def _test_restore_to_timestamp_reverts_bad_add(self, fs: GammaFeatureLake):
+        """Restore the entire store to a cutoff before a bad add batch."""
+        features = [f"feature_{i}" for i in range(3)]
+        start_date = datetime(2020, 6, 20, tzinfo=UTC)
+        fs.enable_runtime_computed_features = True
+
+        fs.add_features(generate_test_data(n_features=3, n_symbols=4, n_days=10, start_date=start_date), owner="tbg")
+        fs.add_runtime_computed_features([(pl.col("feature_0") + pl.col("feature_1")).alias("runtime_sum")], owner="tbg")
+
+        good_meta = fs.feature_metadata_frame().collect().sort(["feature_name", "version"])
+        good_table_meta = fs.table_metadata_frame().collect().sort(["table_addr", "update_timestamp"])
+        good_index = fs.index_frame().collect().sort(fs.sort_keys)
+        good_read = fs.read(features).sort(fs.sort_keys)
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            fs.restore_to_timestamp(datetime.now())  # noqa: DTZ005
+
+        time.sleep(2.0)
+        cutoff = datetime.now(UTC)
+        time.sleep(2.0)
+
+        fs.add_features(generate_test_data(n_features=3, n_symbols=4, n_days=10, start_date=start_date + timedelta(days=100)), owner="tbg")
+        fs.add_features(
+            generate_test_data(n_features=2, n_symbols=4, n_days=10, start_date=start_date, feature_suffix="oops"),
+            owner="tbg",
+        )
+
+        assert fs.feature_metadata_frame().collect().height > good_meta.height
+        assert fs.index_frame().collect().height > good_index.height
+        assert not fs.read(["oops_0"]).is_empty()
+
+        fs.restore_to_timestamp(cutoff)
+        fs.restore_to_timestamp(cutoff)
+
+        assert_frame_equal(fs.feature_metadata_frame().collect().sort(["feature_name", "version"]), good_meta)
+        assert_frame_equal(fs.table_metadata_frame().collect().sort(["table_addr", "update_timestamp"]), good_table_meta)
+        assert_frame_equal(fs.index_frame().collect().sort(fs.sort_keys), good_index)
+        assert_frame_equal(fs.read(features).sort(fs.sort_keys), good_read, check_column_order=False)
+        assert "runtime_sum" in fs.read(["runtime_sum"]).columns
+
+        with pytest.raises(MissingFeaturesException):
+            fs.read(["oops_0"])
 
     def _test_merge_extends_date_range(self, fs: GammaFeatureLake):
         """After an overlap merge, the table has more rows and the same table_addr is reused."""

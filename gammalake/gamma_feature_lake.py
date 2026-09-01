@@ -751,6 +751,47 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         self._sort_keys = schema.schema.names
         return self
 
+    @ensure_deltalake_is_initialized
+    def restore_to_timestamp(self, timestamp: datetime) -> "GammaFeatureLake":
+        """Revert the entire feature store to its state as of ``timestamp``.
+
+        Every Delta commit after ``timestamp`` is undone across the index,
+        metadata, and referenced physical data tables. Choose a cutoff between
+        the last good write and the writes to undo.
+
+        The system tables are restored first. Restored feature metadata then
+        identifies the physical data tables that existed at the cutoff. Tables
+        created later are left unreferenced and can be reclaimed separately.
+        Runtime-computed features are skipped because their ``n/a`` table
+        address does not refer to a physical table.
+
+        Restore is idempotent per table but is not atomic across tables. Run it
+        without concurrent writers. The cutoff must be after initialization
+        and within Delta's retention window, with all required data files still
+        available.
+
+        Args:
+            timestamp: Timezone-aware cutoff; commits after it are reverted.
+
+        Returns:
+            This feature store, restored in place.
+
+        """
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("restore_to_timestamp requires a timezone-aware datetime")
+
+        for system_table in (self.index, self.table_metadata, self.feature_metadata):
+            self.io.restore_to_timestamp(system_table, timestamp)
+
+        restored = (
+            self.feature_metadata_frame()
+            .collect()
+            .filter((pl.col("signal_type") != "runtime_computed") & pl.col("table_addr").is_not_null() & (pl.col("table_addr") != "n/a"))
+        )
+        for table_addr in restored["table_addr"].unique():
+            self.io.restore_to_timestamp(self.get_path(table_addr), timestamp)
+        return self
+
     def _get_correct_feature_tables(self, features: list[str]) -> pl.DataFrame:
         """Fetches the tables for the latest version of each feature provided in the input features list"""
         meta = self.feature_metadata_frame().collect()
