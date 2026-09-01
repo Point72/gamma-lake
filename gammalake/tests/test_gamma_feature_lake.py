@@ -160,6 +160,42 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         with pytest.raises(ValueError, match="as_of_feature table .* requires feature_params"):
             fs.read(metadata)
 
+    @pytest.mark.parametrize(
+        ("params", "observation_indices", "values", "start_index", "end_index", "expected"),
+        [
+            ({}, [0], [10.0], 2, 4, [10.0, 10.0, 10.0]),
+            ({"strategy": "forward"}, [4], [20.0], 0, 2, [20.0, 20.0, 20.0]),
+            ({"strategy": "nearest"}, [0, 4], [10.0, 20.0], 3, 3, [20.0]),
+        ],
+    )
+    def test_as_of_range_preserves_out_of_range_context(
+        self,
+        tmp_path,
+        params,
+        observation_indices,
+        values,
+        start_index,
+        end_index,
+        expected,
+    ):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+        days = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(5)]
+        fs.add_as_of_features(
+            pl.DataFrame(
+                {
+                    "timestamp": [days[index] for index in observation_indices],
+                    "symbol": ["A"] * len(observation_indices),
+                    "fundamental": values,
+                }
+            ),
+            params=params,
+        )
+        fs.add_features(pl.DataFrame({"timestamp": days, "symbol": ["A"] * len(days), "dummy": [0] * len(days)}))
+
+        result = fs.read(["fundamental"], start=days[start_index], end=days[end_index])
+
+        assert result["fundamental"].to_list() == expected
+
     def test_parallel_read_passes_builtin_metadata_payload(self, fs):
         fs.add_features(self._clean_frame("A", 0, 1))
         tables = fs.feature_metadata_frame().collect()
