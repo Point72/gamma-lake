@@ -29,6 +29,36 @@ result = lake.read(meta)
 
 ______________________________________________________________________
 
+## Batch Writes to Minimise Index Work
+
+Each `_add()` operation, including calls through `add_features()` and `add_targets()`, scans the global index once and
+appends newly discovered index rows once. Every call also pays fixed dispatch, metadata, and storage-commit overhead, so
+the shape and number of writes can matter more than the total row count.
+
+Prefer **wide-and-shallow** writes over **tall-and-skinny** writes. Here, wide means batching related value columns and
+all secondary-key values for a primary-sort-key period; shallow means writing fewer complete periods at a time. Avoid
+splitting the same period across many calls.
+
+Representative object-storage benchmarks for one feature group and one primary-sort-key period show the per-call cost:
+
+| Write shape                                        | Execution mode |   Time |
+| -------------------------------------------------- | -------------- | -----: |
+| 1,000 features × 1,000 secondary-key values        | Ray            |   ~4 s |
+| 1,000 features × 5,000 secondary-key values        | Ray            | ~6.5 s |
+| 1,000 features × 5,000 secondary-key values        | Local          |   ~9 s |
+| The same 5,000 values split across two local calls | Local          |  ~14 s |
+| Ten local calls of 1,000 values each               | Local          |  55+ s |
+
+For backfills, build blocks containing every secondary-key value for each primary-sort-key period, include as many
+complete periods as fit comfortably in memory, and write each block in one call. Do not repeatedly batch the same
+period by entity. Keep unrelated owners or update cadences in separate feature groups even when batching writes.
+
+If incremental weekly additions leave related features fragmented across many small feature-group tables, call
+`consolidate_feature_groups()` after the features share an update cadence. Consolidation reduces the number of table
+scans required by future reads without changing feature values.
+
+______________________________________________________________________
+
 ## Use Owners to Organise Features
 
 Every `add_*` call accepts an `owner` string. Use this to track which team, pipeline, or experiment produced a feature:
