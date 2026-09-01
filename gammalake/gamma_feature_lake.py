@@ -135,9 +135,9 @@ from ccflow.exttypes.polars import PolarsExpression
 from deltalake import WriterProperties
 from deltalake.writer.properties import Compression
 from packaging import version
+from polars_io_tools import FilterSpec, pushdown_combine
 from pydantic import ConfigDict, Field, model_validator
 
-from gammalake._multi_source import scan_aligned_sources
 from gammalake._telemetry import trace
 from gammalake._topo import with_columns_topo
 from gammalake._types import RayObjectReference
@@ -811,14 +811,22 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     def _load_features_from_tables(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         groups = [frame for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")]
-        sources = {
-            "index": self.index_frame(start, end).sort(self.sort_keys),
-            **{
-                frame["table_addr"].first(): read_table(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end)
-                for frame in groups
-            },
+        feature_sources = {
+            frame["table_addr"].first(): read_table(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end) for frame in groups
         }
-        return self._scan_feature_sources(tables, sources)
+        index = self.index_frame(start, end).sort(self.sort_keys)
+        filter_specs = (
+            {}
+            if tables.filter(pl.col("signal_type") == "runtime_computed").height
+            else {key: FilterSpec() for key in self.sort_keys if not index.collect_schema()[key].is_temporal()}
+        )
+        sources = {"index": (index, filter_specs), **{name: (frame, filter_specs) for name, frame in feature_sources.items()}}
+
+        def combine(filtered_sources):
+            frames = [frame.drop(self.sort_keys) for name, frame in filtered_sources.items() if name != "index"]
+            return self._concat_root_features(tables, filtered_sources["index"], frames)
+
+        return pushdown_combine(sources, combine)
 
     def _load_features_from_tables_in_parallel(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         groups = [frame for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")]
@@ -831,34 +839,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             ready, table_load_refs = self.wait(table_load_refs)
             frames.append(self.get(ready[0]))
 
-        sources = {
-            "index": self.index_frame(start, end).sort(self.sort_keys),
-            **{f"feature_{index}": frame.lazy() for index, frame in enumerate(frames)},
-        }
-        return self._scan_feature_sources(tables, sources, predicate_pushdown=False)
+        index = self.index_frame(start, end).sort(self.sort_keys)
+        return self._concat_root_features(tables, index, [frame.lazy().drop(self.sort_keys) for frame in frames])
 
-    def _scan_feature_sources(
-        self,
-        tables: pl.DataFrame,
-        sources: dict[str, pl.LazyFrame],
-        *,
-        predicate_pushdown: bool = True,
-    ) -> pl.LazyFrame:
-        """Combine canonical index keys with aligned feature values."""
-        columns = tables["feature_name"].to_list() + self.sort_keys
-        has_runtime = tables.filter(pl.col("signal_type") == "runtime_computed").height > 0
-        if has_runtime:
-            return scan_aligned_sources(
-                sources,
-                alignment_columns=self.sort_keys,
-                postprocess=lambda root_features: self._compute_runtime_features(tables, root_features).select(columns),
-                predicate_pushdown=False,
-            )
-        return scan_aligned_sources(
-            sources,
-            alignment_columns=self.sort_keys,
-            predicate_pushdown=predicate_pushdown,
-        ).select(columns)
+    def _concat_root_features(self, tables, index, frames) -> pl.LazyFrame:
+        """Prepend canonical sort keys to aligned feature-only frames."""
+        features = pl.concat([index, *frames], how="horizontal")
+        return self._compute_runtime_features(tables, features).select(tables["feature_name"].to_list() + self.sort_keys)
 
     def _compute_runtime_features(self, feature_table, root_features):
         runtime_computed_features = feature_table.filter(pl.col("signal_type") == "runtime_computed")
