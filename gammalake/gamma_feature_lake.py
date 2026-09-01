@@ -288,6 +288,7 @@ def update_feature_tables(
                 delta_write_options={
                     "writer_properties": WriterProperties(compression=feature_store.compression),
                     "target_file_size": feature_store.target_file_size,
+                    "configuration": feature_store._feature_stats_configuration,
                 },
             )
             return (
@@ -357,7 +358,11 @@ def update_feature_tables(
                         pl.concat([old_features, new_rows], how="vertical_relaxed").lazy().sort(feature_store.sort_keys),
                         feature_store.get_path(table_addr),
                         mode="append",
-                        delta_write_options={"writer_properties": writer_props, "target_file_size": feature_store.target_file_size},
+                        delta_write_options={
+                            "writer_properties": writer_props,
+                            "target_file_size": feature_store.target_file_size,
+                            "configuration": feature_store._feature_stats_configuration,
+                        },
                     )
 
                 feature_metadata_row = feature_df.with_columns(
@@ -619,6 +624,11 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     def sort_keys(self) -> list[str]:
         """Returns the index table's columm schema."""
         return self._sort_keys
+
+    @property
+    def _feature_stats_configuration(self) -> dict[str, str]:
+        """Restrict feature-table data-skipping statistics to the sort keys."""
+        return {"delta.dataSkippingStatsColumns": ",".join(self.sort_keys)}
 
     @property
     def index(self) -> str:
@@ -1223,7 +1233,12 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         consolidated = (
             self._load_features_from_tables_in_parallel(candidates) if self.run_on_ray_cluster else self._load_features_from_tables(candidates)
         )
-        self.io.write_delta(consolidated, self.get_path(new_addr), mode="append", delta_write_options=writer_options)
+        self.io.write_delta(
+            consolidated,
+            self.get_path(new_addr),
+            mode="append",
+            delta_write_options={**writer_options, "configuration": self._feature_stats_configuration},
+        )
         self.io.write_delta(
             pl.DataFrame().with_columns(
                 table_addr=pl.lit(new_addr),

@@ -6,11 +6,13 @@ import polars as pl
 import pyarrow as pa
 import pytest
 from ccflow import ArrowSchema
+from deltalake import DeltaTable
 from polars.testing import assert_frame_equal
 from pydantic import ValidationError
 
 from gammalake import GammaFeatureLake
 from gammalake.gamma_feature_lake import write_metadata
+from gammalake.io import PolarsIO
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
@@ -31,6 +33,44 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         return GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
 
     # --- special cases ---
+
+    def test_feature_tables_limit_stats_to_sort_keys(self, fs):
+        fs.add_features(generate_test_data(n_features=4, n_symbols=3, n_days=5))
+        addr = fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "feature_0")["table_addr"][0]
+        table = DeltaTable(fs.get_path(addr))
+        assert table.metadata().configuration.get("delta.dataSkippingStatsColumns") == ",".join(fs.sort_keys)
+        adds = pl.from_arrow(table.get_add_actions(flatten=True))
+        assert {column.removeprefix("min.") for column in adds.columns if column.startswith("min.")} == set(fs.sort_keys)
+
+        for system_table in (fs.index, fs.feature_metadata, fs.table_metadata):
+            assert "delta.dataSkippingStatsColumns" not in DeltaTable(system_table).metadata().configuration
+
+    def test_copy_replacement_limits_stats_to_sort_keys(self, fs):
+        timestamps = [datetime(2020, 1, day, tzinfo=UTC) for day in range(1, 4)]
+        initial = pl.DataFrame({"timestamp": timestamps, "symbol": ["S1"] * 3, "feature_0": [1] * 3})
+        fs.add_features(initial)
+        old_addr = fs.feature_metadata_frame().collect()["table_addr"][0]
+
+        fs.add_features(initial.with_columns(feature_0=pl.lit(2)))
+        latest = fs.feature_metadata_frame().collect().sort("version", descending=True).row(0, named=True)
+
+        assert latest["table_addr"] != old_addr
+        configuration = DeltaTable(fs.get_path(latest["table_addr"])).metadata().configuration
+        assert configuration.get("delta.dataSkippingStatsColumns") == ",".join(fs.sort_keys)
+
+    def test_existing_feature_table_append_does_not_reset_configuration(self, fs):
+        initial = generate_test_data(n_features=1, n_symbols=1, n_days=3)
+        fs.add_features(initial)
+        addr = fs.feature_metadata_frame().collect()["table_addr"][0]
+        table_path = fs.get_path(addr)
+        later = generate_test_data(n_features=1, n_symbols=1, n_days=3, start_date=datetime(2021, 1, 1, tzinfo=UTC))
+
+        with patch.object(fs.io, "write_delta", wraps=fs.io.write_delta) as mock_write:
+            fs.add_features(later)
+
+        feature_writes = [call for call in mock_write.call_args_list if call.args[1] == table_path]
+        assert feature_writes
+        assert all("configuration" not in call.kwargs["delta_write_options"] for call in feature_writes)
 
     def test_exceptions(self, tmp_path):
         fs_uninit = GammaFeatureLake(base_path=str(tmp_path))
@@ -251,6 +291,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         new_addr = fs.consolidate_feature_groups(["feature_0", "feature_1", "target_0"])
 
         assert new_addr is not None
+        assert DeltaTable(fs.get_path(new_addr)).metadata().configuration.get("delta.dataSkippingStatsColumns") == ",".join(fs.sort_keys)
         assert_frame_equal(
             expected.sort(fs.sort_keys),
             fs.read(["feature_0", "feature_1"], targets=["target_0"]).sort(fs.sort_keys),
@@ -359,6 +400,14 @@ def test_write_metadata_schema_mode_forwarded(tmp_path):
         assert mock_write.call_count == 1
         _, kwargs = mock_write.call_args
         assert kwargs["delta_write_options"].get("schema_mode") == "merge"
+
+
+def test_polars_io_forwards_delta_configuration():
+    configuration = {"delta.dataSkippingStatsColumns": "timestamp,symbol"}
+    with patch.object(pl.DataFrame, "write_delta") as mock_write:
+        PolarsIO().write_delta(pl.DataFrame({"value": [1]}), "unused", delta_write_options={"configuration": configuration})
+
+    mock_write.assert_called_once_with("unused", delta_write_options={"configuration": configuration})
 
 
 def test_add_features_single_commit_per_metadata_table(tmp_path):

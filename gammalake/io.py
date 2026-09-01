@@ -47,7 +47,7 @@ class FrameIO(ABC):
             df: a dataframe (either lazy or materialized) to write
             target: the target destination of the polars Dataframe
             delta_write_options: options passed through to the underlying Delta writer
-                (e.g. WriterProperties, schema_mode, target_file_size).
+                (e.g. WriterProperties, configuration, schema_mode, target_file_size).
 
         Returns:
             An Any type, typically None
