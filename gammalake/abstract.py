@@ -86,7 +86,6 @@ class BaseFeatureLake(abc.ABC):
     def index_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         """Returns the index table. Used in query operations."""
 
-    @abc.abstractmethod
     def add_index_rows(self, df: pl.DataFrame | ray.ObjectRef) -> list[StatusCode]:
         """Extend this FeatureLake's index without adding features.
 
@@ -97,7 +96,7 @@ class BaseFeatureLake(abc.ABC):
             A list of StatusCode enums.
 
         """
-        ...
+        raise NotImplementedError
 
     @singledispatchmethod
     def read(self, *arg) -> pl.DataFrame:
