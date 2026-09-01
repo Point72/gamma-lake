@@ -846,6 +846,60 @@ class GammaFeatureLakeTestsMixin:
             index_height=n_symbols * n_days,
         )
 
+    def _test_add_index_rows(self, fs: GammaFeatureLake, use_remote_data: bool = False):
+        """Index-only updates pad overlapping dense tables without changing metadata or sparse tables."""
+        n_symbols = 4
+        n_days = 10
+        start_date = datetime(2020, 6, 20, tzinfo=UTC)
+
+        fs.add_features(generate_test_data(n_features=2, n_symbols=n_symbols, n_days=n_days, start_date=start_date))
+        all_index = fs.index_frame().collect()
+        as_of_df = all_index.sample(fraction=0.3, seed=1).with_columns(pl.lit(1.0).alias("as_of"))
+        sparse_df = all_index.sample(fraction=0.3, seed=2).with_columns(pl.lit(2.0).alias("sparse"))
+        fs.add_as_of_features(as_of_df, params={})
+        fs.add_sparse_features(sparse_df)
+        self.verify_index_alignment(fs)
+
+        feature_metadata_before = fs.feature_metadata_frame().collect()
+        table_metadata_before = fs.table_metadata_frame().collect()
+        excluded_addrs = (
+            feature_metadata_before.filter(pl.col("signal_type").is_in(["as_of_feature", "sparse_feature"]))["table_addr"].unique().to_list()
+        )
+        dense_addrs = [addr for addr in feature_metadata_before["table_addr"].unique() if addr not in excluded_addrs]
+
+        def physical_heights(addrs: list[str]) -> dict[str, int]:
+            return {addr: fs.io.scan_delta(fs.get_path(addr)).collect().height for addr in addrs}
+
+        baseline_index_height = all_index.height
+        excluded_heights = physical_heights(excluded_addrs)
+        within = generate_test_data(n_features=1, n_symbols=n_symbols, n_days=3, start_date=start_date + timedelta(days=2)).select(fs.sort_keys)
+        within = clean(within.with_columns(pl.col("timestamp") + pl.duration(hours=6)), fs.sort_keys)
+        if use_remote_data:
+            import ray
+
+            fs.add_index_rows(ray.put(within))
+        else:
+            fs.add_index_rows(within.with_columns(pl.lit(99.0).alias("ignored_feature")))
+
+        expected_height = baseline_index_height + within.height
+        assert fs.index_frame().collect().height == expected_height
+        assert all(height == expected_height for height in physical_heights(dense_addrs).values())
+        assert physical_heights(excluded_addrs) == excluded_heights
+        self.verify_index_alignment(fs)
+
+        dense_heights = physical_heights(dense_addrs)
+        future = generate_test_data(n_features=1, n_symbols=n_symbols, n_days=5, start_date=start_date + timedelta(days=100)).select(fs.sort_keys)
+        future = clean(future, fs.sort_keys)
+        fs.add_index_rows(future)
+        assert fs.index_frame().collect().height == expected_height + future.height
+        assert physical_heights(dense_addrs) == dense_heights
+        assert physical_heights(excluded_addrs) == excluded_heights
+        assert_frame_equal(fs.feature_metadata_frame().collect(), feature_metadata_before)
+        assert_frame_equal(fs.table_metadata_frame().collect(), table_metadata_before)
+
+        fs.add_index_rows(pl.concat([within, within]))
+        assert fs.index_frame().collect().height == expected_height + future.height
+
     def _test_restore_to_timestamp_reverts_bad_add(self, fs: GammaFeatureLake):
         """Restore the entire store to a cutoff before a bad add batch."""
         features = [f"feature_{i}" for i in range(3)]
