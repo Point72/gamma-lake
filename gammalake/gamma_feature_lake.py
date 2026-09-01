@@ -498,21 +498,25 @@ def read_table(feature_store, table_meta: dict, features: list[str], start, end,
     """Read and sort a feature table using metadata resolved by the caller."""
     flt = pl.col(feature_store.primary_sort_key) >= start if start is not None else pl.lit(True)
     flt &= pl.col(feature_store.primary_sort_key) <= end if end is not None else pl.lit(True)
-    table = feature_store.io.scan_delta(feature_store.get_path(table_meta["table_addr"])).filter(flt).select(feature_store.sort_keys + features)
+    table = feature_store.io.scan_delta(feature_store.get_path(table_meta["table_addr"])).select(feature_store.sort_keys + features)
 
     if table_meta["signal_type"] == "as_of_feature":
         if table_meta["feature_params"] is None:
             raise ValueError(f"as_of_feature table {table_meta['table_addr']} requires feature_params to be resolved and passed by the caller")
+        as_of_params = json.loads(table_meta["feature_params"])
+        strategy = as_of_params.get("strategy", "backward")
+        as_of_filter = pl.col(feature_store.primary_sort_key) <= end if end is not None and strategy == "backward" else pl.lit(True)
+        as_of_filter &= pl.col(feature_store.primary_sort_key) >= start if start is not None and strategy == "forward" else pl.lit(True)
         by_keys = [key for key in feature_store.sort_keys if key != feature_store.primary_sort_key]
         table = (
             feature_store.index_frame()
             .filter(flt)
             .sort(by_keys + [feature_store.primary_sort_key])
             .join_asof(
-                table.sort(by_keys + [feature_store.primary_sort_key]),
+                table.filter(as_of_filter).sort(by_keys + [feature_store.primary_sort_key]),
                 on=feature_store.primary_sort_key,
                 by=by_keys,
-                **json.loads(table_meta["feature_params"]),
+                **as_of_params,
             )
         )
 
@@ -523,6 +527,9 @@ def read_table(feature_store, table_meta: dict, features: list[str], start, end,
             left_lf = left_lf.set_sorted(feature_store.primary_sort_key)
             right_lf = right_lf.set_sorted(feature_store.primary_sort_key)
         table = left_lf.join(right_lf, on=feature_store.sort_keys, how="left", coalesce=True)
+
+    else:
+        table = table.filter(flt)
 
     result = table.sort(feature_store.sort_keys)
     return result.collect() if materialize else result
