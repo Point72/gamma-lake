@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any
 
 import polars as pl
@@ -100,6 +101,17 @@ class FrameIO(ABC):
         """
         ...
 
+    @abstractmethod
+    def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
+        """Restore a Delta table to its state as of ``timestamp``.
+
+        Args:
+            target: Path of the Delta table to restore.
+            timestamp: Timezone-aware cutoff; commits after it are reverted.
+
+        """
+        ...
+
 
 class PolarsIO(FrameIO):
     """An implementation of FrameIO using native polars Delta table I/O."""
@@ -112,6 +124,10 @@ class PolarsIO(FrameIO):
 
     def scan_delta(self, target, **kwargs):
         return pl.scan_delta(target, **kwargs)
+
+    def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
+        """Restore a Delta table to ``timestamp`` using deltalake."""
+        DeltaTable(target).restore(timestamp)
 
     def annotate_table(self, table_addr: str, annotations: pl.DataFrame) -> None:
         """Persist comments and tags in Delta column metadata for one table."""
