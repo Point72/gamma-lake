@@ -116,24 +116,16 @@ class PolarsIO(FrameIO):
 
     def write_delta(self, df, target, *, delta_write_options=None, **kwargs):
         frame = df if isinstance(df, pl.LazyFrame) else df.lazy()
-        timezone_casts = [
-            pl.col(column).cast(pl.Datetime("us", dtype.time_zone))
-            for column, dtype in frame.collect_schema().items()
-            if isinstance(dtype, pl.Datetime) and dtype.time_zone is not None and dtype.time_unit != "us"
-        ]
-        if timezone_casts:
-            frame = frame.with_columns(timezone_casts)
         return piot.sink_delta(
             frame,
             target,
             chunk_size=-1,
-            translate_logical_types=False,
             delta_write_options=delta_write_options,
             **kwargs,
         )
 
     def scan_delta(self, target, **kwargs):
-        return pl.scan_delta(target, **kwargs)
+        return piot.scan_delta(target, **kwargs)
 
     def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
         """Restore a Delta table to ``timestamp`` using deltalake."""

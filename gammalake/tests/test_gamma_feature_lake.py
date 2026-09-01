@@ -763,7 +763,6 @@ def test_polars_io_forwards_delta_configuration():
     assert target == "unused"
     assert mock_write.call_args.kwargs == {
         "chunk_size": -1,
-        "translate_logical_types": False,
         "delta_write_options": {"configuration": configuration},
     }
 
