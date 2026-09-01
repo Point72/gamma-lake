@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* [bugfix] Preserve out-of-range context required by backward, forward, and nearest as-of reads.
 * [feature] Add `GammaFeatureLake.add_runtime_transforms` for deterministic row-local runtime transforms with validation and opt-in runtime-computed-feature security.
 * [feature] Push sort-key predicates into the global index and eligible feature scans using `polars-io-tools`, while preserving alignment and runtime/as-of context.
 * [feature] Add strict aligned-source concatenation using `polars-io-tools` coordinated predicate pushdown.
