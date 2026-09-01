@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* Resolve `feature_metadata` once per `GammaFeatureLake.read` and pipe it through read helpers to avoid repeated Delta-table scans.
 * Breaking API cleanup: remove the unused `debug` parameter from `GammaFeatureLake.read`; reads now always return requested features plus sort keys.
 * Restrict feature-table data-skipping statistics to `GammaFeatureLake` sort keys.
 * Document efficient `GammaFeatureLake` writes and backfills.
