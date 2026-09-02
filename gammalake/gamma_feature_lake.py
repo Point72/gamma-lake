@@ -138,6 +138,7 @@ from packaging import version
 from polars_io_tools import FilterSpec, pushdown_combine
 from pydantic import ConfigDict, Field, model_validator
 
+from gammalake._telemetry import trace
 from gammalake._topo import with_columns_topo
 from gammalake._types import RayObjectReference
 from gammalake.abstract import (
@@ -856,6 +857,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return with_columns_topo(root_features, runtime_feature_expressions)
 
     @singledispatchmethod
+    @trace(always=True)
     @ensure_deltalake_is_initialized
     def read(self, *arg) -> pl.DataFrame:
         """Abstract base dispatch method for sequential reads of feature tables"""
@@ -864,6 +866,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         )
 
     @read.register
+    @trace(always=True)
     @ensure_deltalake_is_initialized
     def _(
         self,
@@ -897,6 +900,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return result.collect() if materialized else result
 
     @read.register
+    @trace(always=True)
     @ensure_deltalake_is_initialized
     def _(
         self,
@@ -1020,6 +1024,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return [list_of_potential_refs.pop(0)], list_of_potential_refs
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def _add(
         self,
         df: pl.DataFrame | ray.ObjectRef,
@@ -1128,6 +1133,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self.get(refs) if self.run_on_ray_cluster else refs
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_targets(
         self,
         df: pl.DataFrame | ray.ObjectRef,
@@ -1144,6 +1150,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._add(df=df, signal_type="target", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_features(
         self,
         df: pl.DataFrame | ray.ObjectRef,
@@ -1160,6 +1167,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._add(df=df, signal_type="feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_index_rows(self, df: pl.DataFrame | ray.ObjectRef) -> list:
         """Extend the global index without adding features.
 
@@ -1182,6 +1190,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._add(df=df, signal_type="feature")
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def consolidate_feature_groups(self, features: list[str]) -> str | None:
         """Merge the current FeatureGroup tables for the given features into one table.
 
@@ -1251,6 +1260,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return new_addr
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_as_of_features(
         self,
         df: pl.DataFrame | ray.ObjectRef,
@@ -1263,6 +1273,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._add(df=df, signal_type="as_of_feature", owner=owner, metadata=metadata, feature_params=params, overlap_mode=overlap_mode)
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_sparse_features(
         self,
         df: pl.DataFrame | ray.ObjectRef,
@@ -1285,6 +1296,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._add(df=df, signal_type="sparse_feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_runtime_computed_features(self, exprs=list[PolarsExpression], owner: str = "missing_owner") -> None:
         """Add (and possibly increment the version) a serialized expression representing an adhoc runtime feature computation"""
         self._ensure_runtime_computed_features_enabled()
@@ -1336,6 +1348,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         self.io.write_delta(new_features, self.feature_metadata, mode="append", delta_write_options={"schema_mode": "merge"})
 
     @ensure_deltalake_is_initialized
+    @trace(always=True)
     def add_runtime_transforms(self, features: list[str], transforms: list[str], owner: str = "missing_owner") -> None:
         """Register row-local transforms over stored features as runtime features.
 
