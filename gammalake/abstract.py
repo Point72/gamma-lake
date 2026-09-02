@@ -1,5 +1,4 @@
 import abc
-from enum import Enum
 from functools import singledispatchmethod
 from typing import Literal
 
@@ -31,14 +30,6 @@ class MissingFeaturesException(KeyError):
         super().__init__(self.message)
 
 
-class MismatchedIndexSchema(ValueError):
-    """Exception raised when a user's provided IndexSchema does not match a preexisting Index's Schema"""
-
-    def __init__(self, message: str):
-        self.message = message
-        super().__init__(self.message)
-
-
 class UninitializedDeltaLakeException(ValueError):
     """Exception raised when a user attempts to use a feature store without ever initializing it"""
 
@@ -57,12 +48,6 @@ class MissingOrMisregisteredSignalsException(ValueError):
 
 UploadMergeModes = Literal["append", "upsert", "overwrite", "increment"]
 DefaultUploadMergeMode = "increment"
-
-
-class StatusCode(Enum):
-    SUCCESS = 1
-    FAILURE = 2
-    OTHER = 3
 
 
 class BaseFeatureLake(abc.ABC):
@@ -86,14 +71,13 @@ class BaseFeatureLake(abc.ABC):
     def index_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         """Returns the index table. Used in query operations."""
 
-    def add_index_rows(self, df: pl.DataFrame | ray.ObjectRef) -> list[StatusCode]:
+    def add_index_rows(self, df: pl.DataFrame | ray.ObjectRef) -> list:
         """Extend this FeatureLake's index without adding features.
 
         Args:
             df: An input Polars DataFrame, or object reference pointing to one, containing the sort-key rows to add.
 
-        Returns:
-            A list of StatusCode enums.
+        Returns: A list of write results.
 
         """
         raise NotImplementedError
@@ -151,7 +135,7 @@ class BaseFeatureLake(abc.ABC):
         df: pl.DataFrame | ray.ObjectRef,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
-    ) -> list[StatusCode]:
+    ) -> list:
         """Add features to this FeatureLake object. An optional metadata frame argument allows users to increment very specific feature versions, otherwise we fallback
         to generic insertion logic around latest feature version value.
 
@@ -160,7 +144,7 @@ class BaseFeatureLake(abc.ABC):
             owner: a string argument for use in identifying ownership in metadata tables.
             metadata: an optional DataFrame object, expected to be a (possibly) filtered version of this object's feature metadata frame, identifying which DeltaTables to update
 
-        Returns: A List of StatusCode enums
+        Returns: A list of write results.
         """
         ...
 
@@ -170,7 +154,7 @@ class BaseFeatureLake(abc.ABC):
         df: pl.DataFrame | ray.ObjectRef,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
-    ) -> list[StatusCode]:
+    ) -> list:
         """Add targets to this FeatureLake object. An optional metadata frame argument allows users to increment very specific feature versions, otherwise we fallback
         to generic insertion logic around latest feature version value.
 
@@ -179,7 +163,7 @@ class BaseFeatureLake(abc.ABC):
             owner: a string argument for use in identifying ownership in metadata tables.
             metadata: an optional DataFrame object, expected to be a (possibly) filtered version of this object's feature metadata frame, identifying which DeltaTables to update
 
-        Returns: A List of StatusCode enums
+        Returns: A list of write results.
         """
         ...
 
