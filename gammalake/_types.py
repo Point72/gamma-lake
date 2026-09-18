@@ -1,8 +1,13 @@
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
-import ray
-from pydantic import InstanceOf
-from typing_extensions import TypeAliasType
+if TYPE_CHECKING:
+    from ray import ObjectRef as RayObjectReference
+else:
+    T = TypeVar("T")
+
+    class RayObjectReference(Protocol, Generic[T]):
+        """Static stand-in for Ray's generic ObjectRef when Ray is unavailable."""
+
 
 __all__ = ("Comparable", "RayObjectReference")
 
@@ -16,7 +21,3 @@ class Comparable(Protocol):
     def __ge__(self, other) -> bool: ...
     def __eq__(self, other) -> bool: ...
     def __ne__(self, other) -> bool: ...
-
-
-T = TypeVar("T")
-RayObjectReference = TypeAliasType("RayObjectReference", InstanceOf[ray.ObjectRef], type_params=(T,))

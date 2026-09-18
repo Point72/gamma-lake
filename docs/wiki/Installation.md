@@ -8,6 +8,12 @@ You need Python >=3.10 on your machine to install `gamma-lake`.
 pip install gamma-lake
 ```
 
+This installs Gamma Lake for local execution without Ray. To enable distributed execution:
+
+```bash
+pip install "gamma-lake[ray]"
+```
+
 ## Install with `conda`
 
 ```bash

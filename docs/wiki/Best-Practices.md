@@ -91,16 +91,16 @@ selective read performance.
 
 ______________________________________________________________________
 
-## Use `run_on_ray_cluster=False` for Local Development
+## Use Local Mode for Local Development
 
-When iterating locally — unit tests, notebooks, small experiments — set `run_on_ray_cluster=False` to skip Ray
-dispatch overhead:
+Local mode is the default and does not require Ray. When iterating locally — unit tests, notebooks, small experiments —
+you can construct a lake directly:
 
 ```python
-lake = GammaFeatureLake(base_path="/tmp/my_lake", run_on_ray_cluster=False)
+lake = GammaFeatureLake(base_path="/tmp/my_lake")
 ```
 
-Switch back to `run_on_ray_cluster=True` (the default) for production or large-scale workloads where parallel writes
+Install the `ray` extra and set `run_on_ray_cluster=True` for production or large-scale workloads where parallel writes
 and reads provide significant speedups.
 
 ______________________________________________________________________

@@ -118,6 +118,8 @@ Two overlap modes are supported via the ``overlap_mode`` parameter on :meth:`add
   All reads always use the latest physical version of the table.
 """
 
+from __future__ import annotations
+
 import io
 import json
 import os
@@ -129,7 +131,6 @@ from typing import Literal
 
 import polars as pl
 import pyarrow as pa
-import ray
 from ccflow import ArrowSchema, BaseModel
 from ccflow.exttypes.polars import PolarsExpression
 from deltalake import WriterProperties
@@ -138,6 +139,7 @@ from packaging import version
 from polars_io_tools import FilterSpec, pushdown_combine
 from pydantic import ConfigDict, Field, model_validator
 
+from gammalake._ray import get as ray_get, is_object_ref, remote as ray_remote, require_ray, wait as ray_wait
 from gammalake._telemetry import trace
 from gammalake._topo import with_columns_topo
 from gammalake._types import RayObjectReference
@@ -179,7 +181,7 @@ def preprocess_df(feature_store, df):
 
 
 def update_feature_tables(
-    feature_store: "GammaFeatureLake",
+    feature_store: GammaFeatureLake,
     table_addr: str | None,
     input_length: int,
     inner_join_ref: RayObjectReference[pl.DataFrame],
@@ -405,7 +407,7 @@ def write_metadata(
     table_path,
     *rows,
     schema_mode=None,
-    _ray_ordering_deps: list[ray.ObjectRef] | None = None,
+    _ray_ordering_deps: list[RayObjectReference] | None = None,
 ) -> None:
     """Batch non-null metadata rows into one Delta commit."""
     filtered = [row for row in rows if row is not None]
@@ -565,7 +567,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         description="Target parquet file size in bytes when writing feature tables. Splitting large writes into "
         "multiple files of this size enables file-level min/max skipping on timestamp-filtered reads.",
     )
-    run_on_ray_cluster: bool = Field(True, description="Toggles whether or not this class uses ray remote functions, or strictly local python calls")
+    run_on_ray_cluster: bool = Field(False, description="Toggles whether or not this class uses ray remote functions, or strictly local python calls")
     enable_runtime_computed_features: bool = Field(
         False,
         description="Enables runtime-computed features. Only enable this when feature metadata is trusted because Polars expressions may execute Python code.",
@@ -577,10 +579,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @model_validator(mode="after")
-    def check(self) -> "GammaFeatureLake":
+    def check(self) -> GammaFeatureLake:
         """
         Write the proper metadata holding DeltaTables if they do not exist upon creation of this object.
         """
+        if self.run_on_ray_cluster:
+            require_ray()
+
         compression_levels = {i.name for i in Compression}
         if self.compression.upper() not in compression_levels:
             raise ValueError(f"Please provide a valid compression level: {compression_levels}\n Found: {self.compression}")
@@ -704,7 +709,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 "Runtime-computed features are disabled. Set enable_runtime_computed_features=True only when feature metadata is trusted."
             )
 
-    def initialize(self, schema: ArrowSchema = _DEFAULT_INDEX_SCHEMA) -> "GammaFeatureLake":
+    def initialize(self, schema: ArrowSchema = _DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
         """
         Write the proper metadata holding DeltaTables with the provided index schema.
         """
@@ -746,7 +751,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self
 
     @ensure_deltalake_is_initialized
-    def restore_to_timestamp(self, timestamp: datetime) -> "GammaFeatureLake":
+    def restore_to_timestamp(self, timestamp: datetime) -> GammaFeatureLake:
         """Revert the entire feature store to its state as of ``timestamp``.
 
         Every Delta commit after ``timestamp`` is undone across the index,
@@ -1011,23 +1016,23 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     def switch(self, function, num_returns=1, **kwargs):
         """Returns a remote function OR local function depending on the run_on_ray_cluster parameter"""
-        return function if not self.run_on_ray_cluster else ray.remote(num_returns=num_returns, **kwargs)(function).remote
+        return function if not self.run_on_ray_cluster else ray_remote(function, num_returns=num_returns, **kwargs)
 
     def get(self, potential_ref):
         """Wrap the getting of references (or actual objects) behind a switch"""
-        return ray.get(potential_ref) if self.run_on_ray_cluster else potential_ref
+        return ray_get(potential_ref) if self.run_on_ray_cluster else potential_ref
 
     def wait(self, list_of_potential_refs, **kwargs):
         """Wrap waiting on ray references (or actual object) behind a switch"""
         if self.run_on_ray_cluster:
-            return ray.wait(list_of_potential_refs, **kwargs)
+            return ray_wait(list_of_potential_refs, **kwargs)
         return [list_of_potential_refs.pop(0)], list_of_potential_refs
 
     @ensure_deltalake_is_initialized
     @trace(always=True)
     def _add(
         self,
-        df: pl.DataFrame | ray.ObjectRef,
+        df: pl.DataFrame | RayObjectReference,
         signal_type,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
@@ -1049,7 +1054,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             sized to fit memory. See the ``Best-Practices`` wiki page.
         """
 
-        if isinstance(df, ray.ObjectRef) and not self.run_on_ray_cluster:
+        if is_object_ref(df) and not self.run_on_ray_cluster:
             raise ValueError("Invalid RayObjectRef input! This class is configured not to use remote functions.")
 
         df = self.switch(preprocess_df)(self, df)
@@ -1136,7 +1141,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @trace(always=True)
     def add_targets(
         self,
-        df: pl.DataFrame | ray.ObjectRef,
+        df: pl.DataFrame | RayObjectReference,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
@@ -1153,7 +1158,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @trace(always=True)
     def add_features(
         self,
-        df: pl.DataFrame | ray.ObjectRef,
+        df: pl.DataFrame | RayObjectReference,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
@@ -1168,7 +1173,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     @ensure_deltalake_is_initialized
     @trace(always=True)
-    def add_index_rows(self, df: pl.DataFrame | ray.ObjectRef) -> list:
+    def add_index_rows(self, df: pl.DataFrame | RayObjectReference) -> list:
         """Extend the global index without adding features.
 
         Equivalent to :meth:`add_features` with only the sort-key columns retained. No
@@ -1263,7 +1268,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @trace(always=True)
     def add_as_of_features(
         self,
-        df: pl.DataFrame | ray.ObjectRef,
+        df: pl.DataFrame | RayObjectReference,
         params: dict,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
@@ -1276,7 +1281,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @trace(always=True)
     def add_sparse_features(
         self,
-        df: pl.DataFrame | ray.ObjectRef,
+        df: pl.DataFrame | RayObjectReference,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
@@ -1402,8 +1407,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     @staticmethod
     def merge(
-        left: "GammaFeatureLake",
-        right: "GammaFeatureLake",
+        left: GammaFeatureLake,
+        right: GammaFeatureLake,
         left_features: list | pl.DataFrame,
         right_features: list | pl.DataFrame,
         left_targets: list | None = None,
@@ -1452,7 +1457,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         if left.sort_keys != right.sort_keys:
             raise ValueError(f"Cannot merge two GammaFeatureLakes with different sort_keys: {left.sort_keys!r} vs {right.sort_keys!r}")
 
-        def _read_lazy(lake: "GammaFeatureLake", features: list | pl.DataFrame, targets: list | None) -> pl.LazyFrame:
+        def _read_lazy(lake: GammaFeatureLake, features: list | pl.DataFrame, targets: list | None) -> pl.LazyFrame:
             if isinstance(features, pl.DataFrame):
                 return lake.read(features, start=start, end=end, materialized=False)
             return lake.read(features, targets or [], start=start, end=end, materialized=False)
