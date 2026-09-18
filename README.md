@@ -1,6 +1,6 @@
 # Gamma Lake
 
-High-performance feature store built on Delta Lake and Ray
+High-performance feature store built on Delta Lake with optional Ray parallelism
 
 [![Build Status](https://github.com/Point72/gamma-lake/actions/workflows/build.yaml/badge.svg?branch=main&event=push)](https://github.com/Point72/gamma-lake/actions/workflows/build.yaml)
 [![codecov](https://codecov.io/gh/Point72/gamma-lake/branch/main/graph/badge.svg)](https://codecov.io/gh/Point72/gamma-lake)
@@ -9,7 +9,7 @@ High-performance feature store built on Delta Lake and Ray
 
 ## Overview
 
-Gamma Lake is a **feature store** built on [Delta Lake](https://delta.io/) and [Ray](https://www.ray.io/), designed for
+Gamma Lake is a **feature store** built on [Delta Lake](https://delta.io/) with optional [Ray](https://www.ray.io/) parallelism, designed for
 efficient storage, versioning, and retrieval of time-indexed features backed by [Polars](https://pola.rs/) DataFrames.
 
 It was built to solve the real-world pain points that teams encounter when using flat Parquet files for ML feature
@@ -210,7 +210,7 @@ read one column to preserve its row count during horizontal concatenation.
 
 With `run_on_ray_cluster=True`, Gamma Lake dispatches feature-group operations independently through Ray. Group writes
 and the single master-index update run in parallel. Metadata becomes visible only after the feature and index writes
-succeed.
+succeed. Install Ray support with `pip install "gamma-lake[ray]"`.
 
 ### Metadata and versioning
 
@@ -280,6 +280,12 @@ To install `gamma-lake` via **pip**, run this command in your terminal:
 
 ```bash
 pip install gamma-lake
+```
+
+This installs the local execution dependencies without Ray. To enable distributed execution:
+
+```bash
+pip install "gamma-lake[ray]"
 ```
 
 To install `gamma-lake` via **conda**, run this command in your terminal:
