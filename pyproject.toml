@@ -12,7 +12,7 @@ authors = [
 description = "High-performance feature store built on Delta Lake with optional Ray parallelism"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.11"
 keywords = [
     "feature store",
@@ -76,7 +76,7 @@ Repository = "https://github.com/Point72/gamma-lake"
 Homepage = "https://github.com/Point72/gamma-lake"
 
 [tool.bumpversion]
-current_version = "0.1.0"
+current_version = "0.2.0"
 commit = true
 tag = true
 commit_args = "-s"
