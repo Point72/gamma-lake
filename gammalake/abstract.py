@@ -1,13 +1,14 @@
+from __future__ import annotations
+
 import abc
 from functools import singledispatchmethod
 from typing import Literal
 
 import polars as pl
-import ray
 from ccflow import BaseModel
 from pydantic import Field, model_validator
 
-from gammalake._types import Comparable
+from gammalake._types import Comparable, RayObjectReference
 
 __all__ = (
     "BaseFeatureLake",
@@ -71,7 +72,7 @@ class BaseFeatureLake(abc.ABC):
     def index_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         """Returns the index table. Used in query operations."""
 
-    def add_index_rows(self, df: pl.DataFrame | ray.ObjectRef) -> list:
+    def add_index_rows(self, df: pl.DataFrame | RayObjectReference) -> list:
         """Extend this FeatureLake's index without adding features.
 
         Args:
@@ -132,7 +133,7 @@ class BaseFeatureLake(abc.ABC):
     @abc.abstractmethod
     def add_features(
         self,
-        df: pl.DataFrame | ray.ObjectRef,
+        df: pl.DataFrame | RayObjectReference,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
     ) -> list:
@@ -151,7 +152,7 @@ class BaseFeatureLake(abc.ABC):
     @abc.abstractmethod
     def add_targets(
         self,
-        df: pl.DataFrame | ray.ObjectRef,
+        df: pl.DataFrame | RayObjectReference,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
     ) -> list:
@@ -175,7 +176,7 @@ class FeatureMetadata(BaseModel):
     feature_versions: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def check(self) -> "FeatureMetadata":
+    def check(self) -> FeatureMetadata:
         """
         Verify alignment between the number of feature_names and versions - either match exactly, or feature_versions should be an empty list.
         """

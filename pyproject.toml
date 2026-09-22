@@ -9,7 +9,7 @@ name = "gamma-lake"
 authors = [
     {name = "Point72, L.P.", email = "OpenSource@point72.com"},
 ]
-description = "High-performance feature store built on Delta Lake and Ray"
+description = "High-performance feature store built on Delta Lake with optional Ray parallelism"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 version = "0.1.0"
@@ -42,11 +42,13 @@ dependencies = [
     "polars-io-tools>=0.2.1,<0.3",
     "pyarrow>=10",
     "pydantic>=2",
-    "ray",
     "typing-extensions>=4.4.0",
 ]
 
 [project.optional-dependencies]
+ray = [
+    "ray",
+]
 develop = [
     "asv",
     "boto3",
@@ -59,6 +61,7 @@ develop = [
     "mdformat-tables>=1",
     "pytest",
     "pytest-cov",
+    "ray",
     "ruff",
     "twine",
     "ty",

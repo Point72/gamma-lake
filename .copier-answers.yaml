@@ -6,7 +6,7 @@ add_extension: python
 add_wiki: true
 email: OpenSource@point72.com
 github: Point72
-project_description: High-performance feature store built on Delta Lake and Ray
+project_description: High-performance feature store built on Delta Lake with optional Ray parallelism
 project_name: gamma-lake
 python_version_primary: '3.11'
 team: Point72, L.P.
