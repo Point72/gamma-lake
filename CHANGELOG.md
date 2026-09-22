@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (09-22-26)
 * [cleanup] Remove unused validation types and stale status scaffolding.
 * [feature] Use `polars-io-tools` for native LazyFrame Delta writes.
 * [docs] Move the architecture deep dive and diagrams into the project README.
