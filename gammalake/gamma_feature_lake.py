@@ -150,6 +150,7 @@ from gammalake.abstract import (
     MissingOrMisregisteredSignalsException,
     UninitializedDeltaLakeException,
 )
+from gammalake.coordinator import WriteCoordinator
 from gammalake.io import FrameIO, PolarsIO
 
 __all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
@@ -184,9 +185,9 @@ def update_feature_tables(
     feature_store: GammaFeatureLake,
     table_addr: str | None,
     input_length: int,
-    inner_join_ref: RayObjectReference[pl.DataFrame],
-    new_index_rows_ref: RayObjectReference[pl.DataFrame],
-    missing_index_rows_ref: RayObjectReference[pl.DataFrame],
+    inner_join_ref: pl.DataFrame,
+    new_index_rows_ref: pl.DataFrame,
+    missing_index_rows_ref: pl.DataFrame,
     input_comparable_max: Comparable,
     input_comparable_min: Comparable,
     columns: list[str],
@@ -196,6 +197,7 @@ def update_feature_tables(
     feature_params: dict | None = None,
     feature_metadata: pl.DataFrame | None = None,
     table_metadata: pl.DataFrame | None = None,
+    index_was_new: bool = False,
 ) -> tuple[pa.Table, pa.Table | None]:
     """
     Processes step 1 of the Gamma Lake add operation for new input frames. Index modification happens outside this function, in parallel, and only once.
@@ -302,8 +304,22 @@ def update_feature_tables(
         columns = feature_store.sort_keys + feature_df["feature_name"].to_list()
         last_updated = feature_store._get_last_updated(table_addr, table_metadata=table_metadata)
         feature_metadata_row = None
+        writer_props = WriterProperties(compression=feature_store.compression)
 
-        if input_length == new_index_rows_ref.height:
+        if index_was_new and input_comparable_min <= last_updated:
+            # These keys were absent before coordinated index preparation.
+            # Replace padding without applying overlap/copy semantics to old data.
+            rows = pl.concat(
+                [inner_join_ref, new_index_rows_ref, missing_index_rows_ref.filter(pl.col(feature_store.primary_sort_key) > last_updated)],
+                how="diagonal",
+            ).select(columns)
+            feature_store.io.merge_delta(
+                rows,
+                feature_store.get_path(table_addr),
+                on=feature_store.sort_keys,
+                writer_properties=writer_props,
+            )
+        elif input_length == new_index_rows_ref.height:
             # All input rows are new to the index. Write them to the feature table directly.
             feature_store.io.write_delta(
                 new_index_rows_ref.lazy().sort(feature_store.sort_keys),
@@ -317,7 +333,6 @@ def update_feature_tables(
             )
         else:
             if input_comparable_min <= last_updated:
-                writer_props = WriterProperties(compression=feature_store.compression)
                 pk = feature_store.primary_sort_key
                 next_rank = feature_df["version"].max() + 1
                 source_path = feature_store.get_path(table_addr)
@@ -438,7 +453,7 @@ def align_feature_tables(feature_store, new_index_rows_ref, row, input_comparabl
 
     Returns: None
     """
-    if input_comparable_min >= row["last_updated"]:
+    if input_comparable_min > row["last_updated"]:
         return
 
     filtered_antijoin = new_index_rows_ref.select(feature_store.sort_keys).filter(pl.col(feature_store.primary_sort_key) <= row["last_updated"])
@@ -568,6 +583,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         "multiple files of this size enables file-level min/max skipping on timestamp-filtered reads.",
     )
     run_on_ray_cluster: bool = Field(False, description="Toggles whether or not this class uses ray remote functions, or strictly local python calls")
+    coordinate_writes: bool = Field(False, description="Opt into a shared Ray write coordinator for concurrent add operations within one cluster.")
     enable_runtime_computed_features: bool = Field(
         False,
         description="Enables runtime-computed features. Only enable this when feature metadata is trusted because Polars expressions may execute Python code.",
@@ -575,6 +591,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     io: FrameIO = Field(default_factory=PolarsIO, description="An IO object, abstracting how/where polars frames are read from storage.")
     _is_initialized: bool = False
     _sort_keys: list[str] = None
+    _coordinated_worker: bool = False
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -583,6 +600,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """
         Write the proper metadata holding DeltaTables if they do not exist upon creation of this object.
         """
+        if self.coordinate_writes and not self.run_on_ray_cluster:
+            raise ValueError("coordinate_writes=True requires run_on_ray_cluster=True")
         if self.run_on_ray_cluster:
             require_ray()
 
@@ -668,6 +687,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         ``annotations`` matches the feature metadata schema with a string ``comment``
         column and a list-of-strings ``tags`` column added.
         """
+        self._require_uncoordinated_maintenance()
         expected_schema = {**self.feature_metadata_frame().collect_schema(), "comment": pl.String, "tags": pl.List(pl.String)}
         if dict(annotations.schema) != expected_schema:
             raise ValueError(
@@ -713,6 +733,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """
         Write the proper metadata holding DeltaTables with the provided index schema.
         """
+        self._require_uncoordinated_maintenance()
         if self.primary_sort_key not in schema.schema.names:
             raise ValueError(f"The provided primary sort key: {self.primary_sort_key} does not exist in the schema keys: {schema.schema.names}")
 
@@ -776,6 +797,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             This feature store, restored in place.
 
         """
+        self._require_uncoordinated_maintenance()
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
             raise ValueError("restore_to_timestamp requires a timezone-aware datetime")
 
@@ -993,7 +1015,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         )
         excluded_addrs = feature_metadata.filter(pl.col("signal_type").is_in(["as_of_feature", "sparse_feature"])).select("table_addr").unique()
         return (
-            table_metadata.join(do_not_update, how="anti", on="table_addr")
+            table_metadata.group_by("table_addr")
+            .agg(pl.col("last_updated").max())
+            .join(do_not_update, how="anti", on="table_addr")
             .join(excluded_addrs, how="anti", on="table_addr")
             .filter(pl.col("last_updated") >= min_value)
         )
@@ -1006,16 +1030,12 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @ensure_deltalake_is_initialized
     def _get_last_updated(self, table_addr, table_metadata: pl.DataFrame):
         """Shorthand to find the last updated value for a given table address"""
-        return (
-            table_metadata.lazy()
-            .filter(pl.col("table_addr") == table_addr)
-            .select(pl.col("last_updated").filter(pl.col("update_timestamp") == pl.col("update_timestamp").max()).first().alias("last_updated"))
-            .collect()
-            .item()
-        )
+        return table_metadata.lazy().filter(pl.col("table_addr") == table_addr).select(pl.col("last_updated").max()).collect().item()
 
     def switch(self, function, num_returns=1, **kwargs):
         """Returns a remote function OR local function depending on the run_on_ray_cluster parameter"""
+        if self._coordinated_worker:
+            kwargs["max_retries"] = 0
         return function if not self.run_on_ray_cluster else ray_remote(function, num_returns=num_returns, **kwargs)
 
     def get(self, potential_ref):
@@ -1028,6 +1048,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             return ray_wait(list_of_potential_refs, **kwargs)
         return [list_of_potential_refs.pop(0)], list_of_potential_refs
 
+    def _require_uncoordinated_maintenance(self) -> None:
+        if self.coordinate_writes:
+            raise ValueError("Maintenance requires stopping all coordinated writers and using coordinate_writes=False")
+
     @ensure_deltalake_is_initialized
     @trace(always=True)
     def _add(
@@ -1038,7 +1062,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         metadata: pl.DataFrame | None = None,
         feature_params: dict | None = None,
         overlap_mode: str = "copy",
-    ) -> list:
+        *,
+        _defer_metadata: bool = False,
+        _index_was_new: bool = False,
+    ) -> list | tuple[list, list]:
         """
         Onboards a new table of features to our FeatureStore.
 
@@ -1054,6 +1081,12 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             sized to fit memory. See the ``Best-Practices`` wiki page.
         """
 
+        if self.coordinate_writes:
+            return ray_get(
+                WriteCoordinator.connect(self).submit.remote(
+                    self, df, signal_type=signal_type, owner=owner, metadata=metadata, feature_params=feature_params, overlap_mode=overlap_mode
+                )
+            )
         if is_object_ref(df) and not self.run_on_ray_cluster:
             raise ValueError("Invalid RayObjectRef input! This class is configured not to use remote functions.")
 
@@ -1068,6 +1101,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             earliest_new_index_rows_ref,
             missing_index_rows_ref,
         ) = self.switch(compute_index_deltas, num_returns=8)(self, df)
+        if _defer_metadata and signal_type in ("as_of_feature", "sparse_feature"):
+            # The coordinator pre-populates other writers' index keys; these
+            # must not become null observations in sparse/as-of tables.
+            missing_index_rows_ref = self.get(df).head(0)
         feature_metadata = self.feature_metadata_frame().collect()
         table_metadata = self.table_metadata_frame().collect()
         feature_tables = self._get_latest_feature_tables(self.get(columns), feature_metadata=feature_metadata)
@@ -1099,6 +1136,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 overlap_mode=overlap_mode,
                 feature_metadata=feature_metadata,
                 table_metadata=table_metadata,
+                index_was_new=_index_was_new,
             )
             for table_addr in feature_tables["table_addr"].unique()
         ]
@@ -1114,6 +1152,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         # This can also be done in parallel.
         index_ref = self.switch(update_index)(self, new_index_rows_ref)
         refs.append(index_ref)
+
+        if _defer_metadata:
+            self.get(refs)
+            tables = []
+            features = []
+            for table_ref, feature_ref in feature_table_update_refs:
+                tables.append(self.get(table_ref))
+                features.append(self.get(feature_ref))
+            return tables, features
 
         if feature_table_update_refs:
             # Metadata becomes visible only after all data and index writes succeed.
@@ -1211,6 +1258,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             MissingFeaturesException: If any requested feature does not exist.
             ValueError: If any requested feature has a non-consolidatable signal type.
         """
+        self._require_uncoordinated_maintenance()
         candidates = (
             self.feature_metadata_frame()
             .collect()
@@ -1304,6 +1352,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @trace(always=True)
     def add_runtime_computed_features(self, exprs=list[PolarsExpression], owner: str = "missing_owner") -> None:
         """Add (and possibly increment the version) a serialized expression representing an adhoc runtime feature computation"""
+        self._require_uncoordinated_maintenance()
         self._ensure_runtime_computed_features_enabled()
         for expr in exprs:
             if expr.meta.output_name() in expr.meta.root_names():

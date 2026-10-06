@@ -1,4 +1,5 @@
 from gammalake.abstract import *
+from gammalake.coordinator import *
 from gammalake.gamma_feature_lake import *
 from gammalake.io import *
 

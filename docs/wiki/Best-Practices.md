@@ -103,6 +103,18 @@ lake = GammaFeatureLake(base_path="/tmp/my_lake")
 Install the `ray` extra and set `run_on_ray_cluster=True` for production or large-scale workloads where parallel writes
 and reads provide significant speedups.
 
+For **independent concurrent producers**, also set `coordinate_writes=True`. Ray task parallelism
+alone does not coordinate separate `add_*` calls. Initialize the lake before enabling coordination,
+and make every producer use the same cluster, storage path, and configuration. The coordinator
+batches new index keys, aligns dense tables, and writes independent feature groups concurrently;
+conflicting groups wait for refreshed metadata. Use `WriteCoordinator.connect(lake).submit_batch.remote(...)`
+to submit multiple frames together.
+
+Coordinate only writes: reads during a batch can observe incomplete state. Maintenance must run
+with producers stopped. After any failed batch, quiesce workers and repair the lake before replacing
+the failed actor. See the [concurrent-write contract](https://github.com/Point72/gamma-lake#coordinated-concurrent-writes-ray-only)
+for restrictions and recovery.
+
 ______________________________________________________________________
 
 ## Choose a Meaningful `primary_sort_key`

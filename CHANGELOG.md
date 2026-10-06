@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+* [feature] Add an opt-in, Ray-only `WriteCoordinator` that batches new index keys, aligns dense tables, parallelizes independent feature writers, and serializes metadata publication.
+* [bugfix] Align new secondary-key rows at a table's latest timestamp and use one physical-table high-water mark when planning padding and backfills.
+
 ## 0.2.0 (09-22-26)
 * [cleanup] Remove unused validation types and stale status scaffolding.
 * [feature] Use `polars-io-tools` for native LazyFrame Delta writes.

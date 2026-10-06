@@ -100,15 +100,15 @@ ______________________________________________________________________
 
 Beyond raw I/O performance, Gamma Lake addresses requirements that pure Parquet solutions struggle with:
 
-| Capability                          | Parquet files | Gamma Lake |
-| ----------------------------------- | :-----------: | :--------: |
-| O(1) feature group addition         |      ❌       |     ✅     |
-| Concurrent team writes              |      ❌       |     ✅     |
-| Feature versioning                  |      ❌       |     ✅     |
-| Time-travel queries                 |      ❌       |     ✅     |
-| As-of (point-in-time safe) features |      ❌       |     ✅     |
-| Runtime-computed features           |      ❌       |     ✅     |
-| Sparse feature storage              |      ❌       |     ✅     |
-| Granular owner/permission metadata  |      ❌       |     ✅     |
-| Parallel reads via Ray              |      ❌       |     ✅     |
-| ACID transactions                   |      ❌       |     ✅     |
+| Capability                          | Parquet files |       Gamma Lake       |
+| ----------------------------------- | :-----------: | :--------------------: |
+| O(1) feature group addition         |      ❌       |           ✅           |
+| Concurrent team writes              |      ❌       | Opt-in Ray coordinator |
+| Feature versioning                  |      ❌       |           ✅           |
+| Time-travel queries                 |      ❌       |           ✅           |
+| As-of (point-in-time safe) features |      ❌       |           ✅           |
+| Runtime-computed features           |      ❌       |           ✅           |
+| Sparse feature storage              |      ❌       |           ✅           |
+| Granular owner/permission metadata  |      ❌       |           ✅           |
+| Parallel reads via Ray              |      ❌       |           ✅           |
+| ACID transactions                   |      ❌       |           ✅           |
