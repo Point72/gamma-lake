@@ -1,5 +1,6 @@
 from gammalake.abstract import *
 from gammalake.gamma_feature_lake import *
 from gammalake.io import *
+from gammalake.writer import *
 
 __version__ = "0.2.0"

@@ -22,7 +22,7 @@ The most common alternative — storing features in per-day Parquet files — br
 | Problem                                                  | Gamma Lake's answer                                                                                 |
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | Adding a new feature group rewrites *all* existing files | Gamma Lake writes one new Delta table per feature group — **O(1) cost regardless of existing data** |
-| Multiple teams can't write features in parallel          | Each feature group is an independent Delta table — concurrent writes don't conflict                 |
+| Multiple teams can't write features in parallel          | An opt-in Ray IO writer serializes index changes and pipelines independent feature writes           |
 | No versioning or audit trail                             | Delta Lake's transaction log provides full time-travel and version history                          |
 | Cross-group reads require expensive joins                | Gamma Lake maintains a master index; reads are aligned horizontal concatenations                    |
 | Experimental features pollute production data            | Features carry `owner` and `version` metadata; `read()` accepts a filtered metadata frame           |
@@ -211,6 +211,78 @@ read one column to preserve its row count during horizontal concatenation.
 With `run_on_ray_cluster=True`, Gamma Lake dispatches feature-group operations independently through Ray. Group writes
 and the single master-index update run in parallel. Metadata becomes visible only after the feature and index writes
 succeed. Install Ray support with `pip install "gamma-lake[ray]"`.
+
+### Coordinated concurrent writes (Ray only)
+
+Set `coordinate_writes=True` together with `run_on_ray_cluster=True` to route concurrent
+`add_features`, `add_targets`, `add_as_of_features`, `add_sparse_features`, and `add_index_rows`
+calls through a shared `RayIOWriter` actor. The default remains uncoordinated.
+Initialize the lake once, before starting concurrent producers:
+
+```python
+import ray
+
+from gammalake import GammaFeatureLake, RayIOWriter
+
+path = "/shared/features"
+GammaFeatureLake(base_path=path).initialize()
+ray.init()
+lake = GammaFeatureLake(base_path=path, run_on_ray_cluster=True, coordinate_writes=True)
+
+# Independent producers can call lake.add_features(...) as usual.
+# When multiple frames are already available, submit them together:
+writer = RayIOWriter.connect(lake)
+ray.get(writer.submit_batch.remote(lake, [features_a, features_b], owner="my-team"))
+```
+
+Every call has its own index critical section: read the current index, classify input keys,
+reserve destinations and feature versions, and append only missing keys. The writer then
+schedules feature writes and dense-table padding and releases the index lane **without waiting
+for either**. The next call can advance the index while previous feature writes are still running.
+Calls with no new keys skip the index write.
+
+```text
+add A: [index A] ---> feature A ----------------> publish A
+add B:          [index B] ---> feature B --> publish B
+add C:                    [index C] ---> feature C ...
+```
+
+The writer tracks pending tables as well as published ones. A later call adding keys inside a
+pending table's range schedules padding after that table's creation. Writes to the same physical
+table are ordered using Ray task dependencies; independent tables proceed concurrently.
+Copy-mode operations reserve their destination in advance and depend on both the source and
+destination lanes. Each task uses its call's captured index relationships and reserved metadata,
+not a later live index snapshot. Sparse/as-of tables do not receive padding observations.
+
+Once a call's own feature and alignment tasks finish, it publishes table metadata followed by
+feature metadata under a separate publication lock. This short metadata critical section never
+holds the index lane or blocks independent data tasks. Calls may complete out of admission order.
+`submit_batch` is only a convenience for submitting multiple calls: it does not combine their
+indices or introduce a batch completion barrier.
+
+All producers must use the **same Ray cluster, lake configuration, IO configuration, and shared
+storage path**. The named actor uses the fixed `gammalake-writes` Ray namespace, so producers in
+different application namespaces still coordinate. Do not mix coordinated and uncoordinated
+writers or write directly to the underlying Delta tables. This is not a cross-cluster lock.
+Storage must support safe Delta commits; the actor does not configure an S3 locking provider.
+
+Index additions are visible before feature completion: **reads are not transactionally isolated
+from writes**, and an error can leave committed index rows or feature data behind. Any write
+failure stops further admission; already scheduled work may still complete, and unrelated calls
+may already have published. Writes are not automatically retried. Quiesce all producers
+and outstanding tasks, repair or restore the lake, then remove the failed actor with
+`ray.kill(writer)` before reconnecting. Never kill/recreate the actor during live writes.
+The actor survives a producer driver's exit, but does not restart after actor/cluster failure.
+It does not provide durable request replay.
+Cancelling a caller is not a rollback. Nonrecursive cancellation leaves admitted writes running;
+recursive Ray cancellation can interrupt their tasks and requires the same recovery as a write failure.
+
+Maintenance (`initialize`, consolidation, annotation, restoration, and runtime-feature registration)
+must run offline using an uncoordinated instance. Explicit `metadata=` overrides are rejected in
+coordinated mode. Successful coordinated calls return `[]` rather than individual task results.
+Input keys are classified before their index commit, preserving new-key versus overlap semantics.
+The writer keeps planned metadata in memory; out-of-band writes and maintenance invalidate it.
+The current prototype does not impose queue or memory limits and does not persist its dependency graph.
 
 ### Metadata and versioning
 
