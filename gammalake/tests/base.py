@@ -43,26 +43,31 @@ def generate_test_data(
     feature_suffix="feature",
 ):
     """Generate test data directly in polars."""
-    feature_expressions = [
-        pl.lit(np.random.normal(loc=100, scale=15, size=n_days)).alias(f"{feature_suffix}_{i}")
-        for i in range(feature_ids_start, feature_ids_start + n_features)
-    ]
+    feature_values = {
+        f"{feature_suffix}_{i}": np.random.normal(loc=100, scale=15, size=n_days) for i in range(feature_ids_start, feature_ids_start + n_features)
+    }
+    timestamps = (
+        pl.datetime_range(
+            start=start_date,
+            end=start_date + timedelta(days=n_days),
+            closed="right",
+            interval="1d",
+            eager=True,
+        )
+        .cast(pl.Datetime)
+        .dt.replace_time_zone("UTC")
+    )
 
     dfs = []
     for symbol in range(symbols_id_start, symbols_id_start + n_symbols):
         dfs.append(
-            pl.DataFrame()
-            .with_columns(
-                pl.date_range(
-                    start=start_date,
-                    end=start_date + timedelta(days=n_days),
-                    closed="right",
-                    interval="1d",
-                ).alias("timestamp"),
-                pl.lit(f"Symbol_{symbol}").alias("symbol"),
+            pl.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "symbol": pl.Series([f"Symbol_{symbol}"] * n_days, dtype=pl.String),
+                    **feature_values,
+                }
             )
-            .with_columns(feature_expressions)
-            .with_columns(pl.col("timestamp").cast(pl.Datetime).dt.replace_time_zone("UTC").alias("timestamp"))
         )
     df = pl.concat(dfs)
     duplicates = df.sample(fraction=0.20, with_replacement=True)
