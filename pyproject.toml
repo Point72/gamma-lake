@@ -38,7 +38,7 @@ dependencies = [
     "ccflow>=0.8",
     "deltalake",
     "packaging",
-    "polars>=1.33.1",
+    "polars>=1.33.1,<2",
     "polars-io-tools>=0.2.1,<0.3",
     "pyarrow>=10",
     "pydantic>=2",

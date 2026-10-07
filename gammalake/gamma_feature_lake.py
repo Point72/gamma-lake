@@ -150,8 +150,8 @@ from gammalake.abstract import (
     MissingOrMisregisteredSignalsException,
     UninitializedDeltaLakeException,
 )
-from gammalake.coordinator import WriteCoordinator
 from gammalake.io import FrameIO, PolarsIO
+from gammalake.writer import RayIOWriter
 
 __all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
 
@@ -181,6 +181,38 @@ def preprocess_df(feature_store, df):
     return df.filter(pl.all_horizontal(pl.col(key).is_not_null() for key in feature_store.sort_keys))
 
 
+def _plan_feature_table(
+    feature_store,
+    table_addr,
+    columns,
+    input_length,
+    new_index_count,
+    input_comparable_min,
+    *,
+    owner,
+    signal_type,
+    overlap_mode,
+    feature_params,
+    feature_metadata,
+    table_metadata,
+) -> tuple[str, pl.DataFrame | None]:
+    """Reserve a destination and feature version without writing data."""
+    feature_df = feature_store._get_latest_feature_tables(columns, feature_metadata=feature_metadata)
+    if table_addr is None:
+        return feature_store._write_new_feature_table(feature_df.filter(pl.col("table_addr").is_null()), owner, signal_type, feature_params)
+    feature_df = feature_df.filter(pl.col("table_addr") == table_addr)
+    if input_length != new_index_count and input_comparable_min <= feature_store._get_last_updated(table_addr, table_metadata=table_metadata):
+        target = table_addr if overlap_mode == "merge" else feature_store.gen_table_addr()
+        return target, feature_df.with_columns(
+            version=pl.lit(feature_df["version"].max() + 1, dtype=pl.Int64),
+            table_addr=pl.lit(target),
+            owner=pl.lit(owner),
+            signal_type=pl.lit(signal_type),
+            feature_params=pl.lit(json.dumps(feature_params)) if feature_params is not None else pl.col("feature_params"),
+        )
+    return table_addr, None
+
+
 def update_feature_tables(
     feature_store: GammaFeatureLake,
     table_addr: str | None,
@@ -197,7 +229,7 @@ def update_feature_tables(
     feature_params: dict | None = None,
     feature_metadata: pl.DataFrame | None = None,
     table_metadata: pl.DataFrame | None = None,
-    index_was_new: bool = False,
+    _planned_write: tuple[str, pl.DataFrame | None] | None = None,
 ) -> tuple[pa.Table, pa.Table | None]:
     """
     Processes step 1 of the Gamma Lake add operation for new input frames. Index modification happens outside this function, in parallel, and only once.
@@ -273,11 +305,26 @@ def update_feature_tables(
 
     """
     try:
+        target, feature_metadata_row = _planned_write or _plan_feature_table(
+            feature_store,
+            table_addr,
+            columns,
+            input_length,
+            new_index_rows_ref.height,
+            input_comparable_min,
+            owner=owner,
+            signal_type=signal_type,
+            overlap_mode=overlap_mode,
+            feature_params=feature_params,
+            feature_metadata=feature_metadata,
+            table_metadata=table_metadata,
+        )
         if table_addr is None:
+            if feature_metadata_row is None:
+                raise ValueError("A new feature table requires planned feature metadata")
             # These features have never been seen before. Add them to a new table, address the new/missing index rows where applicable, and return.
             # sparse_feature tables never receive null sentinel rows — only rows with actual values are stored.
-            feature_df = feature_store._get_latest_feature_tables(columns, feature_metadata=feature_metadata).filter(pl.col("table_addr").is_null())
-            table_addr, new_feature_metadata_row = feature_store._write_new_feature_table(feature_df, owner, signal_type, feature_params)
+            table_addr = target
             rows_to_write = (
                 pl.concat([inner_join_ref, new_index_rows_ref], how="diagonal")
                 if signal_type == "sparse_feature"
@@ -297,32 +344,24 @@ def update_feature_tables(
                 pl.DataFrame()
                 .with_columns(table_addr=pl.lit(table_addr), last_updated=pl.lit(input_comparable_max), update_timestamp=_get_timestamp())
                 .to_arrow(),
-                new_feature_metadata_row.to_arrow(),
+                feature_metadata_row.to_arrow(),
             )
 
         feature_df = feature_store._get_latest_feature_tables(columns, feature_metadata=feature_metadata).filter(pl.col("table_addr") == table_addr)
         columns = feature_store.sort_keys + feature_df["feature_name"].to_list()
         last_updated = feature_store._get_last_updated(table_addr, table_metadata=table_metadata)
-        feature_metadata_row = None
         writer_props = WriterProperties(compression=feature_store.compression)
 
-        if index_was_new and input_comparable_min <= last_updated:
-            # These keys were absent before coordinated index preparation.
-            # Replace padding without applying overlap/copy semantics to old data.
-            rows = pl.concat(
-                [inner_join_ref, new_index_rows_ref, missing_index_rows_ref.filter(pl.col(feature_store.primary_sort_key) > last_updated)],
-                how="diagonal",
-            ).select(columns)
-            feature_store.io.merge_delta(
-                rows,
-                feature_store.get_path(table_addr),
-                on=feature_store.sort_keys,
-                writer_properties=writer_props,
-            )
-        elif input_length == new_index_rows_ref.height:
+        if input_length == new_index_rows_ref.height:
             # All input rows are new to the index. Write them to the feature table directly.
+            rows = new_index_rows_ref
+            if _planned_write is not None and signal_type not in ("as_of_feature", "sparse_feature"):
+                rows = pl.concat(
+                    [rows, missing_index_rows_ref.filter(pl.col(feature_store.primary_sort_key) > last_updated)],
+                    how="diagonal",
+                )
             feature_store.io.write_delta(
-                new_index_rows_ref.lazy().sort(feature_store.sort_keys),
+                rows.lazy().sort(feature_store.sort_keys),
                 feature_store.get_path(table_addr),
                 mode="append",
                 delta_write_options={
@@ -334,7 +373,6 @@ def update_feature_tables(
         else:
             if input_comparable_min <= last_updated:
                 pk = feature_store.primary_sort_key
-                next_rank = feature_df["version"].max() + 1
                 source_path = feature_store.get_path(table_addr)
 
                 if overlap_mode == "merge":
@@ -367,8 +405,10 @@ def update_feature_tables(
                         if (old_features.height > 0 and signal_type not in ("as_of_feature", "sparse_feature"))
                         else pl.DataFrame()
                     )
+                    if _planned_write is not None and signal_type not in ("as_of_feature", "sparse_feature"):
+                        alignment_rows = missing_index_rows_ref.filter(pl.col(pk) >= input_comparable_min)
                     new_rows = pl.concat([inner_join_ref, new_index_rows_ref, alignment_rows], how="diagonal").select(columns)
-                    table_addr = feature_store.gen_table_addr()
+                    table_addr = target
                     feature_store.io.write_delta(
                         pl.concat([old_features, new_rows], how="vertical_relaxed").lazy().sort(feature_store.sort_keys),
                         feature_store.get_path(table_addr),
@@ -379,14 +419,6 @@ def update_feature_tables(
                             "configuration": feature_store._feature_stats_configuration,
                         },
                     )
-
-                feature_metadata_row = feature_df.with_columns(
-                    version=pl.lit(next_rank, dtype=pl.Int64),
-                    table_addr=pl.lit(table_addr),
-                    owner=pl.lit(owner),
-                    signal_type=pl.lit(signal_type),
-                    feature_params=pl.lit(json.dumps(feature_params)) if feature_params is not None else pl.col("feature_params"),
-                )
 
             else:
                 feature_store.io.write_delta(
@@ -583,7 +615,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         "multiple files of this size enables file-level min/max skipping on timestamp-filtered reads.",
     )
     run_on_ray_cluster: bool = Field(False, description="Toggles whether or not this class uses ray remote functions, or strictly local python calls")
-    coordinate_writes: bool = Field(False, description="Opt into a shared Ray write coordinator for concurrent add operations within one cluster.")
+    coordinate_writes: bool = Field(False, description="Opt into a shared Ray IO writer with per-call index and per-table write ordering.")
     enable_runtime_computed_features: bool = Field(
         False,
         description="Enables runtime-computed features. Only enable this when feature metadata is trusted because Polars expressions may execute Python code.",
@@ -591,7 +623,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     io: FrameIO = Field(default_factory=PolarsIO, description="An IO object, abstracting how/where polars frames are read from storage.")
     _is_initialized: bool = False
     _sort_keys: list[str] = None
-    _coordinated_worker: bool = False
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -1034,8 +1065,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     def switch(self, function, num_returns=1, **kwargs):
         """Returns a remote function OR local function depending on the run_on_ray_cluster parameter"""
-        if self._coordinated_worker:
-            kwargs["max_retries"] = 0
         return function if not self.run_on_ray_cluster else ray_remote(function, num_returns=num_returns, **kwargs)
 
     def get(self, potential_ref):
@@ -1062,10 +1091,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         metadata: pl.DataFrame | None = None,
         feature_params: dict | None = None,
         overlap_mode: str = "copy",
-        *,
-        _defer_metadata: bool = False,
-        _index_was_new: bool = False,
-    ) -> list | tuple[list, list]:
+    ) -> list:
         """
         Onboards a new table of features to our FeatureStore.
 
@@ -1083,7 +1109,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
         if self.coordinate_writes:
             return ray_get(
-                WriteCoordinator.connect(self).submit.remote(
+                RayIOWriter.connect(self).submit.remote(
                     self, df, signal_type=signal_type, owner=owner, metadata=metadata, feature_params=feature_params, overlap_mode=overlap_mode
                 )
             )
@@ -1101,10 +1127,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             earliest_new_index_rows_ref,
             missing_index_rows_ref,
         ) = self.switch(compute_index_deltas, num_returns=8)(self, df)
-        if _defer_metadata and signal_type in ("as_of_feature", "sparse_feature"):
-            # The coordinator pre-populates other writers' index keys; these
-            # must not become null observations in sparse/as-of tables.
-            missing_index_rows_ref = self.get(df).head(0)
         feature_metadata = self.feature_metadata_frame().collect()
         table_metadata = self.table_metadata_frame().collect()
         feature_tables = self._get_latest_feature_tables(self.get(columns), feature_metadata=feature_metadata)
@@ -1136,7 +1158,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 overlap_mode=overlap_mode,
                 feature_metadata=feature_metadata,
                 table_metadata=table_metadata,
-                index_was_new=_index_was_new,
             )
             for table_addr in feature_tables["table_addr"].unique()
         ]
@@ -1152,15 +1173,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         # This can also be done in parallel.
         index_ref = self.switch(update_index)(self, new_index_rows_ref)
         refs.append(index_ref)
-
-        if _defer_metadata:
-            self.get(refs)
-            tables = []
-            features = []
-            for table_ref, feature_ref in feature_table_update_refs:
-                tables.append(self.get(table_ref))
-                features.append(self.get(feature_ref))
-            return tables, features
 
         if feature_table_update_refs:
             # Metadata becomes visible only after all data and index writes succeed.

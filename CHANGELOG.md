@@ -1,8 +1,9 @@
 # Changelog
 
 ## Unreleased
-* [feature] Add an opt-in, Ray-only `WriteCoordinator` that batches new index keys, aligns dense tables, parallelizes independent feature writers, and serializes metadata publication.
+* [feature] Add an opt-in `RayIOWriter` with per-call index serialization and pipelined table writes, pending-table alignment, and separate metadata publication.
 * [bugfix] Align new secondary-key rows at a table's latest timestamp and use one physical-table high-water mark when planning padding and backfills.
+* [bugfix] Bound Polars to 1.x while the IO dependency and horizontal alignment rely on APIs changed in Polars 2.0.
 
 ## 0.2.0 (09-22-26)
 * [cleanup] Remove unused validation types and stale status scaffolding.

@@ -105,13 +105,15 @@ and reads provide significant speedups.
 
 For **independent concurrent producers**, also set `coordinate_writes=True`. Ray task parallelism
 alone does not coordinate separate `add_*` calls. Initialize the lake before enabling coordination,
-and make every producer use the same cluster, storage path, and configuration. The coordinator
-batches new index keys, aligns dense tables, and writes independent feature groups concurrently;
-conflicting groups wait for refreshed metadata. Use `WriteCoordinator.connect(lake).submit_batch.remote(...)`
-to submit multiple frames together.
+and make every producer use the same cluster, storage path, and configuration. `RayIOWriter`
+serializes each call's index read/addition, then releases independent feature writes and padding
+through table-specific Ray dependencies. The next index operation does not wait for those writes
+or metadata publication. Pending table creation is tracked so later additions cannot miss padding.
+Use `RayIOWriter.connect(lake).submit_batch.remote(...)` to submit multiple calls conveniently;
+there is no batch barrier.
 
-Coordinate only writes: reads during a batch can observe incomplete state. Maintenance must run
-with producers stopped. After any failed batch, quiesce workers and repair the lake before replacing
+Coordinate only writes: reads during writes can observe incomplete state. Maintenance must run
+with producers stopped. After any failed write, quiesce workers and repair the lake before replacing
 the failed actor. See the [concurrent-write contract](https://github.com/Point72/gamma-lake#coordinated-concurrent-writes-ray-only)
 for restrictions and recovery.
 
