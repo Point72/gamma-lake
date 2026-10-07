@@ -164,8 +164,14 @@ _DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
 )
 
 
-def _get_timestamp():
-    return pl.lit(datetime.now(UTC))
+def _table_metadata_row(table_addr: str, last_updated) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "table_addr": [table_addr],
+            "last_updated": [last_updated],
+            "update_timestamp": [datetime.now(UTC)],
+        }
+    )
 
 
 def preprocess_df(feature_store, df):
@@ -292,9 +298,7 @@ def update_feature_tables(
                 },
             )
             return (
-                pl.DataFrame()
-                .with_columns(table_addr=pl.lit(table_addr), last_updated=pl.lit(input_comparable_max), update_timestamp=_get_timestamp())
-                .to_arrow(),
+                _table_metadata_row(table_addr, input_comparable_max).to_arrow(),
                 new_feature_metadata_row.to_arrow(),
             )
 
@@ -391,9 +395,7 @@ def update_feature_tables(
                 )
 
         return (
-            pl.DataFrame()
-            .with_columns(table_addr=pl.lit(table_addr), last_updated=pl.lit(input_comparable_max), update_timestamp=_get_timestamp())
-            .to_arrow(),
+            _table_metadata_row(table_addr, input_comparable_max).to_arrow(),
             feature_metadata_row.to_arrow() if feature_metadata_row is not None else None,
         )
 
@@ -849,7 +851,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     def _concat_root_features(self, tables, index, frames) -> pl.LazyFrame:
         """Prepend canonical sort keys to aligned feature-only frames."""
-        features = pl.concat([index, *frames], how="horizontal")
+        how = "horizontal_extend" if version.parse(pl.__version__) >= version.parse("2.0.0") else "horizontal"
+        features = pl.concat([index, *frames], how=how)
         return self._compute_runtime_features(tables, features).select(tables["feature_name"].to_list() + self.sort_keys)
 
     def _compute_runtime_features(self, feature_table, root_features):
@@ -1247,11 +1250,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             delta_write_options={**writer_options, "configuration": self._feature_stats_configuration},
         )
         self.io.write_delta(
-            pl.DataFrame().with_columns(
-                table_addr=pl.lit(new_addr),
-                last_updated=pl.lit(merged_last_updated),
-                update_timestamp=_get_timestamp(),
-            ),
+            _table_metadata_row(new_addr, merged_last_updated),
             self.table_metadata,
             mode="append",
             delta_write_options=writer_options,
@@ -1323,12 +1322,14 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 f"Your expressions require the following root names which are not yet stored in (or computed by) this Gamma Lake: {missing_root_names}"
             )
 
-        new_features = pl.DataFrame().with_columns(
-            feature_name=pl.Series([expr.meta.output_name() for expr in exprs]),
-            table_addr=pl.Series(["n/a"] * len(exprs)),
-            owner=pl.Series([owner] * len(exprs)),
-            signal_type=pl.Series(["runtime_computed"] * len(exprs)),
-            feature_params=pl.Series([expr.meta.serialize(format="json") for expr in exprs]),
+        new_features = pl.DataFrame(
+            {
+                "feature_name": [expr.meta.output_name() for expr in exprs],
+                "table_addr": ["n/a"] * len(exprs),
+                "owner": [owner] * len(exprs),
+                "signal_type": ["runtime_computed"] * len(exprs),
+                "feature_params": [expr.meta.serialize(format="json") for expr in exprs],
+            }
         )
 
         already_registered = [n for n in new_features["feature_name"].to_list() if n in existing_feature_names]
