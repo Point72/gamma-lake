@@ -1,6 +1,10 @@
-# Gamma Lake
+<a href="https://github.com/Point72/gamma-lake">
+  <img alt="Gamma Lake logo" src="docs/img/logo.png" width="400">
+</a>
 
 High-performance feature store built on Delta Lake with optional Ray parallelism
+
+<br/>
 
 [![Build Status](https://github.com/Point72/gamma-lake/actions/workflows/build.yaml/badge.svg?branch=main&event=push)](https://github.com/Point72/gamma-lake/actions/workflows/build.yaml)
 [![codecov](https://codecov.io/gh/Point72/gamma-lake/branch/main/graph/badge.svg)](https://codecov.io/gh/Point72/gamma-lake)
