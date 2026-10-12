@@ -921,7 +921,7 @@ class GammaFeatureLakeTestsMixin:
         good_read = fs.read(features).sort(fs.sort_keys)
 
         with pytest.raises(ValueError, match="timezone-aware"):
-            fs.restore_to_timestamp(datetime.now())  # noqa: DTZ005
+            fs.restore_to_timestamp(datetime.now(UTC).replace(tzinfo=None))
 
         time.sleep(2.0)
         cutoff = datetime.now(UTC)
