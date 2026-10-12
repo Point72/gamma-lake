@@ -51,8 +51,7 @@ def generate_test_data(
     dfs = []
     for symbol in range(symbols_id_start, symbols_id_start + n_symbols):
         dfs.append(
-            pl.DataFrame()
-            .with_columns(
+            pl.select(
                 pl.date_range(
                     start=start_date,
                     end=start_date + timedelta(days=n_days),
@@ -62,7 +61,12 @@ def generate_test_data(
                 pl.lit(f"Symbol_{symbol}").alias("symbol"),
             )
             .with_columns(feature_expressions)
-            .with_columns(pl.col("timestamp").cast(pl.Datetime).dt.replace_time_zone("UTC").alias("timestamp"))
+            .with_columns(
+                pl.col("timestamp")
+                .cast(pl.Datetime)
+                .dt.replace_time_zone("UTC")
+                .alias("timestamp")
+            )
         )
     df = pl.concat(dfs)
     duplicates = df.sample(fraction=0.20, with_replacement=True)
