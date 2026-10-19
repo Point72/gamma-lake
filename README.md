@@ -218,6 +218,24 @@ With `run_on_ray_cluster=True`, Gamma Lake dispatches feature-group operations i
 and the single master-index update run in parallel. Metadata becomes visible only after the feature and index writes
 succeed. Install Ray support with `pip install "gamma-lake[ray]"`.
 
+### Custom write locking
+
+`PolarsIO` accepts an optional lock factory for coordinating writes across processes or machines. The factory receives
+the exact target URI and returns a context manager:
+
+```python
+from gammalake import GammaFeatureLake
+from gammalake.io import PolarsIO
+
+
+lake = GammaFeatureLake(
+    base_path="s3://my-bucket/features",
+    io=PolarsIO(lock=acquire_distributed_lock),
+)
+```
+
+Writes, merges, annotations, and restores acquire the lock; reads remain unlocked. Locking is disabled by default.
+
 ### Metadata and versioning
 
 Every feature write records its name, version, owner, table address, signal type, and optional feature parameters.

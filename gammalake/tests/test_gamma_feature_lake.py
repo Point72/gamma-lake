@@ -1,6 +1,7 @@
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import polars as pl
 import pyarrow as pa
@@ -767,6 +768,56 @@ def test_polars_io_forwards_delta_configuration():
         "chunk_size": -1,
         "delta_write_options": {"configuration": configuration},
     }
+
+
+def test_polars_io_locks_write_target():
+    target = "s3://bucket/cache/2024-01-01"
+    events = []
+
+    @contextmanager
+    def lock(uri):
+        events.append(("enter", uri))
+        yield object()
+        events.append(("exit", uri))
+
+    def sink_delta(*args, **kwargs):
+        assert events == [("enter", target)]
+
+    with patch("gammalake.io.piot.sink_delta", side_effect=sink_delta):
+        PolarsIO(lock=lock).write_delta(pl.DataFrame({"value": [1]}), target)
+
+    assert events == [("enter", target), ("exit", target)]
+
+
+def test_polars_io_locks_other_mutations():
+    targets = []
+
+    @contextmanager
+    def lock(uri):
+        targets.append(uri)
+        yield object()
+
+    merger = Mock()
+    merger.when_matched_update_all.return_value = merger
+    merger.when_not_matched_insert_all.return_value = merger
+    with patch("gammalake.io.DeltaTable") as delta_table:
+        delta_table.return_value.merge.return_value = merger
+        io = PolarsIO(lock=lock)
+        io.restore_to_timestamp("restore", datetime(2024, 1, 1, tzinfo=UTC))
+        io.annotate_table(
+            "annotate",
+            pl.DataFrame(
+                {
+                    "feature_name": ["value"],
+                    "comment": ["comment"],
+                    "tags": [["tag"]],
+                }
+            ),
+        )
+        io.merge_delta(pl.DataFrame({"id": [1]}), "merge", on=["id"])
+
+    assert targets == ["restore", "annotate", "merge"]
+    merger.execute.assert_called_once_with()
 
 
 def test_polars_io_writes_lazy_frames(tmp_path):

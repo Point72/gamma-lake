@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import Any
 
@@ -19,6 +21,9 @@ class FrameIO(ABC):
     """
     An abstraction for polars DataFrame reading/writing, allows for better interaction with a variety of storage solutions.
     """
+
+    def __init__(self, lock: Callable[[str], AbstractContextManager[object]] | None = None):
+        self.lock = nullcontext if lock is None else lock
 
     @abstractmethod
     def scan_delta(self, target: str, **kwargs: Any) -> pl.LazyFrame:
@@ -116,27 +121,30 @@ class PolarsIO(FrameIO):
 
     def write_delta(self, df, target, *, delta_write_options=None, **kwargs):
         frame = df if isinstance(df, pl.LazyFrame) else df.lazy()
-        return piot.sink_delta(
-            frame,
-            target,
-            chunk_size=-1,
-            delta_write_options=delta_write_options,
-            **kwargs,
-        )
+        with self.lock(target):
+            return piot.sink_delta(
+                frame,
+                target,
+                chunk_size=-1,
+                delta_write_options=delta_write_options,
+                **kwargs,
+            )
 
     def scan_delta(self, target, **kwargs):
         return piot.scan_delta(target, **kwargs)
 
     def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
         """Restore a Delta table to ``timestamp`` using deltalake."""
-        DeltaTable(target).restore(timestamp)
+        with self.lock(target):
+            DeltaTable(target).restore(timestamp)
 
     def annotate_table(self, table_addr: str, annotations: pl.DataFrame) -> None:
         """Persist comments and tags in Delta column metadata for one table."""
-        dt = DeltaTable(table_addr)
-        for row in annotations.iter_rows(named=True):
-            metadata = {key: value for key, value in {"comment": row["comment"], "tags": json.dumps(row["tags"])}.items() if value is not None}
-            dt.alter.set_column_metadata(row["feature_name"], metadata)
+        with self.lock(table_addr):
+            dt = DeltaTable(table_addr)
+            for row in annotations.iter_rows(named=True):
+                metadata = {key: value for key, value in {"comment": row["comment"], "tags": json.dumps(row["tags"])}.items() if value is not None}
+                dt.alter.set_column_metadata(row["feature_name"], metadata)
 
     def describe_table(self, table_addr: str, feature_names: list[str]) -> pl.DataFrame:
         """Read comments and tags from Delta column metadata for one table."""
@@ -174,16 +182,17 @@ class PolarsIO(FrameIO):
         **kwargs,
     ):
         predicate = " AND ".join(f'target."{col}" = source."{col}"' for col in on)
-        dt = DeltaTable(target)
-        merger = dt.merge(source=df.to_arrow(), predicate=predicate, source_alias="source", target_alias="target", **kwargs)
-        merger = (
-            merger.when_matched_update(updates=when_matched_update, predicate=matched_predicate)
-            if when_matched_update is not None
-            else merger.when_matched_update_all(predicate=matched_predicate)
-        )
-        merger = (
-            merger.when_not_matched_insert(updates=when_not_matched_insert)
-            if when_not_matched_insert is not None
-            else merger.when_not_matched_insert_all()
-        )
-        return merger.execute()
+        with self.lock(target):
+            dt = DeltaTable(target)
+            merger = dt.merge(source=df.to_arrow(), predicate=predicate, source_alias="source", target_alias="target", **kwargs)
+            merger = (
+                merger.when_matched_update(updates=when_matched_update, predicate=matched_predicate)
+                if when_matched_update is not None
+                else merger.when_matched_update_all(predicate=matched_predicate)
+            )
+            merger = (
+                merger.when_not_matched_insert(updates=when_not_matched_insert)
+                if when_not_matched_insert is not None
+                else merger.when_not_matched_insert_all()
+            )
+            return merger.execute()
