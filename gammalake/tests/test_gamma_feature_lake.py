@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 from ccflow import ArrowSchema
 from deltalake import DeltaTable
+from filelock import Timeout
 from polars.testing import assert_frame_equal
 from polars_io_tools import pushdown_combine as original_pushdown_combine
 from pydantic import ValidationError
@@ -15,7 +16,7 @@ from pydantic import ValidationError
 from gammalake import GammaFeatureLake
 from gammalake.abstract import BaseFeatureLake
 from gammalake.gamma_feature_lake import write_metadata
-from gammalake.io import FrameIO, PolarsIO
+from gammalake.io import FileSystemLock, FrameIO, PolarsIO
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
@@ -818,6 +819,23 @@ def test_polars_io_locks_other_mutations():
 
     assert targets == ["restore", "annotate", "merge"]
     merger.execute.assert_called_once_with()
+
+
+@pytest.mark.parametrize("target", ["/tmp/cache/2024-01-01", "s3://bucket/cache/2024-01-01"])
+def test_file_system_lock_acquires_and_releases(tmp_path, target):
+    lock = FileSystemLock(tmp_path, timeout=0)
+
+    with lock(target), pytest.raises(Timeout), lock(target):
+        pass
+
+    with lock(target):
+        pass
+
+
+def test_file_system_lock_uses_distinct_files_per_target(tmp_path):
+    lock = FileSystemLock(tmp_path)
+
+    assert lock("s3://bucket/first").lock_file != lock("s3://bucket/second").lock_file
 
 
 def test_polars_io_writes_lazy_frames(tmp_path):

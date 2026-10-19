@@ -2,6 +2,7 @@
 
 ## Unreleased
 * [feature] Add opt-in per-target locking to the FrameIO interface and PolarsIO writes.
+* [feature] Add a file-system lock provider for local and S3 target URIs.
 
 ## 0.2.0 (09-22-26)
 * [cleanup] Remove unused validation types and stale status scaffolding.

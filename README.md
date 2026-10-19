@@ -225,16 +225,18 @@ the exact target URI and returns a context manager:
 
 ```python
 from gammalake import GammaFeatureLake
-from gammalake.io import PolarsIO
+from gammalake.io import FileSystemLock, PolarsIO
 
 
 lake = GammaFeatureLake(
     base_path="s3://my-bucket/features",
-    io=PolarsIO(lock=acquire_distributed_lock),
+    io=PolarsIO(lock=FileSystemLock("/shared/gammalake-locks", timeout=60)),
 )
 ```
 
-Writes, merges, annotations, and restores acquire the lock; reads remain unlocked. Locking is disabled by default.
+The target URI is hashed into a deterministic lock filename, so local paths and `s3://` URIs are both supported.
+Use a shared `lock_dir` to coordinate across machines. Writes, merges, annotations, and restores acquire the lock;
+reads remain unlocked. Locking is disabled by default.
 
 ### Metadata and versioning
 

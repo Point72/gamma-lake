@@ -37,6 +37,7 @@ classifiers = [
 dependencies = [
     "ccflow>=0.8",
     "deltalake",
+    "filelock",
     "packaging",
     "polars>=1.33.1",
     "polars-io-tools>=0.2.1,<0.3",

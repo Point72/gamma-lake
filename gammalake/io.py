@@ -1,20 +1,37 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import polars as pl
 import polars_io_tools as piot
 from deltalake import DeltaTable
+from filelock import FileLock
 
 __all__ = (
+    "FileSystemLock",
     "FrameIO",
     "PolarsIO",
 )
+
+
+class FileSystemLock:
+    """Provide per-target file locks in a local or shared directory."""
+
+    def __init__(self, lock_dir: str | Path, timeout: float = -1):
+        self.lock_dir = Path(lock_dir)
+        self.timeout = timeout
+
+    def __call__(self, target: str) -> AbstractContextManager[object]:
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_name = f"{hashlib.sha256(target.encode()).hexdigest()}.lock"
+        return FileLock(self.lock_dir / lock_name, timeout=self.timeout)
 
 
 class FrameIO(ABC):
