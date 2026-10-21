@@ -393,6 +393,7 @@ def update_feature_tables(
                     delta_write_options={
                         "writer_properties": WriterProperties(compression=feature_store.compression),
                         "target_file_size": feature_store.target_file_size,
+                        "schema_mode": "merge",
                     },
                 )
 
