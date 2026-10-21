@@ -350,7 +350,8 @@ def update_feature_tables(
                                 "target_file_size": feature_store.target_file_size,
                             },
                         )
-                    old_features = feature_store.io.scan_delta(source_path).select(columns).filter(pl.col(pk) < input_comparable_min).collect()
+                    existing_features = feature_store.io.scan_delta(source_path).select(columns).collect()
+                    old_features = existing_features.join(inner_join_ref.select(feature_store.sort_keys), on=feature_store.sort_keys, how="anti")
                     alignment_rows = (
                         missing_index_rows_ref.filter(pl.col(pk) >= last_updated)
                         if (old_features.height > 0 and signal_type not in ("as_of_feature", "sparse_feature"))
