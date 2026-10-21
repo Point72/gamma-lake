@@ -308,9 +308,11 @@ def update_feature_tables(
         feature_metadata_row = None
 
         if input_length == new_index_rows_ref.height:
-            # All input rows are new to the index. Write them to the feature table directly.
+            # All input rows are new to the index. Write them to the feature table directly, padding with missing index rows.
             feature_store.io.write_delta(
-                new_index_rows_ref.lazy().sort(feature_store.sort_keys),
+                pl.concat([missing_index_rows_ref.filter(pl.col(feature_store.primary_sort_key) > last_updated), new_index_rows_ref], how="diagonal")
+                .lazy()
+                .sort(feature_store.sort_keys),
                 feature_store.get_path(table_addr),
                 mode="append",
                 delta_write_options={
