@@ -628,6 +628,60 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
             check_column_order=False,
         )
 
+    def test_appending_existing_feature_pads_missing_index_rows(self, fs):
+        def frame(days, **features):
+            return pl.DataFrame(
+                {
+                    "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in days],
+                    "symbol": ["A"] * len(days),
+                    **{name: [float(scale * day) for day in days] for name, scale in features.items()},
+                }
+            ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+
+        fs.add_features(frame([1], x=1))
+        fs.add_features(frame([1, 2, 3, 4], y=10))
+        fs.add_features(frame([5], x=1))
+
+        expected = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in range(1, 6)],
+                "symbol": ["A"] * 5,
+                "x": [1.0, None, None, None, 5.0],
+                "y": [10.0, 20.0, 30.0, 40.0, None],
+            }
+        ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+
+        assert_frame_equal(
+            fs.read(["x", "y"]).sort(fs.sort_keys),
+            expected.sort(fs.sort_keys),
+            check_column_order=False,
+        )
+
+    def test_write_at_last_updated_timestamp_keeps_feature_rows_aligned(self, tmp_path):
+        def frame(rows, **features):
+            return pl.DataFrame(
+                {
+                    "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day, _ in rows],
+                    "symbol": [symbol for _, symbol in rows],
+                    **{name: [float(scale * day) for day, _ in rows] for name, scale in features.items()},
+                }
+            ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+
+        lake = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+        lake.add_features(frame([(1, "A"), (2, "A"), (3, "A")], x=1))
+        lake.add_features(frame([(3, "B")], y=10))
+        lake.add_features(frame([(4, "A")], x=1))
+
+        result = lake.read(["x", "y"]).select("timestamp", "symbol", "x")
+        expected = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in (1, 2, 3, 3, 4)],
+                "symbol": ["A", "A", "A", "B", "A"],
+                "x": [1.0, 2.0, 3.0, None, 4.0],
+            }
+        ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+        assert_frame_equal(result, expected)
+
     @pytest.mark.parametrize("use_ray_cluster", [True, False])
     def test_partial_future_feature_updates(self, use_ray_cluster, tmp_path):
         def frame(days, **features):
