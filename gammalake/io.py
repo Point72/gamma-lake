@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import polars as pl
@@ -114,29 +117,48 @@ class FrameIO(ABC):
 class PolarsIO(FrameIO):
     """An implementation of FrameIO using polars-io-tools Delta I/O."""
 
+    def __init__(self, lock: Callable[[str], AbstractContextManager[object]] | None = None):
+        """Create a PolarsIO.
+
+        Args:
+            lock: optional factory returning a context manager for a target. It receives a
+                normalized target so equivalent spellings share one lock. Defaults to no locking.
+
+        """
+        self._lock = nullcontext if lock is None else lock
+
+    @staticmethod
+    def _normalize_target(target: str) -> str:
+        if "://" in target:
+            return target.rstrip("/")
+        return str(Path(target).resolve())
+
     def write_delta(self, df, target, *, delta_write_options=None, **kwargs):
         frame = df if isinstance(df, pl.LazyFrame) else df.lazy()
-        return piot.sink_delta(
-            frame,
-            target,
-            chunk_size=-1,
-            delta_write_options=delta_write_options,
-            **kwargs,
-        )
+        with self._lock(self._normalize_target(target)):
+            return piot.sink_delta(
+                frame,
+                target,
+                chunk_size=-1,
+                delta_write_options=delta_write_options,
+                **kwargs,
+            )
 
     def scan_delta(self, target, **kwargs):
         return piot.scan_delta(target, **kwargs)
 
     def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
         """Restore a Delta table to ``timestamp`` using deltalake."""
-        DeltaTable(target).restore(timestamp)
+        with self._lock(self._normalize_target(target)):
+            DeltaTable(target).restore(timestamp)
 
     def annotate_table(self, table_addr: str, annotations: pl.DataFrame) -> None:
         """Persist comments and tags in Delta column metadata for one table."""
-        dt = DeltaTable(table_addr)
-        for row in annotations.iter_rows(named=True):
-            metadata = {key: value for key, value in {"comment": row["comment"], "tags": json.dumps(row["tags"])}.items() if value is not None}
-            dt.alter.set_column_metadata(row["feature_name"], metadata)
+        with self._lock(self._normalize_target(table_addr)):
+            dt = DeltaTable(table_addr)
+            for row in annotations.iter_rows(named=True):
+                metadata = {key: value for key, value in {"comment": row["comment"], "tags": json.dumps(row["tags"])}.items() if value is not None}
+                dt.alter.set_column_metadata(row["feature_name"], metadata)
 
     def describe_table(self, table_addr: str, feature_names: list[str]) -> pl.DataFrame:
         """Read comments and tags from Delta column metadata for one table."""
@@ -174,16 +196,18 @@ class PolarsIO(FrameIO):
         **kwargs,
     ):
         predicate = " AND ".join(f'target."{col}" = source."{col}"' for col in on)
-        dt = DeltaTable(target)
-        merger = dt.merge(source=df.to_arrow(), predicate=predicate, source_alias="source", target_alias="target", **kwargs)
-        merger = (
-            merger.when_matched_update(updates=when_matched_update, predicate=matched_predicate)
-            if when_matched_update is not None
-            else merger.when_matched_update_all(predicate=matched_predicate)
-        )
-        merger = (
-            merger.when_not_matched_insert(updates=when_not_matched_insert)
-            if when_not_matched_insert is not None
-            else merger.when_not_matched_insert_all()
-        )
-        return merger.execute()
+        source = df.to_arrow()
+        with self._lock(self._normalize_target(target)):
+            dt = DeltaTable(target)
+            merger = dt.merge(source=source, predicate=predicate, source_alias="source", target_alias="target", **kwargs)
+            merger = (
+                merger.when_matched_update(updates=when_matched_update, predicate=matched_predicate)
+                if when_matched_update is not None
+                else merger.when_matched_update_all(predicate=matched_predicate)
+            )
+            merger = (
+                merger.when_not_matched_insert(updates=when_not_matched_insert)
+                if when_not_matched_insert is not None
+                else merger.when_not_matched_insert_all()
+            )
+            return merger.execute()

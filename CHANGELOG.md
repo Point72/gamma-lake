@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+* [feature] Add opt-in per-target write locking to `PolarsIO`.
+
 ## 0.2.0 (09-22-26)
 * [cleanup] Remove unused validation types and stale status scaffolding.
 * [feature] Use `polars-io-tools` for native LazyFrame Delta writes.

@@ -1,6 +1,7 @@
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import polars as pl
 import pyarrow as pa
@@ -792,6 +793,111 @@ def test_polars_io_forwards_delta_configuration():
         "chunk_size": -1,
         "delta_write_options": {"configuration": configuration},
     }
+
+
+def test_polars_io_locks_write_target():
+    target = "s3://bucket/cache/2024-01-01"
+    events = []
+
+    @contextmanager
+    def lock(uri):
+        events.append(("enter", uri))
+        yield object()
+        events.append(("exit", uri))
+
+    def sink_delta(*args, **kwargs):
+        assert events == [("enter", target)]
+
+    with patch("gammalake.io.piot.sink_delta", side_effect=sink_delta):
+        PolarsIO(lock=lock).write_delta(pl.DataFrame({"value": [1]}), target)
+
+    assert events == [("enter", target), ("exit", target)]
+
+
+def test_polars_io_locks_other_mutations():
+    events = []
+    held = {"value": False}
+
+    @contextmanager
+    def lock(uri):
+        held["value"] = True
+        events.append(("enter", uri))
+        yield object()
+        held["value"] = False
+        events.append(("exit", uri))
+
+    merger = Mock()
+    merger.when_matched_update_all.return_value = merger
+    merger.when_not_matched_insert_all.return_value = merger
+    dt = Mock()
+    dt.merge.return_value = merger
+
+    def delta_table_factory(*args, **kwargs):
+        assert held["value"], "work must run inside the held lock"
+        return dt
+
+    with patch("gammalake.io.DeltaTable", side_effect=delta_table_factory):
+        io = PolarsIO(lock=lock)
+        io.restore_to_timestamp("s3://b/restore", datetime(2024, 1, 1, tzinfo=UTC))
+        io.annotate_table(
+            "s3://b/annotate",
+            pl.DataFrame(
+                {
+                    "feature_name": ["value"],
+                    "comment": ["comment"],
+                    "tags": [["tag"]],
+                }
+            ),
+        )
+        io.merge_delta(pl.DataFrame({"id": [1]}), "s3://b/merge", on=["id"])
+
+    assert events == [
+        ("enter", "s3://b/restore"),
+        ("exit", "s3://b/restore"),
+        ("enter", "s3://b/annotate"),
+        ("exit", "s3://b/annotate"),
+        ("enter", "s3://b/merge"),
+        ("exit", "s3://b/merge"),
+    ]
+    merger.execute.assert_called_once_with()
+
+
+def test_polars_io_normalizes_lock_target(tmp_path):
+    keys = []
+
+    @contextmanager
+    def lock(uri):
+        keys.append(uri)
+        yield object()
+
+    target = tmp_path / "table"
+    with patch("gammalake.io.piot.sink_delta"):
+        io = PolarsIO(lock=lock)
+        io.write_delta(pl.DataFrame({"value": [1]}), str(target))
+        io.write_delta(pl.DataFrame({"value": [2]}), str(target) + "/")
+
+    assert len(set(keys)) == 1
+    assert PolarsIO._normalize_target("s3://bucket/table") == PolarsIO._normalize_target("s3://bucket/table/")
+
+
+def test_polars_io_releases_lock_on_exception():
+    events = []
+
+    @contextmanager
+    def lock(uri):
+        events.append(("enter", uri))
+        try:
+            yield object()
+        finally:
+            events.append(("exit", uri))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("write failed")
+
+    with patch("gammalake.io.piot.sink_delta", side_effect=boom), pytest.raises(RuntimeError):
+        PolarsIO(lock=lock).write_delta(pl.DataFrame({"value": [1]}), "s3://bucket/table")
+
+    assert events == [("enter", "s3://bucket/table"), ("exit", "s3://bucket/table")]
 
 
 def test_polars_io_writes_lazy_frames(tmp_path):
