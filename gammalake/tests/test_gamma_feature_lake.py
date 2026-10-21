@@ -682,6 +682,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
         assert_frame_equal(result, expected)
 
+
 def test_primary_sort_key_not_in_schema_raises(tmp_path):
     """initialize() raises ValueError when primary_sort_key is absent from the provided schema."""
     schema = ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())]))
