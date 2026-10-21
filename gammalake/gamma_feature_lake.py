@@ -440,7 +440,7 @@ def align_feature_tables(feature_store, new_index_rows_ref, row, input_comparabl
 
     Returns: None
     """
-    if input_comparable_min >= row["last_updated"]:
+    if input_comparable_min > row["last_updated"]:
         return
 
     filtered_antijoin = new_index_rows_ref.select(feature_store.sort_keys).filter(pl.col(feature_store.primary_sort_key) <= row["last_updated"])
