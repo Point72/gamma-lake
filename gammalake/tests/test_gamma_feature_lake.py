@@ -628,6 +628,35 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
             check_column_order=False,
         )
 
+    def test_appending_existing_feature_pads_missing_index_rows(self, fs):
+        def frame(days, **features):
+            return pl.DataFrame(
+                {
+                    "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in days],
+                    "symbol": ["A"] * len(days),
+                    **{name: [float(scale * day) for day in days] for name, scale in features.items()},
+                }
+            ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+
+        fs.add_features(frame([1], x=1))
+        fs.add_features(frame([1, 2, 3, 4], y=10))
+        fs.add_features(frame([5], x=1))
+
+        expected = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in range(1, 6)],
+                "symbol": ["A"] * 5,
+                "x": [1.0, None, None, None, 5.0],
+                "y": [10.0, 20.0, 30.0, 40.0, None],
+            }
+        ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+
+        assert_frame_equal(
+            fs.read(["x", "y"]).sort(fs.sort_keys),
+            expected.sort(fs.sort_keys),
+            check_column_order=False,
+        )
+
 
 def test_primary_sort_key_not_in_schema_raises(tmp_path):
     """initialize() raises ValueError when primary_sort_key is absent from the provided schema."""
