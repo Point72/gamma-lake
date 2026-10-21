@@ -628,6 +628,22 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
             check_column_order=False,
         )
 
+    @pytest.mark.parametrize("use_ray_cluster", [True, False])
+    def test_partial_future_feature_updates(self, use_ray_cluster, tmp_path):
+        def frame(days, **features):
+            return pl.DataFrame(
+                {
+                    "timestamp": [datetime(2024, 1, d, tzinfo=UTC) for d in days],
+                    "symbol": ["A"] * len(days),
+                    **{name: [float(scale * d) for d in days] for name, scale in features.items()},
+                }
+            ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+        fs.add_features(frame([1, 2, 3], x=1, y=10))  # x and y share one feature table
+        fs.add_features(frame([1, 2, 3, 4, 5], z=100))  # the index now runs to day 5
+        fs.add_features(frame([4], x=1), overlap_mode="merge")  # write x alone for day 4
+
 
 def test_primary_sort_key_not_in_schema_raises(tmp_path):
     """initialize() raises ValueError when primary_sort_key is absent from the provided schema."""
