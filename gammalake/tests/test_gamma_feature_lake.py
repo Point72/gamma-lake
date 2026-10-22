@@ -1,3 +1,6 @@
+import os
+import shutil
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -721,20 +724,15 @@ def test_failed_write_does_not_corrupt_feature_metadata(tmp_path):
     is written, a subsequent retry must not crash with a TypeError from comparing
     input_comparable_min against a null last_updated.
 
-    We simulate the failure by patching write_delta to raise on the table_metadata write
-    (the second write_delta call in the new-table path).
+    We simulate the failure by patching write_delta to raise on the table_metadata write.
     """
     fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
     df = generate_test_data(n_features=2, n_symbols=3, n_days=5)
 
     real_write_delta = fs.io.write_delta
-    call_count = {"n": 0}
 
     def fail_on_table_metadata(frame, path, **kwargs):
-        call_count["n"] += 1
-        # The table_metadata write is the second write_delta call in the new-table path
-        # (after the feature-data write). Raise here to simulate a partial failure.
-        if call_count["n"] == 2:
+        if path == fs.table_metadata:
             raise RuntimeError("simulated table_metadata write failure")
         return real_write_delta(frame, path, **kwargs)
 
@@ -818,6 +816,126 @@ def test_failed_index_write_does_not_publish_metadata(tmp_path):
 
     fs.add_features(df, owner="test-owner")
     assert fs.read(["feature_0", "feature_1"]).height == fs.index_frame().collect().height
+
+
+class _FailingIO(PolarsIO):
+    """PolarsIO that fails writes to the table named by ``fail_on`` and delays writes to tables starting with ``slow_prefix``."""
+
+    def __init__(self, fail_on: str | None = None, slow_prefix: str | None = None):
+        self.fail_on = fail_on
+        self.slow_prefix = slow_prefix
+
+    def write_delta(self, df, target, **kwargs):
+        if self.fail_on is not None and os.path.basename(target) == self.fail_on:
+            raise RuntimeError(f"simulated failure writing {self.fail_on}")
+        if self.slow_prefix is not None and os.path.basename(target).startswith(self.slow_prefix):
+            time.sleep(1)
+        return super().write_delta(df, target, **kwargs)
+
+
+def _frame(days, value: float) -> pl.DataFrame:
+    """One feature ``f`` for symbols ``a`` and ``b`` on each of ``days`` (day-of-January offsets)."""
+    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=day) for day in days for _ in ("a", "b")]
+    return pl.DataFrame({"timestamp": timestamps, "symbol": ["a", "b"] * len(days), "f": [float(value)] * len(timestamps)}).with_columns(
+        pl.col("timestamp").dt.cast_time_unit("us")
+    )
+
+
+def _statuses(fs: GammaFeatureLake) -> list[str]:
+    return fs.transaction_log_frame().sort("updated_at").collect()["status"].to_list()
+
+
+def test_transaction_log_records_pending_then_success(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    assert fs.transaction_log_frame().collect().is_empty()
+
+    fs.add_features(_frame(range(1, 3), 1), owner="me")
+
+    log = fs.transaction_log_frame().sort("updated_at").collect()
+    assert log["status"].to_list() == ["pending", "success"]
+    assert log["transaction_id"].n_unique() == 1
+    assert log["owner"].to_list() == ["me", "me"]
+    assert log["signal_type"].to_list() == ["feature", "feature"]
+
+
+def test_rejected_input_is_not_logged_as_a_transaction(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+
+    with pytest.raises(ValueError, match="no rows"):
+        fs.add_features(_frame([1], 1).clear())
+
+    assert fs.transaction_log_frame().collect().is_empty()
+
+
+@pytest.mark.parametrize("use_ray_cluster", [False, True])
+def test_failed_add_is_rolled_back_and_later_writes_do_not_see_it(use_ray_cluster, tmp_path, barebones_ray_cluster):
+    """Regression test for issue #52: feature tables must not keep a failed write that the index never received.
+
+    With Ray, the feature table write is still in flight when the index write fails, so rollback has to wait for it.
+    """
+    io = _FailingIO()
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, io=io, table_name_prefix="data_").initialize()
+    fs.add_features(_frame(range(1, 6), 1), owner="me")
+    index_before = fs.index_frame().collect()
+
+    io.fail_on = "index"
+    io.slow_prefix = "data_" if use_ray_cluster else None
+    with pytest.raises(Exception, match="simulated failure writing index"):
+        fs.add_features(_frame([6, 7], 2), owner="me")
+
+    time.sleep(2)  # long enough for a write that rollback failed to wait for to land
+    assert_frame_equal(fs.index_frame().collect(), index_before)
+    assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10
+    log = fs.transaction_log_frame().sort("updated_at").collect()
+    assert log["status"].to_list()[-3:] == ["pending", "failed", "rolled_back"]
+    assert "simulated failure writing index" in log["error"][-1]
+
+    io.fail_on = None
+    io.slow_prefix = None
+    fs.add_features(_frame([8, 9], 3), owner="me")
+
+    assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10 + [3.0] * 4
+
+
+def test_failed_rollback_leaves_transaction_failed(tmp_path):
+    io = _FailingIO()
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, io=io).initialize()
+    fs.add_features(_frame(range(1, 6), 1), owner="me")
+
+    io.fail_on = "index"
+    with (
+        patch.object(io, "restore_to_timestamp", side_effect=RuntimeError("restore exploded")),
+        pytest.raises(RuntimeError, match="restore exploded") as excinfo,
+    ):
+        fs.add_features(_frame([6, 7], 2), owner="me")
+
+    assert "simulated failure writing index" in str(excinfo.value.__context__)
+    assert _statuses(fs)[-2:] == ["pending", "failed"]
+
+
+def test_lake_created_before_the_transaction_log_creates_it_on_first_write(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    shutil.rmtree(fs.transaction_log)
+
+    fs.add_features(_frame(range(1, 3), 1), owner="me")
+
+    assert _statuses(fs) == ["pending", "success"]
+
+
+def test_polars_io_restore_skips_tables_without_newer_commits(tmp_path):
+    io = PolarsIO()
+    path = str(tmp_path / "table")
+    io.write_delta(pl.DataFrame({"value": [1]}), path)
+    time.sleep(0.1)
+    cutoff = datetime.now(UTC)
+
+    io.restore_to_timestamp(path, cutoff)
+    assert DeltaTable(path).version() == 0
+
+    time.sleep(0.1)
+    io.write_delta(pl.DataFrame({"value": [2]}), path, mode="append")
+    io.restore_to_timestamp(path, cutoff)
+    assert io.scan_delta(path).collect()["value"].to_list() == [1]
 
 
 def test_optional_backend_extensions_remain_compatible():

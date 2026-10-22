@@ -234,6 +234,16 @@ version explicitly.
 | Cross-group assembly  | Predicate-distributed positional horizontal concatenation         |
 | Parallel I/O          | Ray task per feature group                                        |
 | Versioning            | Append-only metadata records owner and version per feature column |
+| Write tracking        | Append-only transaction log; failed writes are rolled back        |
+
+### Transactions and rollback
+
+Each write (`add_features`, `add_targets`, and the other `add_*` methods) is recorded in the append-only
+`transaction_log` table as `pending`, then `success`. A transaction's current status is its row with the latest
+`updated_at`. If a write fails, it is recorded as `failed`, the lake is restored to its state when the write started with
+`restore_to_timestamp`, and it is recorded as `rolled_back`. A transaction that stays `failed` or `pending` was not
+rolled back, and `restore_to_timestamp(started_at)` recovers the lake. Rollback inherits the limits of
+`restore_to_timestamp`, such as assuming no concurrent writers.
 
 ## Documentation
 
@@ -275,6 +285,7 @@ lake.read(lake.feature_metadata_frame()                      # specific owner/ve
 # Metadata inspection
 lake.feature_metadata_frame().collect()   # features, versions, owners
 lake.table_metadata_frame().collect()     # Delta table details
+lake.transaction_log_frame().collect()    # status history of every write
 lake.index_frame().collect()              # master index
 ```
 
