@@ -127,8 +127,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import datetime
 from functools import singledispatchmethod, wraps
 from typing import Literal
 
@@ -154,52 +153,18 @@ from gammalake.abstract import (
     UninitializedDeltaLakeException,
 )
 from gammalake.io import FrameIO, PolarsIO
-
-__all__ = ("GammaFeatureLake", "TransactionStatus", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
-
-_DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
-    pa.schema(
-        [
-            ("timestamp", pa.timestamp("us", tz="UTC")),
-            ("symbol", pa.string()),
-        ]
-    )
+from gammalake.metadata import (
+    DEFAULT_INDEX_SCHEMA,
+    Transaction,
+    TransactionStatus,
+    empty_feature_metadata,
+    empty_table_metadata,
+    empty_transaction_log,
+    table_metadata_row,
+    transaction_log_row,
 )
 
-
-class TransactionStatus(StrEnum):
-    """Lifecycle states recorded in the transaction log for each write."""
-
-    PENDING = "pending"
-    SUCCESS = "success"
-    FAILED = "failed"
-    ROLLED_BACK = "rolled_back"
-
-
-_TRANSACTION_LOG_SCHEMA = pa.schema(
-    [
-        ("transaction_id", pa.string()),
-        ("status", pa.string()),
-        ("owner", pa.string()),
-        ("signal_type", pa.string()),
-        ("started_at", pa.timestamp("us", tz="UTC")),
-        ("updated_at", pa.timestamp("us", tz="UTC")),
-        ("error", pa.string()),
-    ]
-)
-_MAX_LOGGED_ERROR_LENGTH = 2000
-
-
-class _Transaction:
-    """Identity of one tracked write; ``started_at`` is the cutoff a rollback restores to."""
-
-    __slots__ = ("owner", "signal_type", "started_at", "transaction_id")
-
-    def __init__(self, owner: str, signal_type: str):
-        self.transaction_id = uuid.uuid4().hex
-        self.owner = owner
-        self.signal_type = signal_type
-        self.started_at = datetime.now(UTC)
+__all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
 
 
 def _attempt(exc: BaseException, description: str, action: Callable[[], None]) -> bool:
@@ -210,33 +175,6 @@ def _attempt(exc: BaseException, description: str, action: Callable[[], None]) -
         exc.add_note(f"gamma-lake: {description}: {cleanup_exc!r}")
         return False
     return True
-
-
-def _transaction_log_row(transaction: _Transaction, status: TransactionStatus, error: str | None = None) -> pa.Table:
-    return pa.Table.from_pylist(
-        [
-            {
-                "transaction_id": transaction.transaction_id,
-                "status": str(status),
-                "owner": transaction.owner,
-                "signal_type": transaction.signal_type,
-                "started_at": transaction.started_at,
-                "updated_at": datetime.now(UTC),
-                "error": error,
-            }
-        ],
-        schema=_TRANSACTION_LOG_SCHEMA,
-    )
-
-
-def _table_metadata_row(table_addr: str, last_updated) -> pl.DataFrame:
-    return pl.DataFrame(
-        {
-            "table_addr": [table_addr],
-            "last_updated": [last_updated],
-            "update_timestamp": [datetime.now(UTC)],
-        }
-    )
 
 
 def preprocess_df(feature_store, df):
@@ -363,7 +301,7 @@ def update_feature_tables(
                 },
             )
             return (
-                _table_metadata_row(table_addr, input_comparable_max).to_arrow(),
+                table_metadata_row(table_addr, input_comparable_max).to_arrow(),
                 new_feature_metadata_row.to_arrow(),
             )
 
@@ -463,7 +401,7 @@ def update_feature_tables(
                 )
 
         return (
-            _table_metadata_row(table_addr, input_comparable_max).to_arrow(),
+            table_metadata_row(table_addr, input_comparable_max).to_arrow(),
             feature_metadata_row.to_arrow() if feature_metadata_row is not None else None,
         )
 
@@ -741,7 +679,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         existed returns an empty frame until its first write.
         """
         if not self.io.is_deltatable(self.transaction_log):
-            return pl.from_arrow(_TRANSACTION_LOG_SCHEMA.empty_table()).lazy()
+            return empty_transaction_log().lazy()
         return self.io.scan_delta(self.transaction_log)
 
     def get_path(self, addr) -> str:
@@ -799,7 +737,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 "Runtime-computed features are disabled. Set enable_runtime_computed_features=True only when feature metadata is trusted."
             )
 
-    def initialize(self, schema: ArrowSchema = _DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
+    def initialize(self, schema: ArrowSchema = DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
         """
         Write the proper metadata holding DeltaTables with the provided index schema.
         """
@@ -810,31 +748,11 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             self.io.write_delta(pl.from_arrow(pa.Table.from_pylist([], schema=schema.schema)), self.index)
 
         if not self.io.is_deltatable(self.feature_metadata):
-            feature_metadata_frame = pl.DataFrame(
-                [],
-                schema={
-                    "feature_name": pl.String,
-                    "version": pl.Int64,
-                    "table_addr": pl.String,
-                    "owner": pl.String,
-                    "signal_type": pl.String,
-                    "feature_params": pl.String,
-                },
-            )
-            self.io.write_delta(feature_metadata_frame, self.feature_metadata)
+            self.io.write_delta(empty_feature_metadata(), self.feature_metadata)
 
         if not self.io.is_deltatable(self.table_metadata):
-            table_metadata_frame = pl.from_arrow(
-                pa.Table.from_arrays(
-                    [
-                        pa.array([], type=pa.string()),
-                        pa.array([], type=schema.schema[schema.schema.get_field_index(self.primary_sort_key)].type),
-                        pa.array([], type=pa.timestamp("us", tz="UTC")),
-                    ],
-                    names=["table_addr", "last_updated", "update_timestamp"],
-                )
-            )
-            self.io.write_delta(table_metadata_frame, self.table_metadata)
+            primary_sort_key_type = schema.schema.field(self.primary_sort_key).type
+            self.io.write_delta(empty_table_metadata(primary_sort_key_type), self.table_metadata)
 
         self._ensure_transaction_log()
 
@@ -847,13 +765,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         if self._transaction_log_ready:
             return
         if not self.io.is_deltatable(self.transaction_log):
-            self.io.write_delta(pl.from_arrow(_TRANSACTION_LOG_SCHEMA.empty_table()), self.transaction_log)
+            self.io.write_delta(empty_transaction_log(), self.transaction_log)
         self._transaction_log_ready = True
 
-    def _log_transaction(self, transaction: _Transaction, status: TransactionStatus, error: str | None = None) -> None:
-        write_metadata(self, self.transaction_log, _transaction_log_row(transaction, status, error))
+    def _log_transaction(self, transaction: Transaction, status: TransactionStatus, error: str | None = None) -> None:
+        write_metadata(self, self.transaction_log, transaction_log_row(transaction, status, error))
 
-    def _has_overlapping_transactions(self, transaction: _Transaction) -> bool:
+    def _has_overlapping_transactions(self, transaction: Transaction) -> bool:
         """Whether any other transaction logged activity since ``transaction`` started."""
         overlapping = (
             self.transaction_log_frame()
@@ -878,7 +796,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                 before restoring so that no write is still in flight.
         """
         self._ensure_transaction_log()
-        transaction = _Transaction(owner, signal_type)
+        transaction = Transaction(owner, signal_type)
         self._log_transaction(transaction, TransactionStatus.PENDING)
         try:
             yield
@@ -887,14 +805,14 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             self._roll_back(transaction, exc, submitted)
             raise
 
-    def _roll_back(self, transaction: _Transaction, exc: BaseException, submitted: list) -> None:
+    def _roll_back(self, transaction: Transaction, exc: BaseException, submitted: list) -> None:
         """Log a failed transaction, restore the lake, and log the rollback.
 
         Never raises, so the failure that triggered it is not masked. Problems here are attached to
         ``exc`` as notes. If the restore does not happen, the transaction stays ``failed`` and
         ``restore_to_timestamp(transaction.started_at)`` recovers the lake manually.
         """
-        error = f"{type(exc).__name__}: {exc}"[:_MAX_LOGGED_ERROR_LENGTH]
+        error = f"{type(exc).__name__}: {exc}"
         if self.run_on_ray_cluster:
             _attempt(exc, "could not wait for in-flight writes to settle", lambda: self._wait_for_refs(submitted))
         _attempt(exc, "could not record the failed transaction", lambda: self._log_transaction(transaction, TransactionStatus.FAILED, error))
@@ -911,7 +829,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         if refs:
             self.wait(refs, num_returns=len(refs))
 
-    def _restore_unless_overlapped(self, transaction: _Transaction) -> None:
+    def _restore_unless_overlapped(self, transaction: Transaction) -> None:
         if self._has_overlapping_transactions(transaction):
             raise RuntimeError("other transactions were active during this write, so restoring would discard their commits")
         self.restore_to_timestamp(transaction.started_at)
@@ -1427,7 +1345,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             delta_write_options={**writer_options, "configuration": self._feature_stats_configuration},
         )
         self.io.write_delta(
-            _table_metadata_row(new_addr, merged_last_updated),
+            table_metadata_row(new_addr, merged_last_updated),
             self.table_metadata,
             mode="append",
             delta_write_options=writer_options,

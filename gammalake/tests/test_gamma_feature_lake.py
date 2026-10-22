@@ -16,8 +16,9 @@ from pydantic import ValidationError
 
 from gammalake import GammaFeatureLake
 from gammalake.abstract import BaseFeatureLake
-from gammalake.gamma_feature_lake import TransactionStatus, _Transaction, write_metadata
+from gammalake.gamma_feature_lake import write_metadata
 from gammalake.io import FrameIO, PolarsIO
+from gammalake.metadata import Transaction, TransactionStatus
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
@@ -974,7 +975,7 @@ def test_rollback_is_skipped_when_another_transaction_overlapped(tmp_path):
 
     def other_writer_starts(target):
         if os.path.basename(target) == "index":
-            fs._log_transaction(_Transaction("someone-else", "feature"), TransactionStatus.PENDING)
+            fs._log_transaction(Transaction("someone-else", "feature"), TransactionStatus.PENDING)
 
     io.on_write = other_writer_starts
     io.fail_on = "index"
