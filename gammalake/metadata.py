@@ -12,14 +12,13 @@ constructed. ``GammaFeatureLake`` decides when to create and write them.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
 import polars as pl
 import pyarrow as pa
 from ccflow import ArrowSchema
-
-__all__ = ("TransactionStatus",)
 
 DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
     pa.schema(
@@ -98,16 +97,14 @@ class TransactionStatus(StrEnum):
     ROLLED_BACK = "rolled_back"
 
 
+@dataclass(frozen=True)
 class Transaction:
     """Identity of one tracked write; ``started_at`` is the cutoff a rollback restores to."""
 
-    __slots__ = ("owner", "signal_type", "started_at", "transaction_id")
-
-    def __init__(self, owner: str, signal_type: str):
-        self.transaction_id = uuid.uuid4().hex
-        self.owner = owner
-        self.signal_type = signal_type
-        self.started_at = datetime.now(UTC)
+    owner: str
+    signal_type: str
+    transaction_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 def transaction_log_row(transaction: Transaction, status: TransactionStatus, error: str | None = None) -> pa.Table:

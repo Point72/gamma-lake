@@ -128,11 +128,7 @@ class PolarsIO(FrameIO):
         return piot.scan_delta(target, **kwargs)
 
     def restore_to_timestamp(self, target: str, timestamp: datetime) -> None:
-        """Restore a Delta table to ``timestamp`` using deltalake.
-
-        A table with no commits after ``timestamp`` is left untouched, since deltalake refuses to restore
-        a table to its latest version.
-        """
+        """Restore a Delta table to ``timestamp``; deltalake refuses to restore one with no newer commits, so those are skipped."""
         table = DeltaTable(target)
         latest_version = table.version()
         table.load_as_version(timestamp)

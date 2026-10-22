@@ -125,7 +125,7 @@ import json
 import os
 import traceback
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from functools import singledispatchmethod, wraps
@@ -165,16 +165,6 @@ from gammalake.metadata import (
 )
 
 __all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
-
-
-def _attempt(exc: BaseException, description: str, action: Callable[[], None]) -> bool:
-    """Run a cleanup ``action`` without letting its failure mask ``exc``; a failure is attached to ``exc`` as a note."""
-    try:
-        action()
-    except Exception as cleanup_exc:  # noqa: BLE001
-        exc.add_note(f"gamma-lake: {description}: {cleanup_exc!r}")
-        return False
-    return True
 
 
 def preprocess_df(feature_store, df):
@@ -585,7 +575,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     )
     io: FrameIO = Field(default_factory=PolarsIO, description="An IO object, abstracting how/where polars frames are read from storage.")
     _is_initialized: bool = False
-    _transaction_log_ready: bool = False
     _sort_keys: list[str] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -672,14 +661,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._apply_filters_to_lazy_frame(self.io.scan_delta(self.index), start, end)
 
     def transaction_log_frame(self) -> pl.LazyFrame:
-        """Return the transaction log, an append-only event log of every tracked write.
-
-        Each status change of a write appends a row, so a transaction's current
-        status is its row with the latest ``updated_at``. A lake created before the log
-        existed returns an empty frame until its first write.
-        """
-        if not self.io.is_deltatable(self.transaction_log):
-            return empty_transaction_log().lazy()
+        """Convenience method to find the correct path for this feature store's transaction log. A transaction's current status is its row with the latest ``updated_at``."""
         return self.io.scan_delta(self.transaction_log)
 
     def get_path(self, addr) -> str:
@@ -762,38 +744,26 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     def _ensure_transaction_log(self) -> None:
         """Create the transaction log if missing, which is the case for lakes initialized before it existed."""
-        if self._transaction_log_ready:
-            return
         if not self.io.is_deltatable(self.transaction_log):
             self.io.write_delta(empty_transaction_log(), self.transaction_log)
-        self._transaction_log_ready = True
 
     def _log_transaction(self, transaction: Transaction, status: TransactionStatus, error: str | None = None) -> None:
         write_metadata(self, self.transaction_log, transaction_log_row(transaction, status, error))
 
-    def _has_overlapping_transactions(self, transaction: Transaction) -> bool:
-        """Whether any other transaction logged activity since ``transaction`` started."""
-        overlapping = (
-            self.transaction_log_frame()
-            .filter((pl.col("transaction_id") != transaction.transaction_id) & (pl.col("updated_at") >= transaction.started_at))
-            .head(1)
-            .collect()
-        )
-        return not overlapping.is_empty()
-
     @contextmanager
-    def _transaction(self, owner: str, signal_type: str, submitted: list) -> Iterator[None]:
+    def _transaction(self, owner: str, signal_type: str, refs: list) -> Iterator[None]:
         """Track a write in the transaction log and undo it if it fails.
 
         The transaction is logged as ``pending``, then ``success`` once the body completes. If the body
         raises, it is logged as ``failed``, the lake is restored to its state when the transaction began,
-        and it is logged as ``rolled_back``. The original exception is always re-raised.
+        and it is logged as ``rolled_back``. The original exception is re-raised; if the restore itself
+        fails, that error is raised instead, chained to the original, and the transaction stays ``failed``.
 
         Args:
             owner: Owner recorded in the log.
             signal_type: Signal type recorded in the log.
-            submitted: Work submitted by the body. On failure, any Ray object references in it are awaited
-                before restoring so that no write is still in flight.
+            refs: Ray references the body submits, awaited on failure so no write is in flight during the
+                restore. Because ``get`` raises on the first failure, the restore cannot rely on it to wait.
         """
         self._ensure_transaction_log()
         transaction = Transaction(owner, signal_type)
@@ -802,37 +772,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             yield
             self._log_transaction(transaction, TransactionStatus.SUCCESS)
         except BaseException as exc:
-            self._roll_back(transaction, exc, submitted)
+            error = f"{type(exc).__name__}: {exc}"
+            self._log_transaction(transaction, TransactionStatus.FAILED, error)
+            if self.run_on_ray_cluster and refs:
+                self.wait(refs, num_returns=len(refs))
+            self.restore_to_timestamp(transaction.started_at)
+            self._log_transaction(transaction, TransactionStatus.ROLLED_BACK, error)
             raise
-
-    def _roll_back(self, transaction: Transaction, exc: BaseException, submitted: list) -> None:
-        """Log a failed transaction, restore the lake, and log the rollback.
-
-        Never raises, so the failure that triggered it is not masked. Problems here are attached to
-        ``exc`` as notes. If the restore does not happen, the transaction stays ``failed`` and
-        ``restore_to_timestamp(transaction.started_at)`` recovers the lake manually.
-        """
-        error = f"{type(exc).__name__}: {exc}"
-        if self.run_on_ray_cluster:
-            _attempt(exc, "could not wait for in-flight writes to settle", lambda: self._wait_for_refs(submitted))
-        _attempt(exc, "could not record the failed transaction", lambda: self._log_transaction(transaction, TransactionStatus.FAILED, error))
-        if not _attempt(exc, "automatic rollback did not complete", lambda: self._restore_unless_overlapped(transaction)):
-            exc.add_note(
-                f"gamma-lake: restore manually with restore_to_timestamp({transaction.started_at!r}); transaction_id={transaction.transaction_id}"
-            )
-            return
-        _attempt(exc, "rolled back, but could not record it", lambda: self._log_transaction(transaction, TransactionStatus.ROLLED_BACK, error))
-
-    def _wait_for_refs(self, submitted: list) -> None:
-        """Block until every Ray task submitted by a failed write has settled, so none is still writing."""
-        refs = [ref for ref in submitted if is_object_ref(ref)]
-        if refs:
-            self.wait(refs, num_returns=len(refs))
-
-    def _restore_unless_overlapped(self, transaction: Transaction) -> None:
-        if self._has_overlapping_transactions(transaction):
-            raise RuntimeError("other transactions were active during this write, so restoring would discard their commits")
-        self.restore_to_timestamp(transaction.started_at)
 
     @ensure_deltalake_is_initialized
     def restore_to_timestamp(self, timestamp: datetime) -> GammaFeatureLake:
@@ -1169,16 +1115,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             table_metadata=table_metadata,
         )
         refs = []
-        submitted = []
         # Everything below this point writes to the lake. If any of it fails, the transaction restores the lake
         # to its state before the writes began, so that feature tables never run ahead of the index.
-        with self._transaction(owner, signal_type, submitted):
+        # The metadata writes depend on every other task, so waiting on refs also waits for the feature table updates.
+        with self._transaction(owner, signal_type, refs):
             # Step 1: Append-only if no overlap; otherwise merge in-place into the existing DeltaTable (upsert).
             # New index rows are inserted; overlapping rows are updated. Alignment rows (index rows absent from the
             # input, with null feature values) are merged in to maintain index alignment across all tables.
-            feature_table_update_refs = []
-            for table_addr in feature_tables["table_addr"].unique():
-                update_refs = self.switch(update_feature_tables, num_returns=2)(
+            feature_table_update_refs = [
+                self.switch(update_feature_tables, num_returns=2)(
                     feature_store=self,
                     table_addr=table_addr,
                     input_length=input_length,
@@ -1195,8 +1140,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                     feature_metadata=feature_metadata,
                     table_metadata=table_metadata,
                 )
-                feature_table_update_refs.append(update_refs)
-                submitted.extend(update_refs)
+                for table_addr in feature_tables["table_addr"].unique()
+            ]
             # Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
             # This step identifies the qualified tables (all feature tables which contain no features found in the input table, OR contain a non-latest version of a feature found in the input table).
             # This preserves index alignment across all our delta tables, and we can do this in parallel.
@@ -1204,13 +1149,11 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             for row in tables_to_update.iter_rows(named=True):
                 alignment_refs.append(self.switch(align_feature_tables)(self, new_index_rows_ref, row, primary_sort_key_min))
             refs.extend(alignment_refs)
-            submitted.extend(alignment_refs)
 
             # Step 3: Append the results of an anti-join between the new data and the index back into the master index.
             # This can also be done in parallel.
             index_ref = self.switch(update_index)(self, new_index_rows_ref)
             refs.append(index_ref)
-            submitted.append(index_ref)
 
             if feature_table_update_refs:
                 # Metadata becomes visible only after all data and index writes succeed.
@@ -1222,16 +1165,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
                     _ray_ordering_deps=[*alignment_refs, index_ref],
                 )
                 refs.append(table_metadata_ref)
-                submitted.append(table_metadata_ref)
-                feature_metadata_ref = self.switch(write_metadata)(
-                    self,
-                    self.feature_metadata,
-                    *feature_metadata_rows,
-                    schema_mode="merge",
-                    _ray_ordering_deps=[table_metadata_ref],
+                refs.append(
+                    self.switch(write_metadata)(
+                        self,
+                        self.feature_metadata,
+                        *feature_metadata_rows,
+                        schema_mode="merge",
+                        _ray_ordering_deps=[table_metadata_ref],
+                    )
                 )
-                refs.append(feature_metadata_ref)
-                submitted.append(feature_metadata_ref)
 
             return self.get(refs) if self.run_on_ray_cluster else refs
 

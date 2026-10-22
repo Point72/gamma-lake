@@ -238,28 +238,12 @@ version explicitly.
 
 ### Transactions and rollback
 
-A feature write commits to several Delta tables in turn: feature groups, the master index, then metadata. Each
-`add_features`, `add_targets`, `add_as_of_features`, `add_sparse_features`, and `add_index_rows` call is recorded in the
-`transaction_log` Delta table, which `initialize()` creates alongside the other metadata tables. Lakes created earlier
-get the table on their first write. The log is append-only: every status change appends a row, so a transaction's
-current status is its row with the latest `updated_at`.
-
-| Status        | Meaning                                                   |
-| ------------- | --------------------------------------------------------- |
-| `pending`     | The write started and has not finished                    |
-| `success`     | Every feature, index, and metadata commit succeeded       |
-| `failed`      | A commit failed                                           |
-| `rolled_back` | The lake was restored to its state when the write started |
-
-When a write fails, Gamma Lake records `failed`, calls `restore_to_timestamp` with the transaction's `started_at` so
-feature groups never run ahead of the index, records `rolled_back`, and re-raises the original error. If the rollback
-cannot complete, the transaction stays `failed` and the error carries a note with the `restore_to_timestamp` call to run
-by hand. A transaction left `pending` indicates the process died mid-write.
-
-Rollback inherits the limits of `restore_to_timestamp`: the history back to `started_at` must still be within Delta's
-retention window. It also assumes no concurrent writers. If another transaction logs activity while a failed write is
-in flight, the restore is skipped rather than discarding that transaction's commits, and the failed write stays
-`failed`. Other writers, such as `consolidate_feature_groups`, are not tracked yet.
+Each write (`add_features`, `add_targets`, and the other `add_*` methods) is recorded in the append-only
+`transaction_log` table as `pending`, then `success`. A transaction's current status is its row with the latest
+`updated_at`. If a write fails, it is recorded as `failed`, the lake is restored to its state when the write started with
+`restore_to_timestamp`, and it is recorded as `rolled_back`. A transaction that stays `failed` or `pending` was not
+rolled back, and `restore_to_timestamp(started_at)` recovers the lake. Rollback inherits the limits of
+`restore_to_timestamp`, such as assuming no concurrent writers.
 
 ## Documentation
 
