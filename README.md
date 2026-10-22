@@ -234,6 +234,32 @@ version explicitly.
 | Cross-group assembly  | Predicate-distributed positional horizontal concatenation         |
 | Parallel I/O          | Ray task per feature group                                        |
 | Versioning            | Append-only metadata records owner and version per feature column |
+| Write tracking        | Append-only transaction log; failed writes are rolled back        |
+
+### Transactions and rollback
+
+A feature write commits to several Delta tables in turn: feature groups, the master index, then metadata. Each
+`add_features`, `add_targets`, `add_as_of_features`, `add_sparse_features`, and `add_index_rows` call is recorded in the
+`transaction_log` Delta table, which `initialize()` creates alongside the other metadata tables. Lakes created earlier
+get the table on their first write. The log is append-only: every status change appends a row, so a transaction's
+current status is its row with the latest `updated_at`.
+
+| Status        | Meaning                                                   |
+| ------------- | --------------------------------------------------------- |
+| `pending`     | The write started and has not finished                    |
+| `success`     | Every feature, index, and metadata commit succeeded       |
+| `failed`      | A commit failed                                           |
+| `rolled_back` | The lake was restored to its state when the write started |
+
+When a write fails, Gamma Lake records `failed`, calls `restore_to_timestamp` with the transaction's `started_at` so
+feature groups never run ahead of the index, records `rolled_back`, and re-raises the original error. If the rollback
+cannot complete, the transaction stays `failed` and the error carries a note with the `restore_to_timestamp` call to run
+by hand. A transaction left `pending` indicates the process died mid-write.
+
+Rollback inherits the limits of `restore_to_timestamp`: the history back to `started_at` must still be within Delta's
+retention window. It also assumes no concurrent writers. If another transaction logs activity while a failed write is
+in flight, the restore is skipped rather than discarding that transaction's commits, and the failed write stays
+`failed`. Other writers, such as `consolidate_feature_groups`, are not tracked yet.
 
 ## Documentation
 
@@ -275,6 +301,7 @@ lake.read(lake.feature_metadata_frame()                      # specific owner/ve
 # Metadata inspection
 lake.feature_metadata_frame().collect()   # features, versions, owners
 lake.table_metadata_frame().collect()     # Delta table details
+lake.transaction_log_frame().collect()    # status history of every write
 lake.index_frame().collect()              # master index
 ```
 
