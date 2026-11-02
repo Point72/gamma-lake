@@ -26,6 +26,7 @@ use crate::scan::{checked_scan, frame as scan_frame};
 use crate::sort::{blocking, sorted_streams, spilling_sorted_streams};
 use crate::store::{StoredTable, TableStore};
 use crate::stream::{AsyncBatchStream, BatchStream};
+use crate::transaction;
 
 pub(crate) const READABLE_SIGNAL_TYPES: [&str; 4] =
     ["feature", "target", "as_of_feature", "sparse_feature"];
@@ -38,6 +39,8 @@ pub struct LakeOptions {
     pub index_path: String,
     pub feature_metadata_path: String,
     pub table_metadata_path: String,
+    /// The transaction log, created by the first write when missing; see [`Lake::add`].
+    pub transaction_log_path: String,
     /// Upper bound on rows per output batch.
     pub batch_size: usize,
     /// While reading, check that every feature table's sort keys match the index row by
@@ -59,6 +62,7 @@ impl std::fmt::Debug for LakeOptions {
             .field("index_path", &self.index_path)
             .field("feature_metadata_path", &self.feature_metadata_path)
             .field("table_metadata_path", &self.table_metadata_path)
+            .field("transaction_log_path", &self.transaction_log_path)
             .field("batch_size", &self.batch_size)
             .field("validate", &self.validate)
             .field("table_name_prefix", &self.table_name_prefix)
@@ -75,6 +79,7 @@ impl Default for LakeOptions {
             index_path: "index".into(),
             feature_metadata_path: "feature_metadata".into(),
             table_metadata_path: "table_metadata".into(),
+            transaction_log_path: "transaction_log".into(),
             batch_size: 65536,
             validate: false,
             table_name_prefix: String::new(),
@@ -399,6 +404,16 @@ impl Lake {
         self.scan(&self.options.table_metadata_path, dnf)
     }
 
+    /// Rows of the transaction log matching `dnf`: none when the lake has no log yet.
+    pub fn transaction_log(&self, dnf: &Dnf) -> Result<BatchStream> {
+        block_on(async {
+            match self.store.open(&self.options.transaction_log_path).await? {
+                Some(table) => self.scan_table(table, dnf).await,
+                None => Ok(BatchStream::from_batches(transaction::schema(), vec![])),
+            }
+        })?
+    }
+
     /// Rows of the index matching `dnf`, unordered.
     pub fn index(&self, dnf: &Dnf) -> Result<BatchStream> {
         self.scan(&self.options.index_path, dnf)
@@ -642,6 +657,14 @@ impl Lake {
     /// Schema of [`Lake::table_metadata`].
     pub fn table_metadata_schema(&self) -> Result<SchemaRef> {
         self.table_schema(&self.options.table_metadata_path)
+    }
+
+    /// Schema of [`Lake::transaction_log`].
+    pub fn transaction_log_schema(&self) -> Result<SchemaRef> {
+        block_on(async {
+            let table = self.store.open(&self.options.transaction_log_path).await?;
+            Ok::<_, Error>(table.map_or_else(transaction::schema, |t| t.schema()))
+        })?
     }
 
     fn table_schema(&self, name: &str) -> Result<SchemaRef> {
@@ -896,12 +919,13 @@ impl Lake {
     }
 
     fn scan(&self, name: &str, dnf: &Dnf) -> Result<BatchStream> {
-        block_on(async {
-            let ctx = self.context()?;
-            let table = Arc::<dyn StoredTable>::from(self.table(name).await?);
-            let df = normalize(scan_frame(&ctx, table, dnf)?)?;
-            Ok(BatchStream::from_plan(df.execute_stream().await?))
-        })?
+        block_on(async { self.scan_table(self.table(name).await?, dnf).await })?
+    }
+
+    async fn scan_table(&self, table: Box<dyn StoredTable>, dnf: &Dnf) -> Result<BatchStream> {
+        let ctx = self.context()?;
+        let df = normalize(scan_frame(&ctx, Arc::from(table), dnf)?)?;
+        Ok(BatchStream::from_plan(df.execute_stream().await?))
     }
 
     pub(crate) fn context(&self) -> Result<SessionContext> {

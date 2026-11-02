@@ -19,6 +19,7 @@ mod scan;
 mod sort;
 pub mod store;
 mod stream;
+mod transaction;
 mod write;
 
 pub use admin::Annotation;

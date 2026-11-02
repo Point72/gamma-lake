@@ -230,10 +230,10 @@ def _settings(path: Path) -> dict[str, list[tuple]]:
 
     Feature tables are keyed by the features they hold, since their names are random. The
     commit info is reduced to the operation, because its parameters and metrics name the
-    Delta library version.
+    Delta library version. The transaction log is skipped, since the old engine has none.
     """
     tables: dict[str, list[tuple]] = {}
-    for table in sorted(p for p in path.iterdir() if (p / "_delta_log").is_dir()):
+    for table in sorted(p for p in path.iterdir() if (p / "_delta_log").is_dir() and p.name != "transaction_log"):
         commits = []
         fields: list[str] = []
         for log in sorted((table / "_delta_log").glob("*.json")):

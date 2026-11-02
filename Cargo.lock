@@ -2551,6 +2551,7 @@ dependencies = [
  "deltalake",
  "futures",
  "gamma_lake_core",
+ "serde_json",
  "url",
 ]
 

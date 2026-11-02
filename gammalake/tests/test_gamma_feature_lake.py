@@ -1,4 +1,8 @@
+import os
+import shutil
 import uuid
+from collections import Counter
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
@@ -9,7 +13,7 @@ from deltalake import DeltaTable
 from polars.testing import assert_frame_equal
 from pydantic import ValidationError
 
-from gammalake import DeltaOptions, GammaFeatureLake
+from gammalake import DeltaOptions, GammaFeatureLake, PartialWriteError
 from gammalake.abstract import BaseFeatureLake
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
@@ -604,3 +608,103 @@ def test_add_features_single_commit_per_metadata_table(tmp_path):
     fs.add_features(df, owner="test")
 
     assert {path: DeltaTable(path).version() for path in before} == {path: version + 1 for path, version in before.items()}
+
+
+def _frame(days, value: float) -> pl.DataFrame:
+    """One feature ``f`` for symbols ``a`` and ``b`` on each of ``days`` (day-of-January offsets)."""
+    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=day) for day in days for _ in ("a", "b")]
+    return pl.DataFrame({"timestamp": timestamps, "symbol": ["a", "b"] * len(days), "f": [float(value)] * len(timestamps)}).with_columns(
+        pl.col("timestamp").dt.cast_time_unit("us")
+    )
+
+
+def _failing_lock(fails):
+    """A lock factory raising on the ``n``-th lock of table ``name`` when ``fails(name, n)``."""
+    counts = Counter()
+
+    @contextmanager
+    def lock(path):
+        name = os.path.basename(path)
+        counts[name] += 1
+        if fails(name, counts[name]):
+            raise RuntimeError(f"simulated failure locking {name}")
+        yield
+
+    return lock
+
+
+def _log(fs: GammaFeatureLake) -> pl.DataFrame:
+    return fs.transaction_log_frame().sort("updated_at").collect()
+
+
+def test_transaction_log_records_pending_then_success(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path), transaction_log_path="writes").initialize()
+    assert _log(fs).is_empty()
+
+    fs.add_features(_frame(range(1, 3), 1), owner="me")
+
+    log = _log(fs)
+    assert log["status"].to_list() == ["pending", "success"]
+    assert log["transaction_id"].n_unique() == 1
+    assert log["owner"].to_list() == ["me", "me"]
+    assert log["signal_type"].to_list() == ["feature", "feature"]
+    assert DeltaTable(str(tmp_path / "writes")).version() == 2
+    assert not (tmp_path / "transaction_log").exists()
+
+
+def test_rejected_input_is_not_logged_as_a_transaction(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+
+    with pytest.raises(ValueError, match="no rows"):
+        fs.add_features(_frame([1], 1).clear())
+
+    assert _log(fs).is_empty()
+
+
+def test_failed_add_is_rolled_back_and_later_writes_do_not_see_it(tmp_path):
+    """Regression test for upstream issue #52: feature tables must not keep a failed write that the index never received."""
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    fs.add_features(_frame(range(1, 6), 1), owner="me")
+    index_before = fs.index_frame().collect()
+    (table,) = fs.table_metadata_frame().collect()["table_addr"]
+    version_before = DeltaTable(os.path.join(fs.base_path, table)).version()
+
+    failing = GammaFeatureLake(base_path=str(tmp_path), lock=_failing_lock(lambda name, _: name == "index"))
+    with pytest.raises(RuntimeError, match="simulated failure locking index"):
+        failing.add_features(_frame([6, 7], 2), owner="me")
+
+    assert DeltaTable(os.path.join(fs.base_path, table)).version() == version_before + 2
+    assert_frame_equal(fs.index_frame().collect(), index_before)
+    assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10
+    log = _log(fs)
+    assert log["status"].to_list()[-3:] == ["pending", "failed", "rolled_back"]
+    assert "simulated failure locking index" in log["error"][-1]
+
+    fs.add_features(_frame([8, 9], 3), owner="me")
+
+    assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10 + [3.0] * 4
+
+
+def test_failed_rollback_leaves_transaction_failed(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    fs.add_features(_frame(range(1, 6), 1), owner="me")
+    (table,) = fs.table_metadata_frame().collect()["table_addr"]
+
+    failing = GammaFeatureLake(base_path=str(tmp_path), lock=_failing_lock(lambda name, n: name == "index" or (name == table and n == 2)))
+    with pytest.raises(PartialWriteError) as raised:
+        failing.add_features(_frame([6, 7], 2), owner="me")
+
+    assert raised.value.committed == [table]
+    assert str(raised.value.__cause__) == f"simulated failure locking {table}"
+    log = _log(fs)
+    assert log["status"].to_list()[-2:] == ["pending", "failed"]
+    assert "simulated failure locking index" in log["error"][-1]
+
+
+def test_lake_created_before_the_transaction_log_creates_it_on_first_write(tmp_path):
+    shutil.rmtree(GammaFeatureLake(base_path=str(tmp_path)).initialize().transaction_log)
+    fs = GammaFeatureLake(base_path=str(tmp_path))
+
+    fs.add_features(_frame(range(1, 3), 1), owner="me")
+
+    assert _log(fs)["status"].to_list() == ["pending", "success"]

@@ -17,6 +17,7 @@
 * [feature] With the `datafusion` extra, `GammaFeatureLake.feature_table` and `NativeLake.feature_table` return features as a DataFusion table for SQL, with filters on sort keys pushed into the scan.
 * [breaking] Rust: storage backends implement an Arrow-only `TableStore`/`StoredTable` contract whose scans return `TableScan`; the core fails a read whose scan returns columns other than the requested ones of the table's schema. `Lake::read_async` reads without blocking.
 * [feature] Add the `lock` option: a per-table lock factory held around every commit.
+* [bugfix] Log row writes in a `transaction_log` table and undo exactly the failed write's tagged commits while preserving other writers' commits.
 
 ## 0.2.0 (09-22-26)
 * [cleanup] Remove unused validation types and stale status scaffolding.

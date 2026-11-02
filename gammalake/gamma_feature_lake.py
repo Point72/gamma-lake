@@ -45,6 +45,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     )
     feature_metadata_path: str = Field("feature_metadata", description="The name of the DeltaTable holding feature metadata.")
     table_metadata_path: str = Field("table_metadata", description="The name of the DeltaTable holding table metadata.")
+    transaction_log_path: str = Field(
+        "transaction_log", description="The name of the DeltaTable holding the transaction log, which tracks the status of every write."
+    )
     index_path: str = Field("index", description="The name of the DeltaTable holding the global index.")
     table_name_prefix: str = Field(
         "",
@@ -118,6 +121,11 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """Convenience method to find the correct path for this feature store's table metadata table"""
         return os.path.join(self.base_path, self.table_metadata_path)
 
+    @property
+    def transaction_log(self) -> str:
+        """Convenience method to find the correct path for this feature store's transaction log table"""
+        return os.path.join(self.base_path, self.transaction_log_path)
+
     def _apply_filters_to_lazy_frame(self, df: pl.LazyFrame, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         """Apply optional filters to a lazyframe, and return it"""
         if start is not None:
@@ -130,6 +138,11 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     def table_metadata_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         """This feature store's table metadata table."""
         return self._apply_filters_to_lazy_frame(self._native_lake().scan_table_metadata(), start, end)
+
+    @ensure_deltalake_is_initialized
+    def transaction_log_frame(self) -> pl.LazyFrame:
+        """This feature store's transaction log. A transaction's current status is its row with the latest ``updated_at``."""
+        return self._native_lake().scan_transaction_log()
 
     @ensure_deltalake_is_initialized
     def feature_metadata_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
@@ -297,6 +310,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             "index_path": self.index_path,
             "feature_metadata_path": self.feature_metadata_path,
             "table_metadata_path": self.table_metadata_path,
+            "transaction_log_path": self.transaction_log_path,
             "primary_sort_key": self.primary_sort_key,
             "table_name_prefix": self.table_name_prefix,
             "delta_options": self.delta_options,
@@ -340,6 +354,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             value columns and all secondary-key values for each primary-sort-key period instead of
             splitting the same period across calls. For backfills, write blocks of complete periods
             sized to fit memory. See the ``Best-Practices`` wiki page.
+
+        Transactions:
+            The write is recorded in the transaction log as ``pending``, then ``success``. If it fails
+            after committing part of itself, its commits, marked with its transaction id, are undone on
+            each table it committed to, keeping other writers' commits, and the write fails as one that
+            committed nothing does. It is not rolled back when an undo fails, as when another writer
+            rewrote rows it committed; see :class:`gammalake.native.NativeLake`.
         """
         annotated = [*(comments or {}), *(tags or {})]
         if unknown := sorted({name for name in annotated if name not in df.columns or name in self.sort_keys}):

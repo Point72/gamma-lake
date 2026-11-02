@@ -15,7 +15,8 @@ from gammalake import ConflictError, GammaFeatureLake, PartialWriteError
 from gammalake.native import NativeLake
 
 UTC = dt.UTC
-LAKE_TABLES = {"index", "table_metadata", "feature_metadata"}
+LOG = "transaction_log"
+LAKE_TABLES = {"index", "table_metadata", "feature_metadata", LOG}
 
 
 def frame(days, symbols, **scales) -> pl.DataFrame:
@@ -84,15 +85,16 @@ def annotate(lake: GammaFeatureLake) -> None:
 
 
 # The tables each operation changes: "features" and "targets" are the tables of f and y, "new" a table it creates.
+# Adds are transactions, which append two rows to the log, each under its own lock.
 OPERATIONS = {
-    "add_features": (lambda lake: lake.add_features(frame(range(1, 3), "ab", h=1)), ["feature_metadata", "new", "table_metadata"]),
+    "add_features": (lambda lake: lake.add_features(frame(range(1, 3), "ab", h=1)), ["feature_metadata", "new", "table_metadata", LOG]),
     "add_features_on_new_keys": (
         lambda lake: lake.add_features(frame(range(4, 6), "ab", f=1, g=2)),
-        ["features", "index", "table_metadata"],
+        ["features", "index", "table_metadata", LOG],
     ),
-    "add_targets": (lambda lake: lake.add_targets(frame(range(1, 3), "ab", z=1)), ["feature_metadata", "new", "table_metadata"]),
-    "add_index_rows": (lambda lake: lake.add_index_rows(frame([5], "ab")), ["index"]),
-    "add_index_rows_inside_coverage": (lambda lake: lake.add_index_rows(frame([2], "c")), ["features", "index", "targets"]),
+    "add_targets": (lambda lake: lake.add_targets(frame(range(1, 3), "ab", z=1)), ["feature_metadata", "new", "table_metadata", LOG]),
+    "add_index_rows": (lambda lake: lake.add_index_rows(frame([5], "ab")), ["index", LOG]),
+    "add_index_rows_inside_coverage": (lambda lake: lake.add_index_rows(frame([2], "c")), ["features", "index", "targets", LOG]),
     "annotate": (annotate, ["features"]),
     "consolidate_feature_groups": (
         lambda lake: lake.consolidate_feature_groups(["f", "y"]),
@@ -115,7 +117,7 @@ def test_writes_lock_exactly_the_tables_they_change(tmp_path, operation):
 
     after = table_versions(lake.base_path)
     changed = sorted(name for name in after if before.get(name) != after[name])
-    assert recorder.names() == changed
+    assert recorder.names() == sorted(changed + [LOG] * (LOG in changed))
     assert sorted(roles.get(name, name if name in before else "new") for name in changed) == expected
     assert recorder.locked == [os.path.join(lake.base_path, os.path.basename(path)) for path in recorder.locked]
 
@@ -156,7 +158,7 @@ def test_restore_locks_every_table_it_may_restore(tmp_path):
 
     after = table_versions(lake.base_path)
     changed = {name for name in after if before[name] != after[name]}
-    assert recorder.names() == sorted(LAKE_TABLES | referenced)
+    assert recorder.names() == sorted(LAKE_TABLES - {LOG} | referenced)
     assert changed == {"table_metadata", "feature_metadata", *(name for name in referenced if before[name] > 0)}
     for name, entered, exited, _ in recorder.held:
         assert exited == (entered + 1 if name in changed else entered), name
@@ -223,29 +225,39 @@ def test_a_lock_error_before_any_commit_propagates_unchanged(tmp_path, raised_by
     with pytest.raises(error_type) as raised:
         with_lock(lake, recorder).add_features(frame(range(3, 5), "ab", f=1))
     assert raised.value is error
-    assert table_versions(lake.base_path) == before
-    assert recorder.names() == [os.path.basename(path) for path in recorder.locked if is_data_table(path)]
+    assert table_versions(lake.base_path) == {**before, LOG: before[LOG] + 3}
+    assert all(is_data_table(path) for path in recorder.locked if os.path.basename(path) != LOG)
 
 
+@pytest.mark.parametrize("rollback_fails", [False, True])
 @pytest.mark.parametrize("error_type", LOCK_ERRORS)
 @pytest.mark.parametrize("raised_by", ["factory", "enter"])
-def test_a_lock_error_after_a_commit_is_a_partial_write(tmp_path, raised_by, error_type):
+def test_a_lock_error_after_a_commit_rolls_the_write_back(tmp_path, raised_by, error_type, rollback_fails):
     lake = populated(tmp_path)
     error = error_type("lock service unavailable")
+    locked = []
 
+    # The rollback restores the table metadata, then locks the index a second time.
     def fail(path):
-        if os.path.basename(path) == "feature_metadata":
+        locked.append(os.path.basename(path))
+        if locked[-1] == "feature_metadata" or (rollback_fails and locked.count("index") == 2):
             raise error
 
     before = table_versions(lake.base_path)
     recorder = Recorder(**{"on_lock" if raised_by == "factory" else "on_enter": fail})
-    with pytest.raises(PartialWriteError) as raised:
+    with pytest.raises(PartialWriteError if rollback_fails else error_type) as raised:
         with_lock(lake, recorder).add_features(frame(range(3, 5), "ab", h=1))
-    assert raised.value.__cause__ is error
     after = table_versions(lake.base_path)
     created = [name for name in after if name not in before]
     assert len(created) == 1
-    assert sorted(raised.value.committed) == sorted([*created, "index", "table_metadata"])
+    if rollback_fails:
+        assert raised.value.__cause__ is error
+        assert sorted(raised.value.committed) == sorted([*created, "index", "table_metadata"])
+        assert lake.index_frame().collect().height == 8
+    else:
+        assert raised.value is error
+        assert lake.index_frame().collect().height == 6
+    assert after["table_metadata"] == before["table_metadata"] + 2
     assert after["feature_metadata"] == before["feature_metadata"]
     assert "h" not in lake.feature_metadata_frame().collect()["feature_name"]
 
@@ -261,18 +273,23 @@ def test_a_failed_release_after_a_commit_counts_the_table_as_committed(tmp_path,
         if (name not in before) if failing == "new table" else (name == "index"):
             raise error
 
-    with pytest.raises(PartialWriteError) as raised:
+    with pytest.raises(pa.ArrowInvalid if failing == "new table" else PartialWriteError) as raised:
         with_lock(lake, Recorder(on_exit=fail)).add_features(frame(range(3, 5), "ab", h=1))
-    assert raised.value.__cause__ is error
     created = [name for name in table_versions(lake.base_path) if name not in before]
     assert len(created) == 1
-    expected = created if failing == "new table" else [*created, "index"]
-    assert sorted(raised.value.committed) == sorted(expected)
+    if failing == "new table":
+        # Rolling back a write that only created a table restores nothing.
+        assert raised.value is error
+    else:
+        # Restoring the index fails to release its lock too.
+        assert raised.value.__cause__ is error
+        assert sorted(raised.value.committed) == sorted([*created, "index"])
 
 
 @pytest.mark.parametrize("raced", ["feature table", "index"])
 def test_a_table_changed_after_the_write_read_it_is_not_committed_to(tmp_path, raced):
     lake = populated(tmp_path)
+    features = lake.feature_metadata_frame().collect().filter(pl.col("feature_name") == "f")["table_addr"].item()
     before = table_versions(lake.base_path)
     changed = []
 
@@ -282,19 +299,17 @@ def test_a_table_changed_after_the_write_read_it_is_not_committed_to(tmp_path, r
             DeltaTable(path).alter.set_table_description("changed by another writer")
             changed.append(name)
 
-    expected = ConflictError if raced == "feature table" else PartialWriteError
-    with pytest.raises(expected) as raised:
+    with pytest.raises(ConflictError) as raised:
         with_lock(lake, Recorder(on_enter=race)).add_features(frame(range(4, 5), "ab", f=1, g=2))
     assert "changed after this write read it" in str(raised.value)
-    after = table_versions(lake.base_path)
-    assert after[changed[0]] == before[changed[0]] + 1
-    if raced == "feature table":
-        assert raised.value.table == changed[0]
-        assert after == {**before, changed[0]: before[changed[0]] + 1}
-    else:
-        assert len(raised.value.committed) == 1
-        assert after["index"] == before["index"] + 1
+    assert raised.value.table == changed[0]
+    expected = {**before, changed[0]: before[changed[0]] + 1, LOG: before[LOG] + 3}
+    if raced == "index":
+        # The feature table was appended to before the conflict, then restored.
+        expected[features] += 2
+    assert table_versions(lake.base_path) == expected
     assert lake.index_frame().collect().height == 6
+    assert lake.read(["f"]).height == 6
 
 
 def test_a_thread_affine_lock_works(tmp_path):
@@ -320,4 +335,4 @@ def test_lock_keys_are_canonical_table_paths(tmp_path):
     recorder = Recorder()
     NativeLake(str(link) + "/", lock=recorder).add_index_rows(frame([9], "a"))
     keys.append(recorder.locked)
-    assert keys == [[os.path.join(os.path.realpath(real), "index")]] * 5
+    assert keys == [[os.path.join(os.path.realpath(real), name) for name in (LOG, "index", LOG)]] * 5

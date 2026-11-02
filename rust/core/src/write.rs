@@ -354,6 +354,66 @@ impl Action {
     }
 }
 
+/// A table a write commits to.
+#[derive(Clone)]
+pub(crate) struct Commit {
+    pub(crate) addr: String,
+    /// The version the write first committed on.
+    pub(crate) read: Option<u64>,
+}
+
+/// The tables a write commits to, in order, and the mark of its commits, so that a failed
+/// write can be undone. Creating a table is not tracked: the table is left in place, and once
+/// the tables referring to it are undone, nothing does.
+pub(crate) struct Commits {
+    tag: String,
+    tables: Mutex<Vec<Commit>>,
+}
+
+impl Default for Commits {
+    fn default() -> Self {
+        Self {
+            tag: uuid::Uuid::new_v4().simple().to_string(),
+            tables: Mutex::default(),
+        }
+    }
+}
+
+impl Commits {
+    /// `table`, marking its commits as this write's.
+    pub(crate) fn tagged(&self, mut table: Box<dyn StoredTable>) -> Box<dyn StoredTable> {
+        table.tag_commits(&self.tag);
+        table
+    }
+
+    /// `result`, of a commit to `addr` made on version `read`, recorded unless it certainly
+    /// did not land: a conflict, or a lock that could not be taken.
+    pub(crate) fn count<T>(&self, addr: &str, read: Option<u64>, result: Result<T>) -> Result<T> {
+        if !matches!(result, Err(Error::Conflict { .. } | Error::Lock { .. })) {
+            let mut tables = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
+            if !tables.iter().any(|c| c.addr == addr) {
+                tables.push(Commit {
+                    addr: addr.to_string(),
+                    read,
+                });
+            }
+        }
+        result
+    }
+
+    /// The mark of this write's commits.
+    pub(crate) fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    pub(crate) fn tables(&self) -> Vec<Commit> {
+        self.tables
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// A key value of the primary sort key, as an array of one row and its row encoding.
 #[derive(Clone)]
 struct Bound {
@@ -505,8 +565,8 @@ impl Planner<'_> {
 }
 
 impl Lake {
-    /// Creates the index and metadata tables of a lake in `store` where they are missing, as
-    /// `GammaFeatureLake.initialize` does, and opens it.
+    /// Creates the index, metadata and transaction log tables of a lake in `store` where they
+    /// are missing, as `GammaFeatureLake.initialize` does, and opens it.
     ///
     /// `index_schema` holds the sort keys; it must contain `options.primary_sort_key`.
     pub fn create_with_store(
@@ -585,6 +645,10 @@ impl Lake {
                     ),
                 ])),
             ),
+            (
+                options.transaction_log_path.as_str(),
+                crate::transaction::schema(),
+            ),
         ];
         block_on(async {
             for (name, schema) in tables {
@@ -614,10 +678,18 @@ impl Lake {
     ///
     /// Writes to one lake are serialized within this process. Writers in other processes
     /// must not run at the same time, and readers may observe a write half done. A commit to
-    /// a table that another writer changed after this write read it fails; the write returns
-    /// [`Error::Conflict`] when nothing was committed yet, and [`Error::Write`] otherwise.
-    /// A write that adds no index rows does not commit to the index, so it can miss keys
-    /// added by a concurrent writer without failing.
+    /// a table that another writer changed after this write read it fails with
+    /// [`Error::Conflict`]. A write that adds no index rows does not commit to the index, so
+    /// it can miss keys added by a concurrent writer without failing.
+    ///
+    /// Each write that passes validation is a transaction in the transaction log, as in
+    /// `GammaFeatureLake`: `pending`, then `success`. A write that fails after committing a
+    /// table is logged `failed`, each table it committed to is restored to the version it
+    /// read, newest commit first, and it is logged `rolled_back`; the write then fails as one
+    /// that committed nothing does. Tables it created are left in place, unreferenced.
+    /// Restoring a table another writer committed to since would undo that commit too, so
+    /// then nothing is restored and the write returns an [`Error::Write`] that says so; a
+    /// restore that fails is an [`Error::Write`] too. Either leaves the transaction `failed`.
     pub fn add(&self, input: Vec<RecordBatch>, options: &AddOptions) -> Result<()> {
         if let Some(params) = &options.feature_params {
             if !matches!(
@@ -653,7 +725,8 @@ impl Lake {
     }
 
     /// Adds keys to the index without features, as `GammaFeatureLake.add_index_rows` does.
-    /// Non-key columns of `input` are ignored.
+    /// Non-key columns of `input` are ignored. Transactions are logged and rolled back as in
+    /// [`Lake::add`], with the owner and signal type of [`AddOptions::default`].
     pub fn add_index_rows(&self, input: Vec<RecordBatch>) -> Result<()> {
         let keys = self.sort_keys.clone();
         let input = input
@@ -675,15 +748,31 @@ impl Lake {
     fn write(&self, input: Vec<RecordBatch>, options: Option<&AddOptions>) -> Result<()> {
         let lock = write_lock(self.store.location());
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        // Plan (read and build every batch), commit, then annotate the committed versions, all as
+        // one logged transaction that undoes its commits if it fails. The trailing `?` unwraps
+        // block_on's own Result, returning the block's Result.
         block_on(async {
             let (actions, index, metadata) = self.plan(input, options).await?;
-            let committed = commit(self, actions, Some(index), metadata).await?;
-            match options {
-                Some(options) if !options.annotations.is_empty() => {
-                    self.annotate_locked(&options.annotations, committed).await
+            let defaults = AddOptions::default();
+            let logged = options.unwrap_or(&defaults);
+            let commits = Commits::default();
+            let body = async {
+                let committed = commit(self, actions, Some(index), metadata, &commits).await?;
+                // `Some(options) if ...` is a pattern with a guard; `_` covers None and empty
+                // annotations.
+                match options {
+                    Some(options) if !options.annotations.is_empty() => {
+                        let annotations = &options.annotations;
+                        self.annotate_locked(annotations, committed.clone(), &commits)
+                            .await?
+                    }
+                    _ => {}
                 }
-                _ => Ok(()),
-            }
+                Ok(committed)
+            };
+            let signal_type = logged.signal_type.as_str();
+            self.transaction(&logged.owner, signal_type, &commits, body)
+                .await
         })?
     }
 
@@ -1232,11 +1321,18 @@ impl Planner<'_> {
     }
 }
 
-async fn run(action: Action, store: &dyn TableStore, keys: &[String]) -> Result<()> {
+async fn run(
+    action: Action,
+    store: &dyn TableStore,
+    keys: &[String],
+    commits: &Commits,
+) -> Result<()> {
     match action {
-        Action::Append { table, batch, .. } => {
+        Action::Append { addr, table, batch } => {
             if batch.num_rows() > 0 {
-                table.append(batch).await?;
+                let table = commits.tagged(table);
+                let read = table.version();
+                commits.count(&addr, read, table.append(batch).await)?;
             }
         }
         Action::Create { addr, batch } => {
@@ -1246,11 +1342,15 @@ async fn run(action: Action, store: &dyn TableStore, keys: &[String]) -> Result<
             store.create(&addr, batch, &options).await?;
         }
         Action::Merge {
+            addr,
             table,
             source,
             features,
-            ..
-        } => table.merge(source, keys, &features).await?,
+        } => {
+            let table = commits.tagged(table);
+            let read = table.version();
+            commits.count(&addr, read, table.merge(source, keys, &features).await)?;
+        }
     }
     Ok(())
 }
@@ -1272,21 +1372,21 @@ fn written(error: Error, committed: &mut Vec<String>) -> Error {
 }
 
 /// Commits the feature tables concurrently, then the index, then the metadata tables, and
-/// returns the addresses of the tables committed. A failure is an [`Error::Write`], unless
-/// nothing was committed and every failure was a conflict; the first conflict is then
-/// returned as is. Other errors may come after a commit, so they never count as conflicts.
+/// returns the addresses of the tables committed, counting the commits in `commits`. A
+/// failure is an [`Error::Write`], unless nothing was committed and every failure was a
+/// conflict; the first conflict is then returned as is. Other errors may come after a
+/// commit, so they never count as conflicts, and are reported ahead of them.
 pub(crate) async fn commit(
     lake: &Lake,
     actions: Vec<Action>,
     index: Option<Action>,
     metadata: Vec<Action>,
+    commits: &Commits,
 ) -> Result<Vec<String>> {
     let run = |action: Action| async move {
         let addr = action.addr().to_string();
-        (
-            addr,
-            run(action, lake.store.as_ref(), &lake.sort_keys).await,
-        )
+        let result = run(action, lake.store.as_ref(), &lake.sort_keys, commits).await;
+        (addr, result)
     };
     let mut committed = vec![];
     let mut failure = None;
@@ -1296,8 +1396,12 @@ pub(crate) async fn commit(
             Ok(()) => committed.push(addr),
             Err(e) => {
                 let e = written(e, &mut committed);
-                only_conflicts &= matches!(e, Error::Conflict { .. });
-                if failure.is_none() {
+                let conflict = matches!(e, Error::Conflict { .. });
+                only_conflicts &= conflict;
+                // A conflict is reported only when every failure was one, so that a rolled
+                // back write fails as a conflict only when retrying it can succeed.
+                let conflicted = matches!(failure, Some((_, Error::Conflict { .. })));
+                if failure.is_none() || (!conflict && conflicted) {
                     failure = Some((format!("writing table {addr}"), e));
                 }
             }
@@ -1378,7 +1482,7 @@ mod tests {
                 .set_column_metadata("ts", HashMap::from([("k".into(), "v".into())]))
                 .await
                 .unwrap();
-            let error = commit(&lake, actions, Some(index), metadata)
+            let error = commit(&lake, actions, Some(index), metadata, &Commits::default())
                 .await
                 .unwrap_err();
             let index = lake.read_batch(&lake.options.index_path).await.unwrap();
@@ -1592,11 +1696,14 @@ mod tests {
                     batch: mismatched,
                 },
             ];
-            let error = commit(&lake, actions, None, vec![]).await.unwrap_err();
+            let error = commit(&lake, actions, None, vec![], &Commits::default())
+                .await
+                .unwrap_err();
             let Error::Write { source, .. } = &error else {
                 panic!("{error}");
             };
-            assert!(matches!(**source, Error::Conflict { .. }), "{error}");
+            // The other failure is reported, so that a rolled back write is not retried.
+            assert!(!matches!(**source, Error::Conflict { .. }), "{error}");
         })
         .unwrap()
     }

@@ -19,7 +19,7 @@ use crate::runtime::block_on;
 use crate::store::StoredTable;
 use crate::write::{
     assemble, cast_into, commit, coverage_values, integrity, new_table_addr, now_micros,
-    write_lock, Action,
+    write_lock, Action, Commits,
 };
 
 /// A column of a table and the metadata keys to set on it.
@@ -73,7 +73,7 @@ fn stored(row: &FeatureRow) -> Option<&str> {
 }
 
 /// `error` as a [`Error::Write`] when tables were already committed.
-fn after(phase: String, committed: Vec<String>, error: Error) -> Error {
+pub(crate) fn after(phase: String, committed: Vec<String>, error: Error) -> Error {
     match error {
         Error::Write {
             committed: more,
@@ -102,14 +102,16 @@ impl Lake {
     pub fn annotate(&self, annotations: &[Annotation]) -> Result<()> {
         let lock = write_lock(self.store.location());
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        block_on(self.annotate_locked(annotations, vec![]))?
+        block_on(self.annotate_locked(annotations, vec![], &Commits::default()))?
     }
 
-    /// [`Lake::annotate`] with the write lock held, after `committed` tables were written.
+    /// [`Lake::annotate`] with the write lock held, after `committed` tables were written,
+    /// counting its commits in `commits`.
     pub(crate) async fn annotate_locked(
         &self,
         annotations: &[Annotation],
         committed: Vec<String>,
+        commits: &Commits,
     ) -> Result<()> {
         let phase = "annotating features".to_string();
         let annotations: Vec<&Annotation> = annotations
@@ -197,9 +199,14 @@ impl Lake {
             .await
             .map_err(|e| after(phase.clone(), committed.clone(), e))?;
         let mut committed = committed;
-        for (addr, mut table, columns) in opened {
+        // table version (`next`), which the following commit must build on. Every
+        // commit is tagged with the write's transaction id.
+        for (addr, table, columns) in opened {
+            let mut table = commits.tagged(table);
             for (column, metadata) in columns {
-                match table.set_column_metadata(&column, metadata).await {
+                let read = table.version();
+                let result = table.set_column_metadata(&column, metadata).await;
+                match commits.count(&addr, read, result) {
                     Ok(next) => table = next,
                     Err(e) => {
                         return Err(after(format!("annotating table {addr}"), committed, e));
@@ -497,6 +504,7 @@ impl Lake {
                         batch: fm_batch,
                     },
                 ],
+                &Commits::default(),
             )
             .await
         })??;

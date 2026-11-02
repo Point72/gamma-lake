@@ -79,8 +79,8 @@ class ConflictError(RuntimeError):
 class PartialWriteError(RuntimeError):
     """A write failed after some of its tables may have committed.
 
-    ``committed`` names the tables that did; ``phase`` names the step that failed. When a
-    lock failed, its exception is the ``__cause__``.
+    ``committed`` names the tables that did, and is empty when the write was rolled back;
+    ``phase`` names the step that failed. When a lock failed, its exception is the ``__cause__``.
     """
 
     def __init__(self, message: str, phase: str, committed: list[str]):
@@ -337,9 +337,17 @@ class NativeLake:
     to an object store without atomic commits need one. The lock serialises commits; it does
     not make a whole write atomic, so writers that extend the index concurrently must be
     coordinated by the caller. Reads take no lock. An exception raised by the lock propagates
-    unchanged, unless a table of the write may already have committed: then it is the
+    unchanged, unless part of the write committed and was not rolled back: then it is the
     ``__cause__`` of a :class:`PartialWriteError`. A table whose lock failed to release after
     its commit counts as committed.
+
+    Each write appends ``pending`` and then ``success`` or ``failed`` rows to the transaction
+    log at ``transaction_log_path``, created on the first write when missing. A write that
+    fails after committing part of itself undoes its commits, which are marked with its
+    transaction id, on each table it committed to, keeping other writers' commits; it logs
+    ``rolled_back`` and then fails as a write that committed nothing does. Tables it created
+    are left in place, unreferenced. It is left ``failed``, naming the tables that may hold
+    it, when an undo fails, as when another writer rewrote rows the write committed.
 
     By default a read sorts each table it reads in memory. With ``memory_limit`` set, the
     tables of a read share that many bytes for sorting and spill to the system temporary
@@ -368,6 +376,7 @@ class NativeLake:
         runtime_computed_features: bool = False,
         lock: LockFactory | None = None,
         memory_limit: int | None = None,
+        transaction_log_path: str = "transaction_log",
     ):
         delta_options = delta_options or DeltaOptions()
         lake = _native.Lake(
@@ -384,6 +393,7 @@ class NativeLake:
             storage_options=delta_options.storage_options or None,
             lock=lock,
             memory_limit=memory_limit,
+            transaction_log_path=transaction_log_path,
         )
         self._init(lake, runtime_computed_features)
 
@@ -647,6 +657,16 @@ class NativeLake:
         """:meth:`table_metadata` as a ``LazyFrame``. Filters applied to it later are pushed into the scan."""
         schema = _schema(self._lake.table_metadata_schema())
         return _scan(schema, lambda _, dnf: self._lake.table_metadata(dnf), _terms(filters, schema), schema, list(schema))
+
+    def transaction_log(self, filters=None) -> pl.DataFrame:
+        """Rows of the transaction log; none when the lake has no log yet."""
+        schema = _schema(self._lake.transaction_log_schema())
+        return _from_stream(self._lake.transaction_log(_dnf(_terms(filters, schema))))
+
+    def scan_transaction_log(self, filters=None) -> pl.LazyFrame:
+        """:meth:`transaction_log` as a ``LazyFrame``. Filters applied to it later are pushed into the scan."""
+        schema = _schema(self._lake.transaction_log_schema())
+        return _scan(schema, lambda _, dnf: self._lake.transaction_log(dnf), _terms(filters, schema), schema, list(schema))
 
     def latest_features(self) -> pl.DataFrame:
         """The latest version of every feature, one metadata row each."""

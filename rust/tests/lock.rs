@@ -157,6 +157,7 @@ fn every_commit_holds_the_lock_on_its_table_and_reads_take_none() {
             location("index"),
             location("feature_metadata"),
             location("table_metadata"),
+            location("transaction_log"),
         ]);
         assert_eq!(BTreeSet::from_iter(acquired(&lock)), metadata);
 
@@ -275,18 +276,21 @@ fn a_table_has_one_lock_target_however_its_lake_is_named() {
 
 #[test]
 fn a_failed_release_after_a_commit_counts_the_table_as_committed() {
-    // The first table a write commits, and a later one.
+    // The first table a write commits, and a later one. The rollback restores them, and
+    // fails to release them again.
     for (fails, expected) in [("delta_", 1), ("/index", 2)] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap();
-        gamma_lake::create(delta_store(path), index_schema(), options(&Arc::default())).unwrap();
+        let lake = gamma_lake::create(delta_store(path), index_schema(), options(&Arc::default()))
+            .unwrap();
+        add(&lake, frame(&[1, 2], "f"), OverlapMode::Copy);
         let lock = Arc::new(RecordingLock {
             fail_release: Some(fails),
             ..Default::default()
         });
         let lake = gamma_lake::open(delta_store(path), options(&lock)).unwrap();
         let err = lake
-            .add(vec![frame(&[1, 2], "f")], &AddOptions::default())
+            .add(vec![frame(&[3], "f")], &AddOptions::default())
             .unwrap_err();
         let Error::Write {
             committed, source, ..
@@ -298,6 +302,7 @@ fn a_failed_release_after_a_commit_counts_the_table_as_committed() {
         assert!(committed[0].starts_with("delta_"), "{err}");
         assert!(matches!(**source, Error::Lock { .. }), "{err}");
         assert!(err.to_string().contains("cannot unlock"), "{err}");
+        assert!(err.to_string().contains("rolling back a write"), "{err}");
         acquired(&lock);
     }
 }

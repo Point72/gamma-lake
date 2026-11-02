@@ -4,7 +4,7 @@
 //! store URL, for use with [`Lake::open_with_store`](gamma_lake_core::Lake::open_with_store)
 //! and [`Lake::create_with_store`](gamma_lake_core::Lake::create_with_store).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -19,20 +19,22 @@ use deltalake::datafusion::common::{Column, TableReference};
 use deltalake::datafusion::logical_expr::{cast as cast_expr, Expr};
 use deltalake::datafusion::prelude::{DataFrame, SessionContext};
 use deltalake::delta_datafusion::{DeltaColumn, DeltaSessionContext};
-use deltalake::kernel::transaction::{CommitProperties, TransactionError};
-use deltalake::kernel::MetadataValue;
+use deltalake::kernel::transaction::{CommitBuilder, CommitProperties, TransactionError};
+use deltalake::kernel::{Action, Metadata, MetadataValue};
+use deltalake::logstore::get_actions;
 use deltalake::logstore::object_store::ObjectStoreExt;
 use deltalake::parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
-use deltalake::protocol::SaveMode;
-use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError};
+use deltalake::protocol::{DeltaOperation, SaveMode};
+use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, Path as StorePath};
 use futures::StreamExt;
 use gamma_lake_core::runtime::threads;
 use gamma_lake_core::store::{
-    before_first_commit, extends, segments, version_at, CreateOptions, StoredTable, TableScan,
-    TableStore,
+    before_first_commit, entangled, extends, segments, version_at, CreateOptions, StoredTable,
+    TableScan, TableStore,
 };
 use gamma_lake_core::{Dnf, Error, Result};
+use serde_json::Value;
 use url::Url;
 
 /// Options of a [`DeltaStore`].
@@ -132,9 +134,33 @@ fn scan_frame(
     Ok((frame.select(expressions)?, schema))
 }
 
-/// Commits that fail rather than retry on top of a newer version.
-fn strict() -> CommitProperties {
-    CommitProperties::default().with_max_retries(0)
+/// Key of a commit's `commitInfo` holding the mark of [`StoredTable::tag_commits`].
+const TAG: &str = "gammaLakeTag";
+/// Key of a commit's `commitInfo` holding the mark whose commits it undid.
+const REVERTS: &str = "gammaLakeReverts";
+
+/// Commits that fail rather than retry on top of a newer version, with `info` in their
+/// `commitInfo`.
+fn strict(info: Option<(&str, &str)>) -> CommitProperties {
+    let properties = CommitProperties::default().with_max_retries(0);
+    match info {
+        Some((key, value)) => properties.with_metadata([(key.to_string(), value.into())]),
+        None => properties,
+    }
+}
+
+/// The column names of the schema `metadata` sets.
+fn columns(metadata: &Metadata) -> Result<Vec<String>> {
+    let invalid = |e: serde_json::Error| Error::Store(Box::new(e));
+    let metadata = serde_json::to_value(metadata).map_err(invalid)?;
+    let schema = metadata["schemaString"].as_str().unwrap_or("{}");
+    let schema: Value = serde_json::from_str(schema).map_err(invalid)?;
+    Ok(schema["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["name"].as_str().map(str::to_string))
+        .collect())
 }
 
 /// `e`, from a commit to table `name`, as [`Error::Conflict`] when another commit came first.
@@ -403,6 +429,7 @@ impl TableStore for DeltaStore {
             schema,
             properties: self.properties.clone(),
             target_file_size: self.target_file_size,
+            tag: None,
         })))
     }
 
@@ -483,6 +510,14 @@ struct DeltaStored {
     schema: SchemaRef,
     properties: WriterProperties,
     target_file_size: u64,
+    tag: Option<String>,
+}
+
+impl DeltaStored {
+    /// [`strict`] properties marking the commit with [`DeltaStored::tag`].
+    fn committing(&self) -> CommitProperties {
+        strict(self.tag.as_deref().map(|tag| (TAG, tag)))
+    }
 }
 
 #[async_trait]
@@ -515,13 +550,14 @@ impl StoredTable for DeltaStored {
     }
 
     async fn append(self: Box<Self>, batch: RecordBatch) -> Result<()> {
+        let committing = self.committing();
         self.table
             .write(vec![as_view_types(batch)?])
             .with_save_mode(SaveMode::Append)
             .with_session_state(delta_session()?)
             .with_writer_properties(self.properties)
             .with_target_file_size(NonZeroU64::new(self.target_file_size))
-            .with_commit_properties(strict())
+            .with_commit_properties(committing)
             .await
             .map_err(|e| commit_err(&self.name, e))?;
         Ok(())
@@ -529,6 +565,7 @@ impl StoredTable for DeltaStored {
 
     async fn append_merging(self: Box<Self>, batch: RecordBatch) -> Result<()> {
         extends(&self.schema, batch.schema_ref(), &self.name)?;
+        let committing = self.committing();
         self.table
             .write(vec![as_view_types(batch)?])
             .with_save_mode(SaveMode::Append)
@@ -536,7 +573,7 @@ impl StoredTable for DeltaStored {
             .with_session_state(delta_session()?)
             .with_writer_properties(self.properties)
             .with_target_file_size(NonZeroU64::new(self.target_file_size))
-            .with_commit_properties(strict())
+            .with_commit_properties(committing)
             .await
             .map_err(|e| commit_err(&self.name, e))?;
         Ok(())
@@ -561,13 +598,14 @@ impl StoredTable for DeltaStored {
             .collect();
         let source = delta_context(&[])?.read_batch(source)?;
         let plain = |name: &str| DeltaColumn::from(Column::new_unqualified(name));
+        let committing = self.committing();
         self.table
             .merge(source, predicate)
             .with_session_state(delta_merge_session()?)
             .with_source_alias("source")
             .with_target_alias("target")
             .with_writer_properties(self.properties)
-            .with_commit_properties(strict())
+            .with_commit_properties(committing)
             .when_matched_update(|mut u| {
                 for f in update {
                     u = u.update(plain(f), column("source", f));
@@ -599,12 +637,13 @@ impl StoredTable for DeltaStored {
             .into_iter()
             .map(|(k, v)| (k, MetadataValue::String(v)))
             .collect();
+        let committing = self.committing();
         let table = self
             .table
             .update_field_metadata()
             .with_field_name(column)
             .with_metadata(metadata)
-            .with_commit_properties(strict())
+            .with_commit_properties(committing)
             .await
             .map_err(|e| commit_err(&self.name, e))?;
         let schema = table
@@ -618,6 +657,7 @@ impl StoredTable for DeltaStored {
             schema,
             properties: self.properties,
             target_file_size: self.target_file_size,
+            tag: self.tag,
         }))
     }
 
@@ -650,6 +690,167 @@ impl StoredTable for DeltaStored {
             .with_version_to_restore(version)
             .await
             .map_err(|e| commit_err(&self.name, e))?;
+        Ok(true)
+    }
+
+    fn version(&self) -> Option<u64> {
+        self.table.version()
+    }
+
+    fn tag_commits(&mut self, tag: &str) {
+        self.tag = Some(tag.to_string());
+    }
+
+    async fn revert(self: Box<Self>, tag: &str, since: u64) -> Result<bool> {
+        let name = &self.name;
+        let latest = self.table.version().unwrap_or(since);
+        let log_store = self.table.log_store();
+        // The commits from the first one marked `tag`, oldest first, with whether each is.
+        let mut commits = vec![];
+        let mut undone = false;
+        for version in since + 1..=latest {
+            let bytes = log_store
+                .read_commit_entry(version)
+                .await
+                .map_err(delta_err)?
+                .ok_or_else(|| {
+                    Error::Store(
+                        format!("table {name} has no log entry for version {version}").into(),
+                    )
+                })?;
+            let actions = get_actions(version, &bytes).map_err(delta_err)?;
+            let marked = |key: &str| {
+                actions.iter().any(|a| {
+                    matches!(a, Action::CommitInfo(info)
+                        if info.info.get(key).and_then(Value::as_str) == Some(tag))
+                })
+            };
+            let (ours, reverts) = (marked(TAG), marked(REVERTS));
+            if reverts {
+                // An earlier revert, whose result was lost, undid the commits before it.
+                commits.clear();
+                undone = true;
+            } else if ours || !commits.is_empty() {
+                commits.push((version, ours, actions));
+            }
+        }
+        let Some(&(first, ..)) = commits.first() else {
+            return Ok(undone);
+        };
+        let base = first - 1;
+        let properties = strict(Some((REVERTS, tag)));
+        if commits.iter().all(|(_, ours, _)| *ours) {
+            self.table
+                .restore()
+                .with_version_to_restore(base)
+                .with_commit_properties(properties)
+                .await
+                .map_err(|e| commit_err(name, e))?;
+            return Ok(true);
+        }
+        let load = |version: u64| {
+            let mut table = self.table.clone();
+            async move {
+                table.load_version(version).await.map_err(delta_err)?;
+                Ok::<_, Error>(table)
+            }
+        };
+        let base_table = load(base).await?;
+        let base_metadata = base_table.snapshot().map_err(delta_err)?.metadata().clone();
+        // Log paths are already percent-decoded; key them as `object_store_path` does.
+        let path = |p: &str| StorePath::parse(p).unwrap_or_else(|_| StorePath::from(p));
+        // The files the marked commits added and removed, with the version that removed each,
+        // and whether they changed the metadata and its columns.
+        let mut added = HashSet::new();
+        let mut removed: Vec<(StorePath, u64)> = vec![];
+        let (mut reschemed, mut recolumned) = (false, false);
+        // The first commit not marked that changed the metadata.
+        let mut rescheming = None;
+        let mut columns_now = columns(&base_metadata)?;
+        for (version, ours, actions) in &commits {
+            for action in actions {
+                match action {
+                    Action::Add(add) if *ours => {
+                        let file = path(&add.path);
+                        match removed.iter().position(|(r, _)| *r == file) {
+                            Some(i) => {
+                                removed.remove(i);
+                            }
+                            None => {
+                                added.insert(file);
+                            }
+                        }
+                    }
+                    Action::Remove(remove) if *ours => {
+                        let file = path(&remove.path);
+                        if !added.remove(&file) {
+                            removed.push((file, *version));
+                        }
+                    }
+                    Action::Remove(remove) if added.contains(&path(&remove.path)) => {
+                        return Err(entangled(name, *version));
+                    }
+                    // Its rows may fill columns the marked commits added.
+                    Action::Add(_) if recolumned => return Err(entangled(name, *version)),
+                    Action::Metadata(metadata) => {
+                        let columns = columns(metadata)?;
+                        if *ours {
+                            reschemed = true;
+                            recolumned |= columns != columns_now;
+                        } else {
+                            rescheming.get_or_insert(*version);
+                        }
+                        columns_now = columns;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(version) = rescheming.filter(|_| reschemed) {
+            return Err(entangled(name, version));
+        }
+        let snapshot = self.table.snapshot().map_err(delta_err)?;
+        let current: HashMap<_, _> = snapshot
+            .log_data()
+            .iter()
+            .map(|file| (file.object_store_path(), file))
+            .collect();
+        let mut actions = vec![];
+        for file in &added {
+            let file = current.get(file).ok_or_else(|| {
+                Error::Store(format!("table {name} has lost file {file} this write added").into())
+            })?;
+            actions.push(Action::Remove(file.remove_action(true)));
+        }
+        // Files the marked commits removed, as the version before each such commit held them.
+        let mut versions: Vec<u64> = removed.iter().map(|(_, v)| *v).collect();
+        versions.dedup();
+        for version in versions {
+            let before = load(version - 1).await?;
+            for file in before.snapshot().map_err(delta_err)?.log_data().iter() {
+                let path = file.object_store_path();
+                if removed.contains(&(path.clone(), version)) && !current.contains_key(&path) {
+                    #[allow(deprecated)]
+                    let mut add = file.add_action();
+                    add.data_change = true;
+                    actions.push(Action::Add(add));
+                }
+            }
+        }
+        if reschemed {
+            actions.push(Action::Metadata(base_metadata));
+        }
+        if !actions.is_empty() {
+            let operation = DeltaOperation::Restore {
+                version: Some(base),
+                datetime: None,
+            };
+            CommitBuilder::from(properties)
+                .with_actions(actions)
+                .build(Some(snapshot), log_store, operation)
+                .await
+                .map_err(|e| commit_err(name, e))?;
+        }
         Ok(true)
     }
 }
@@ -735,6 +936,97 @@ mod tests {
                 .sum();
             assert_eq!(rows, 6);
             assert!(open().await.restore(0).await.is_err());
+        });
+    }
+
+    #[test]
+    fn revert_undoes_only_the_tagged_commits() {
+        use deltalake::arrow::array::{ArrayRef, Int64Array};
+        use deltalake::arrow::datatypes::Field;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = DeltaStore::new(dir.path().to_str().unwrap(), DeltaOptions::default()).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = |k: &[i64], v: i64| {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(k.to_vec())),
+                Arc::new(Int64Array::from(vec![v; k.len()])),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        let (keys, update) = (["k".to_string()], ["v".to_string()]);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let open = || async { store.open("t").await.unwrap().unwrap() };
+            let tagged = |tag: &'static str| async move {
+                let mut table = open().await;
+                table.tag_commits(tag);
+                table
+            };
+            let rows = || async {
+                let scan = open()
+                    .await
+                    .scan(None, &Dnf::default(), 1024)
+                    .await
+                    .unwrap();
+                let batches: Vec<RecordBatch> = scan.stream.try_collect().await.unwrap();
+                let column = |b: &RecordBatch, i| {
+                    let array = b.column(i).as_any().downcast_ref::<Int64Array>().unwrap();
+                    array.values().to_vec()
+                };
+                let mut rows: Vec<(i64, i64)> = batches
+                    .iter()
+                    .flat_map(|b| column(b, 0).into_iter().zip(column(b, 1)))
+                    .collect();
+                rows.sort();
+                rows
+            };
+            store
+                .create("t", batch(&[0], 0), &CreateOptions::default())
+                .await
+                .unwrap();
+
+            // Only the write's commits follow the read, so the table is restored.
+            tagged("a").await.append(batch(&[1], 0)).await.unwrap();
+            assert!(open().await.revert("a", 0).await.unwrap());
+            assert_eq!(rows().await, [(0, 0)]);
+            // Reverting again, as after a revert whose outcome was lost, commits nothing.
+            assert!(open().await.revert("a", 0).await.unwrap());
+            assert_eq!(open().await.version(), Some(2));
+            assert!(!open().await.revert("unused", 0).await.unwrap());
+
+            // Another writer's commits before and after the write's are kept, and the file
+            // the write rewrote is restored.
+            open().await.append(batch(&[2], 0)).await.unwrap();
+            let merging = tagged("b").await;
+            merging
+                .merge(batch(&[0, 3], 1), &keys, &update)
+                .await
+                .unwrap();
+            let annotating = tagged("b").await;
+            let metadata = HashMap::from([("unit".to_string(), "s".to_string())]);
+            annotating.set_column_metadata("v", metadata).await.unwrap();
+            open().await.append(batch(&[4], 0)).await.unwrap();
+            assert!(open().await.revert("b", 2).await.unwrap());
+            assert_eq!(rows().await, [(0, 0), (2, 0), (4, 0)]);
+            let reverted = open().await;
+            assert!(reverted.schema().field(1).metadata().is_empty());
+
+            // Another writer rewrote the write's rows, so it cannot be undone alone.
+            let read = reverted.version().unwrap();
+            tagged("c").await.append(batch(&[5], 0)).await.unwrap();
+            open()
+                .await
+                .merge(batch(&[5], 2), &keys, &update)
+                .await
+                .unwrap();
+            let err = open().await.revert("c", read).await.unwrap_err();
+            let expected = format!("version {} of table t", read + 2);
+            assert!(err.to_string().contains(&expected), "{err}");
+            assert_eq!(rows().await, [(0, 0), (2, 0), (4, 0), (5, 2)]);
         });
     }
 

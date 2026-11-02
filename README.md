@@ -231,9 +231,9 @@ metadata becomes visible only after the feature and index writes succeed. Each c
 lake from a single process run one at a time.
 
 A write commits to a table only if the table has not changed since the write read it. If another process committed to
-it in between, the write stops there: it raises
-`ConflictError` when nothing was committed yet, and the lake is unchanged, so the write can be run again. If other
-tables of the write were already committed, it raises `PartialWriteError` instead, and the lake holds part of the
+it in between, the write stops there and the tables it already committed to are
+[rolled back](#transactions-and-rollback): it raises `ConflictError`, and the lake is unchanged, so the write can be
+run again. If the rollback cannot complete, it raises `PartialWriteError` instead, and the lake holds part of the
 write.
 
 A write is checked only against the tables it commits to. A write that adds no index rows, and
@@ -263,9 +263,9 @@ def table_lock(table: str) -> FileLock:
 lake = GammaFeatureLake(base_path="s3://my-bucket/features", lock=table_lock)
 ```
 
-An exception raised by the lock propagates unchanged. If a table of the same write may already have committed, a
-`PartialWriteError` is raised instead, with the lock's exception as its cause. A table whose lock failed to release
-after its commit counts as committed.
+An exception raised by the lock propagates unchanged once the write is rolled back. If part of the write committed and
+could not be rolled back, a `PartialWriteError` is raised instead, with the lock's exception as its cause. A table
+whose lock failed to release after its commit counts as committed, and is rolled back with the others.
 
 ### Metadata and versioning
 
@@ -288,12 +288,20 @@ version explicitly.
 
 ### Transactions and rollback
 
-Each write (`add_features`, `add_targets`, and the other `add_*` methods) is recorded in the append-only
-`transaction_log` table as `pending`, then `success`. A transaction's current status is its row with the latest
-`updated_at`. If a write fails, it is recorded as `failed`, the lake is restored to its state when the write started with
-`restore_to_timestamp`, and it is recorded as `rolled_back`. A transaction that stays `failed` or `pending` was not
-rolled back, and `restore_to_timestamp(started_at)` recovers the lake. Rollback inherits the limits of
-`restore_to_timestamp`, such as assuming no concurrent writers.
+Each `add_*` write of rows is recorded in the append-only `transaction_log` table as `pending`, then `success`. A
+transaction's current status is its row with the latest `updated_at`. If a write fails after committing to some
+tables, it is recorded as `failed`, its commits are undone on each table it committed to, and it is recorded as
+`rolled_back`; the write then fails as if it had committed nothing. Tables it created are left in place,
+unreferenced, so reads never see them.
+
+Each commit of a write is marked with its transaction id, so rollback finds exactly the write's commits in each
+table's log, including one that failed after it landed, and does not depend on clocks. When only the write's commits
+follow the version it read, the table is restored to that version. Otherwise rollback commits their inverse, which
+keeps other writers' commits. If another writer rewrote or deleted rows the write committed, or changed the schema of
+a table whose schema the write changed, undoing the write would undo that commit too, so the write is not rolled back:
+it stays `failed` and raises `PartialWriteError` naming the tables that may hold it, which `restore_to_timestamp` can
+recover. Other operations, such as `annotate`, `consolidate_feature_groups` and the runtime-feature methods, are not
+logged.
 
 ## Documentation
 

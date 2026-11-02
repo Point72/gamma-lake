@@ -120,6 +120,49 @@ pub trait StoredTable: Send + Sync {
     /// in microseconds since the Unix epoch. Does nothing and returns `false` when that is
     /// already this version. Fails when every version is newer than `at`.
     async fn restore(self: Box<Self>, at: i64) -> Result<bool>;
+
+    /// This version's number: 0 for the table's first version, then one more per commit, or
+    /// `None` when the store does not number versions. A lake rolls back a failed write only
+    /// on tables whose versions are numbered.
+    fn version(&self) -> Option<u64> {
+        None
+    }
+
+    /// Marks the commits made through this handle, and through the handle
+    /// [`StoredTable::set_column_metadata`] returns, with `tag`, so that
+    /// [`StoredTable::revert`] can find them. Stores that cannot mark commits ignore it.
+    fn tag_commits(&mut self, _tag: &str) {}
+
+    /// Undoes the commits marked `tag` made after version `since`, keeping every other
+    /// commit, in one commit on this version, and returns whether any were undone, now or by
+    /// an earlier revert of `tag`. Fails with [`entangled`], without committing, when another
+    /// commit rewrote what a marked one wrote, since undoing the marked one would undo it too.
+    /// Stores that do not number versions cannot.
+    async fn revert(self: Box<Self>, tag: &str, since: u64) -> Result<bool> {
+        let _ = (tag, since);
+        Err(Error::InvalidArgument(
+            "this store does not number versions, so it cannot undo commits".into(),
+        ))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "version {version} of table {table}, another writer's, rewrote what this write committed, \
+     so undoing this write would undo that version too"
+)]
+pub(crate) struct Entangled {
+    table: String,
+    version: u64,
+}
+
+/// The error of [`StoredTable::revert`] on table `table`, whose commit `version`, not one to
+/// undo, rewrote what one to undo wrote.
+pub fn entangled(table: &str, version: u64) -> Error {
+    Error::Store(Box::new(Entangled {
+        table: table.to_string(),
+        version,
+    }))
 }
 
 /// The newest of versions `earliest..=latest` committed at or before `at`, given each
@@ -222,11 +265,13 @@ impl MemoryStore {
         self.tables.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Replaces version `base` of `name` with `f` of it, if `base` is still the latest.
+    /// Replaces version `base` of `name` with `f` of it, marked `tag`, if `base` is still the
+    /// latest.
     fn commit(
         &self,
         name: &str,
         base: &Arc<MemoryVersion>,
+        tag: Option<&str>,
         f: impl FnOnce(&MemoryVersion) -> Result<(SchemaRef, Vec<RecordBatch>)>,
     ) -> Result<Arc<MemoryVersion>> {
         let mut tables = self.tables();
@@ -243,7 +288,9 @@ impl MemoryStore {
         let version = Arc::new(MemoryVersion {
             schema,
             batches,
+            number: latest.number + 1,
             committed: now_micros(),
+            tag: tag.map(str::to_string),
             previous: Some(latest),
         });
         tables.insert(name.to_string(), version.clone());
@@ -262,8 +309,11 @@ fn now_micros() -> i64 {
 struct MemoryVersion {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    number: u64,
     /// Commit time in microseconds since the Unix epoch.
     committed: i64,
+    /// The mark of [`StoredTable::tag_commits`] the commit was made with.
+    tag: Option<String>,
     previous: Option<Arc<MemoryVersion>>,
 }
 
@@ -331,6 +381,7 @@ impl TableStore for MemoryStore {
                 store: self.clone(),
                 name: name.to_string(),
                 version: version.clone(),
+                tag: None,
             }) as Box<dyn StoredTable>
         }))
     }
@@ -349,7 +400,9 @@ impl TableStore for MemoryStore {
             Arc::new(MemoryVersion {
                 schema,
                 batches: vec![batch],
+                number: 0,
                 committed: now_micros(),
+                tag: None,
                 previous: None,
             }),
         );
@@ -361,6 +414,7 @@ struct MemoryStored {
     store: MemoryStore,
     name: String,
     version: Arc<MemoryVersion>,
+    tag: Option<String>,
 }
 
 #[async_trait]
@@ -433,32 +487,37 @@ impl StoredTable for MemoryStored {
 
     async fn append(self: Box<Self>, batch: RecordBatch) -> Result<()> {
         let batch = conform(&self.version.schema, batch, &self.name)?;
-        self.store.commit(&self.name, &self.version, |latest| {
-            let mut batches = latest.batches.clone();
-            batches.push(batch);
-            Ok((latest.schema.clone(), batches))
-        })?;
+        self.store
+            .commit(&self.name, &self.version, self.tag.as_deref(), |latest| {
+                let mut batches = latest.batches.clone();
+                batches.push(batch);
+                Ok((latest.schema.clone(), batches))
+            })?;
         Ok(())
     }
 
     async fn append_merging(self: Box<Self>, batch: RecordBatch) -> Result<()> {
         extends(&self.version.schema, batch.schema_ref(), &self.name)?;
-        self.store.commit(&self.name, &self.version, |latest| {
-            let schema = batch.schema();
-            let mut batches = latest
-                .batches
-                .iter()
-                .map(|old| {
-                    let mut columns = old.columns().to_vec();
-                    for field in &schema.fields()[old.num_columns()..] {
-                        columns.push(new_null_array(field.data_type(), old.num_rows()));
-                    }
-                    Ok(RecordBatch::try_new(schema.clone(), columns)?)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            batches.push(batch);
-            Ok((schema, batches))
-        })?;
+        self.store
+            .commit(&self.name, &self.version, self.tag.as_deref(), |latest| {
+                // The new schema is the batch's wider one. Every existing batch is padded with
+                // all-null arrays for the added columns (`schema.fields()[n..]` is the tail
+                // slice beyond the old column count), then the new batch is appended.
+                let schema = batch.schema();
+                let mut batches = latest
+                    .batches
+                    .iter()
+                    .map(|old| {
+                        let mut columns = old.columns().to_vec();
+                        for field in &schema.fields()[old.num_columns()..] {
+                            columns.push(new_null_array(field.data_type(), old.num_rows()));
+                        }
+                        Ok(RecordBatch::try_new(schema.clone(), columns)?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                batches.push(batch);
+                Ok((schema, batches))
+            })?;
         Ok(())
     }
 
@@ -468,10 +527,12 @@ impl StoredTable for MemoryStored {
         keys: &[String],
         update: &[String],
     ) -> Result<()> {
-        self.store.commit(&self.name, &self.version, |latest| {
-            let batches = merge_batches(&latest.schema, &latest.batches, &source, keys, update)?;
-            Ok((latest.schema.clone(), batches))
-        })?;
+        self.store
+            .commit(&self.name, &self.version, self.tag.as_deref(), |latest| {
+                let batches =
+                    merge_batches(&latest.schema, &latest.batches, &source, keys, update)?;
+                Ok((latest.schema.clone(), batches))
+            })?;
         Ok(())
     }
 
@@ -481,39 +542,44 @@ impl StoredTable for MemoryStored {
         metadata: HashMap<String, String>,
     ) -> Result<Box<dyn StoredTable>> {
         let name = self.name.clone();
-        let version = self.store.commit(&name, &self.version, |latest| {
-            let fields = latest
-                .schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    let mut f = f.as_ref().clone();
-                    if f.name() == column {
-                        f.metadata_mut().extend(metadata.clone());
-                    }
-                    f
-                })
-                .collect::<Vec<_>>();
-            if latest.schema.field_with_name(column).is_err() {
-                return Err(Error::InvalidArgument(format!(
-                    "table {name} has no column {column:?}"
-                )));
-            }
-            let schema = Arc::new(Schema::new_with_metadata(
-                fields,
-                latest.schema.metadata().clone(),
-            ));
-            let batches = latest
-                .batches
-                .iter()
-                .map(|b| conform(&schema, b.clone(), &name))
-                .collect::<Result<Vec<_>>>()?;
-            Ok((schema, batches))
-        })?;
+        let version = self
+            .store
+            .commit(&name, &self.version, self.tag.as_deref(), |latest| {
+                // Copy each field, merging `metadata` into the matching column's existing map.
+                let fields = latest
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let mut f = f.as_ref().clone();
+                        if f.name() == column {
+                            f.metadata_mut().extend(metadata.clone());
+                        }
+                        f
+                    })
+                    .collect::<Vec<_>>();
+                if latest.schema.field_with_name(column).is_err() {
+                    return Err(Error::InvalidArgument(format!(
+                        "table {name} has no column {column:?}"
+                    )));
+                }
+                // Keep the table-level metadata; rebuild every batch onto the new schema.
+                let schema = Arc::new(Schema::new_with_metadata(
+                    fields,
+                    latest.schema.metadata().clone(),
+                ));
+                let batches = latest
+                    .batches
+                    .iter()
+                    .map(|b| conform(&schema, b.clone(), &name))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((schema, batches))
+            })?;
         Ok(Box::new(MemoryStored {
             store: self.store,
             name,
             version,
+            tag: self.tag,
         }))
     }
 
@@ -524,11 +590,125 @@ impl StoredTable for MemoryStored {
         if Arc::ptr_eq(&target, &self.version) {
             return Ok(false);
         }
-        self.store.commit(&self.name, &self.version, |_| {
-            Ok((target.schema.clone(), target.batches.clone()))
-        })?;
+        self.store
+            .commit(&self.name, &self.version, self.tag.as_deref(), |_| {
+                Ok((target.schema.clone(), target.batches.clone()))
+            })?;
         Ok(true)
     }
+
+    fn version(&self) -> Option<u64> {
+        Some(self.version.number)
+    }
+
+    fn tag_commits(&mut self, tag: &str) {
+        self.tag = Some(tag.to_string());
+    }
+
+    async fn revert(self: Box<Self>, tag: &str, since: u64) -> Result<bool> {
+        // The versions after `since`, oldest first, each with the one before it.
+        let mut versions: Vec<_> = self
+            .version
+            .history()
+            .take_while(|v| v.number > since)
+            .filter_map(|v| Some((v, v.previous.as_ref()?)))
+            .collect();
+        versions.reverse();
+        let ours = |v: &MemoryVersion| v.tag.as_deref() == Some(tag);
+        let Some(first) = versions.iter().position(|(v, _)| ours(v)) else {
+            return Ok(false);
+        };
+        let versions = &versions[first..];
+        let base = versions[0].1;
+        if versions.iter().all(|(v, _)| ours(v)) {
+            self.store.commit(&self.name, &self.version, None, |_| {
+                Ok((base.schema.clone(), base.batches.clone()))
+            })?;
+            return Ok(true);
+        }
+        // A commit that keeps a batch keeps its first column.
+        let id = |b: &RecordBatch| Arc::as_ptr(b.column(0)) as *const () as usize;
+        let ids = |v: &MemoryVersion| v.batches.iter().map(id).collect::<HashSet<_>>();
+        let same_columns = |a: &Schema, b: &Schema| {
+            a.fields().len() == b.fields().len()
+                && a.fields()
+                    .iter()
+                    .zip(b.fields())
+                    .all(|(a, b)| a.name() == b.name())
+        };
+        // The batches the marked commits added and removed, and whether they changed the
+        // schema and its columns.
+        let mut added = HashSet::new();
+        let mut removed: Vec<(usize, RecordBatch)> = vec![];
+        let (mut reschemed, mut recolumned) = (false, false);
+        // The first commit not marked that changed the schema.
+        let mut rescheming = None;
+        for (v, previous) in versions {
+            let (after, before) = (ids(v), ids(previous));
+            if ours(v) {
+                for batch in &v.batches {
+                    let key = id(batch);
+                    if !before.contains(&key) && !removed.iter().any(|(k, _)| *k == key) {
+                        added.insert(key);
+                    }
+                }
+                removed.retain(|(k, _)| !after.contains(k));
+                for batch in &previous.batches {
+                    let key = id(batch);
+                    if !after.contains(&key) && !added.remove(&key) {
+                        removed.push((key, batch.clone()));
+                    }
+                }
+                reschemed |= v.schema != previous.schema;
+                recolumned |= !same_columns(&v.schema, &previous.schema);
+            } else if added.iter().any(|k| !after.contains(k))
+                // Its rows may fill columns the marked commits added.
+                || (recolumned && after.iter().any(|k| !before.contains(k)))
+            {
+                return Err(entangled(&self.name, v.number));
+            } else if v.schema != previous.schema {
+                rescheming.get_or_insert(v.number);
+            }
+        }
+        if let Some(number) = rescheming.filter(|_| reschemed) {
+            return Err(entangled(&self.name, number));
+        }
+        let schema = if reschemed {
+            base.schema.clone()
+        } else {
+            self.version.schema.clone()
+        };
+        let latest = ids(&self.version);
+        let kept = self
+            .version
+            .batches
+            .iter()
+            .filter(|b| !added.contains(&id(b)));
+        let restored = removed
+            .iter()
+            .filter(|(k, _)| !latest.contains(k))
+            .map(|(_, b)| b);
+        let batches = kept
+            .chain(restored)
+            .map(|b| fit(&schema, b))
+            .collect::<Result<Vec<_>>>()?;
+        self.store
+            .commit(&self.name, &self.version, None, |_| Ok((schema, batches)))?;
+        Ok(true)
+    }
+}
+
+/// `batch` with the columns of `schema` by name; columns it lacks are null.
+fn fit(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|f| match batch.column_by_name(f.name()) {
+            Some(column) => column.clone(),
+            None => new_null_array(f.data_type(), batch.num_rows()),
+        })
+        .collect();
+    Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
 /// The rows of `batches` with `source` merged in as [`StoredTable::merge`] describes.

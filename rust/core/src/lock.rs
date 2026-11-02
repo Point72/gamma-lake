@@ -232,6 +232,19 @@ impl StoredTable for LockingTable {
         let Self { store, name, table } = *self;
         store.commit(&name, table.restore(at)).await
     }
+
+    fn version(&self) -> Option<u64> {
+        self.table.version()
+    }
+
+    fn tag_commits(&mut self, tag: &str) {
+        self.table.tag_commits(tag);
+    }
+
+    async fn revert(self: Box<Self>, tag: &str, since: u64) -> Result<bool> {
+        let Self { store, name, table } = *self;
+        store.commit(&name, table.revert(tag, since)).await
+    }
 }
 
 #[cfg(test)]

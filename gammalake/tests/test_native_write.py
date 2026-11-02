@@ -272,7 +272,7 @@ def test_write_errors(tmp_path):
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
-def test_a_failed_commit_names_the_committed_tables(tmp_path):
+def test_a_failed_commit_is_rolled_back(tmp_path):
     lake = NativeLake.create(str(tmp_path), SCHEMA)
     lake.add_features(frame(keys([1], "a"), f=1))
     log = tmp_path / "table_metadata" / "_delta_log"
@@ -283,8 +283,11 @@ def test_a_failed_commit_names_the_committed_tables(tmp_path):
             lake.add_features(frame(keys([2], "a"), f=1))
     finally:
         log.chmod(mode)
-    assert raised.value.phase == "writing table table_metadata"
-    assert "index" in raised.value.committed
+    assert raised.value.phase == "writing table table_metadata (rolled back)"
+    assert raised.value.committed == []
+    assert lake.index().height == 1
+    assert lake.read(["f"]).height == 1
+    assert lake.transaction_log().sort("updated_at")["status"].to_list()[2:] == ["pending", "failed", "rolled_back"]
 
 
 def described(lake) -> dict[str, tuple]:

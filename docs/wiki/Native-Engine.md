@@ -32,7 +32,7 @@ the index and feature table scans. `scan()` returns a `LazyFrame`. Filters appli
 with literals, test membership with `is_in`, use `is_between` or test for nulls, combined with `&`, `|` and `~`, reach the
 scans, for example `pl.col("timestamp") >= start` or `pl.col("symbol").is_in(symbols)`. The rest, and filters on float
 columns, run after alignment.
-`scan_index()`, `scan_feature_metadata()` and `scan_table_metadata()` push the same filters, on any of their columns, into
+`scan_index()`, `scan_feature_metadata()`, `scan_table_metadata()` and `scan_transaction_log()` push the same filters, on any of their columns, into
 their scans. `read_arrow()` returns a single-use Arrow C stream, which `pyarrow.RecordBatchReader.from_stream` and
 `polars.DataFrame` accept.
 
@@ -61,6 +61,16 @@ A write splits its input by the feature table that holds the latest version of e
 
 The index and feature tables are written first and the metadata tables last, so a reader never sees a feature before its
 data. Writes to one lake are serialized within a process; separate processes writing the same lake must coordinate.
+
+Each write is logged as `pending`, then `success`, in the transaction log. The core marks each commit it makes with the
+write's transaction id, in the Delta `commitInfo`, and records the version of each table it read. If the write fails
+after committing, it reads each such table's log from that version and undoes the marked commits, including one whose
+commit failed after it landed: with a Delta restore to the version before the first of them when no other writer's
+commit follows it, and otherwise with one commit that removes the files they added and re-adds the files they removed,
+keeping other writers' commits. The write is then logged `rolled_back`. If another writer removed a file the write
+added, added rows to columns the write added, or changed a schema the write changed, the undo fails and the write stays
+`failed`. Tables the write created are left unreferenced. A backend that does not number versions
+(`StoredTable::version` returns `None`) is never rolled back.
 
 ## Files
 

@@ -729,7 +729,7 @@ fn targets_and_metadata_options_are_recorded() {
 }
 
 #[test]
-fn a_failed_commit_reports_what_was_committed() {
+fn a_failed_commit_is_rolled_back() {
     use std::os::unix::fs::PermissionsExt;
     let (dir, lake) = create();
     add(
@@ -745,9 +745,22 @@ fn a_failed_commit_reports_what_was_committed() {
     );
     std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o755)).unwrap();
     match result.unwrap_err() {
-        Error::Write { committed, .. } => assert_eq!(committed.len(), 1, "{committed:?}"),
+        Error::Write {
+            phase, committed, ..
+        } => assert_eq!(
+            (phase.as_str(), committed.len()),
+            ("writing table index (rolled back)", 0)
+        ),
         other => panic!("expected a write error, got {other}"),
     }
+    check_invariant(dir.path());
+    add(
+        &lake,
+        frame(&keys(3..=3, &["a"]), &[("f", 2.0)]),
+        OverlapMode::Copy,
+    );
+    let f: Vec<_> = read(&lake, "f").into_values().collect();
+    assert_eq!(f, [Some(1.0), Some(2.0), Some(6.0)]);
 }
 
 /// Writes covering every kind of commit, then every feature read back.

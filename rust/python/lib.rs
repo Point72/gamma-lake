@@ -285,6 +285,7 @@ fn lake_options(
     storage_options: Option<HashMap<String, String>>,
     lock: Option<Py<PyAny>>,
     memory_limit: Option<usize>,
+    transaction_log_path: Option<String>,
 ) -> (LakeOptions, DeltaOptions) {
     let defaults = LakeOptions::default();
     let delta = DeltaOptions::default();
@@ -298,6 +299,7 @@ fn lake_options(
         table_name_prefix: table_name_prefix.unwrap_or(defaults.table_name_prefix),
         lock: lock.map(|factory| Arc::new(PyLock { factory }) as Arc<dyn TableLock>),
         memory_limit,
+        transaction_log_path: transaction_log_path.unwrap_or(defaults.transaction_log_path),
     };
     let delta = DeltaOptions {
         compression: compression.unwrap_or(delta.compression),
@@ -406,6 +408,7 @@ impl Lake {
         storage_options = None,
         lock = None,
         memory_limit = None,
+        transaction_log_path = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -423,6 +426,7 @@ impl Lake {
         storage_options: Option<HashMap<String, String>>,
         lock: Option<Py<PyAny>>,
         memory_limit: Option<usize>,
+        transaction_log_path: Option<String>,
     ) -> PyResult<Self> {
         let (options, delta) = lake_options(
             primary_sort_key,
@@ -437,6 +441,7 @@ impl Lake {
             storage_options,
             lock,
             memory_limit,
+            transaction_log_path,
         );
         let inner = py
             .detach(|| {
@@ -465,6 +470,7 @@ impl Lake {
         storage_options = None,
         lock = None,
         memory_limit = None,
+        transaction_log_path = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn create(
@@ -483,6 +489,7 @@ impl Lake {
         storage_options: Option<HashMap<String, String>>,
         lock: Option<Py<PyAny>>,
         memory_limit: Option<usize>,
+        transaction_log_path: Option<String>,
     ) -> PyResult<Self> {
         let schema = import_schema(&index_schema)?;
         let (options, delta) = lake_options(
@@ -498,6 +505,7 @@ impl Lake {
             storage_options,
             lock,
             memory_limit,
+            transaction_log_path,
         );
         let inner = py
             .detach(|| {
@@ -742,6 +750,25 @@ impl Lake {
 
     fn table_metadata_schema(&self, py: Python<'_>) -> PyResult<ArrowSchema> {
         py.detach(|| self.inner.table_metadata_schema())
+            .map(|schema| ArrowSchema { schema })
+            .map_err(to_py)
+    }
+
+    /// Rows of the transaction log; none when the lake has no log yet.
+    #[pyo3(signature = (predicate = None))]
+    fn transaction_log(
+        &self,
+        py: Python<'_>,
+        predicate: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<ArrowStream> {
+        let dnf = import_dnf(predicate.as_ref())?;
+        py.detach(|| self.inner.transaction_log(&dnf))
+            .map(ArrowStream::new)
+            .map_err(to_py)
+    }
+
+    fn transaction_log_schema(&self, py: Python<'_>) -> PyResult<ArrowSchema> {
+        py.detach(|| self.inner.transaction_log_schema())
             .map(|schema| ArrowSchema { schema })
             .map_err(to_py)
     }
