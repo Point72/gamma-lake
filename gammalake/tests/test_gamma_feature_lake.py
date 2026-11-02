@@ -131,6 +131,31 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
         self._test_add_index_rows(fs, use_remote_data=use_remote_data)
 
+    @pytest.mark.parametrize("use_ray_cluster", [True, False])
+    def test_add_features_can_require_existing_index_rows(self, use_ray_cluster, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+        timestamps = [datetime(2020, 1, day, tzinfo=UTC) for day in range(1, 4)]
+        index_rows = pl.DataFrame({"timestamp": timestamps, "symbol": ["S1"] * 3})
+        fs.add_index_rows(index_rows)
+        fs.add_features(index_rows.with_columns(feature_0=pl.Series([1, 2, 3])), allow_new_index_rows=False)
+
+        index_before = fs.index_frame().collect()
+        read_before = fs.read(["feature_0"])
+        mixed_rows = pl.DataFrame(
+            {
+                "timestamp": [timestamps[-1], datetime(2020, 1, 4, tzinfo=UTC)],
+                "symbol": ["S1", "S1"],
+                "feature_1": [4, 5],
+            }
+        )
+
+        with pytest.raises(ValueError, match="not present in the lake index"):
+            fs.add_features(mixed_rows, allow_new_index_rows=False)
+
+        assert_frame_equal(fs.index_frame().collect(), index_before)
+        assert_frame_equal(fs.read(["feature_0"]), read_before)
+        assert fs.feature_metadata_frame().collect()["feature_name"].unique().to_list() == ["feature_0"]
+
     @pytest.mark.parametrize("overlap_mode", ["copy", "merge"])
     def test_parametrized_overlap_modes_read_correctness(self, overlap_mode, fs):
         self._test_parametrized_overlap_modes_read_correctness(fs, overlap_mode=overlap_mode)

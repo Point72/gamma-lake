@@ -496,6 +496,7 @@ def compute_index_deltas(feature_store, df):
         df.height,
         df.columns,
         new_index_rows,
+        new_index_rows.height > 0,
         new_index_rows[primary_sort_key].min(),
         missing_index_rows,
     )
@@ -1044,6 +1045,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         metadata: pl.DataFrame | None = None,
         feature_params: dict | None = None,
         overlap_mode: str = "copy",
+        allow_new_index_rows: bool = True,
     ) -> list:
         """
         Onboards a new table of features to our FeatureStore.
@@ -1051,6 +1053,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         Args:
             overlap_mode: ``"copy"`` (default) creates a new DeltaTable on overlap, preserving the
                 old table as an immutable snapshot.  ``"merge"`` upserts into the existing table in-place.
+            allow_new_index_rows: Whether values may extend the lake's index.
 
         Performance:
             Each call scans the global index once and sends newly discovered index rows through a
@@ -1071,9 +1074,12 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             input_length,
             columns,
             new_index_rows_ref,
+            has_new_index_rows,
             earliest_new_index_rows_ref,
             missing_index_rows_ref,
-        ) = self.switch(compute_index_deltas, num_returns=8)(self, df)
+        ) = self.switch(compute_index_deltas, num_returns=9)(self, df)
+        if not allow_new_index_rows and self.get(has_new_index_rows):
+            raise ValueError("Input contains rows that are not present in the lake index.")
         feature_metadata = self.feature_metadata_frame().collect()
         table_metadata = self.table_metadata_frame().collect()
         feature_tables = self._get_latest_feature_tables(self.get(columns), feature_metadata=feature_metadata)
@@ -1168,14 +1174,27 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
+        *,
+        allow_new_index_rows: bool = True,
     ) -> list:
         """Add feature columns to the lake.
 
         Each call scans and appends to the global index once, so batch related columns and
         complete primary-sort-key periods rather than splitting them across calls. See ``_add``
         and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
+
+        Args:
+            allow_new_index_rows: Whether feature values may extend the lake's index. Set to
+                ``False`` to reject the entire write when any sort-key row is absent from the index.
         """
-        return self._add(df=df, signal_type="feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
+        return self._add(
+            df=df,
+            signal_type="feature",
+            owner=owner,
+            metadata=metadata,
+            overlap_mode=overlap_mode,
+            allow_new_index_rows=allow_new_index_rows,
+        )
 
     @ensure_deltalake_is_initialized
     @trace(always=True)
