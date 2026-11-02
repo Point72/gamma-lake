@@ -136,6 +136,8 @@ class BaseFeatureLake(abc.ABC):
         df: pl.DataFrame | RayObjectReference,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
+        *,
+        allow_new_index_rows: bool = True,
     ) -> list:
         """Add features to this FeatureLake object. An optional metadata frame argument allows users to increment very specific feature versions, otherwise we fallback
         to generic insertion logic around latest feature version value.
@@ -144,6 +146,7 @@ class BaseFeatureLake(abc.ABC):
             df: an input polars DataFrame (or object reference pointing to a polars DataFrame) containing feature values to be added to this FeatureLake's underlying DeltaTables.
             owner: a string argument for use in identifying ownership in metadata tables.
             metadata: an optional DataFrame object, expected to be a (possibly) filtered version of this object's feature metadata frame, identifying which DeltaTables to update
+            allow_new_index_rows: Whether feature values may extend the lake's index.
 
         Returns: A list of write results.
         """
