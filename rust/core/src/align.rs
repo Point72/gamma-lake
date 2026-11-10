@@ -175,22 +175,22 @@ pub(crate) fn zip_aligned(
     bounded: bool,
 ) -> DfResult<SendableRecordBatchStream> {
     let index_schema = index.schema();
-    let mut inputs = vec![Buffered {
+    let index = AlignInput {
         name: "index".into(),
         stream: index,
         keys,
-        batches: VecDeque::new(),
-        rows: 0,
-        done: false,
-    }];
-    inputs.extend(tables.into_iter().map(|t| Buffered {
-        name: t.name,
-        stream: t.stream,
-        keys: t.keys,
-        batches: VecDeque::new(),
-        rows: 0,
-        done: false,
-    }));
+    };
+    let inputs: Vec<Buffered> = std::iter::once(index)
+        .chain(tables)
+        .map(|t| Buffered {
+            name: t.name,
+            stream: t.stream,
+            keys: t.keys,
+            batches: VecDeque::new(),
+            rows: 0,
+            done: false,
+        })
+        .collect();
     // Padding introduces nulls in every column, including the index keys when a table is
     // longer than the index.
     let schema: SchemaRef = Arc::new(Schema::new(

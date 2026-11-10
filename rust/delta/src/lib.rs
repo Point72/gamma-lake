@@ -27,7 +27,7 @@ use deltalake::parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, Path as StorePath};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use gamma_lake_core::runtime::threads;
 use gamma_lake_core::store::{
     before_first_commit, entangled, extends, segments, version_at, CreateOptions, StoredTable,
@@ -194,8 +194,7 @@ fn delta_context(overrides: &[(&str, String)]) -> Result<SessionContext> {
 }
 
 /// Session state for plain Delta writes, configured like [`delta_context`] except that
-/// rows are not repartitioned, so files hold rows in input order as the Python `deltalake`
-/// writer leaves them.
+/// rows are not repartitioned, so files hold rows in input order.
 fn delta_session() -> Result<Arc<dyn Session>> {
     let in_order = [(
         "datafusion.optimizer.enable_round_robin_repartition",
@@ -204,17 +203,7 @@ fn delta_session() -> Result<Arc<dyn Session>> {
     Ok(Arc::new(delta_context(&in_order)?.state()))
 }
 
-/// Session state for Delta merges. Scans keep plain string and binary types, so merged
-/// files record the same Arrow types as files the Python `deltalake` merge writes.
-fn delta_merge_session() -> Result<Arc<dyn Session>> {
-    let plain = [(
-        "datafusion.execution.parquet.schema_force_view_types",
-        "false".to_string(),
-    )];
-    Ok(Arc::new(delta_context(&plain)?.state()))
-}
-
-/// Parses a compression name as `GammaFeatureLake.compression` accepts it.
+/// Parses a case-insensitive Parquet compression name.
 fn compression(name: &str) -> Result<Compression> {
     Ok(match name.to_ascii_lowercase().as_str() {
         "uncompressed" => Compression::UNCOMPRESSED,
@@ -235,8 +224,7 @@ fn compression(name: &str) -> Result<Compression> {
 
 /// The oldest version of a Delta table whose commit file is still in its log.
 async fn earliest_commit(store: &dyn deltalake::ObjectStore) -> Result<u64> {
-    use futures::TryStreamExt;
-    let log = deltalake::Path::from("_delta_log");
+    let log = StorePath::from("_delta_log");
     let files: Vec<_> = store
         .list(Some(&log))
         .try_collect()
@@ -294,7 +282,7 @@ impl DeltaStore {
         }
         let root = match Url::parse(base) {
             // Single-letter schemes are Windows drive letters, not URLs.
-            Ok(url) if url.scheme().len() > 1 && url.scheme() != "file" => {
+            Ok(mut url) if url.scheme().len() > 1 && url.scheme() != "file" => {
                 if url.query().is_some() || url.fragment().is_some() {
                     return Err(Error::InvalidArgument(format!(
                         "lake URL {base:?} must not have a query or fragment"
@@ -305,7 +293,6 @@ impl DeltaStore {
                         "lake URL {base:?} contains '%', which is not supported"
                     )));
                 }
-                let mut url = url;
                 if !url.path().ends_with('/') {
                     let path = format!("{}/", url.path());
                     url.set_path(&path);
@@ -392,10 +379,11 @@ impl TableStore for DeltaStore {
     fn table_location(&self, name: &str) -> Result<String> {
         let url = self.table_url(name)?;
         let location = match Self::local(&url) {
-            Some(path) => match local_root(&path)?.to_file_path() {
-                Ok(path) => path.display().to_string(),
-                Err(()) => path.display().to_string(),
-            },
+            Some(path) => local_root(&path)?
+                .to_file_path()
+                .unwrap_or(path)
+                .display()
+                .to_string(),
             None => url.to_string(),
         };
         Ok(location.trim_end_matches('/').to_string())
@@ -403,10 +391,8 @@ impl TableStore for DeltaStore {
 
     async fn open(&self, name: &str) -> Result<Option<Box<dyn StoredTable>>> {
         let url = self.table_url(name)?;
-        if let Some(path) = Self::local(&url) {
-            if !path.join("_delta_log").is_dir() {
-                return Ok(None);
-            }
+        if Self::local(&url).is_some_and(|path| !path.join("_delta_log").is_dir()) {
+            return Ok(None);
         }
         let table = match DeltaTableBuilder::from_url(url)
             .map_err(delta_err)?
@@ -626,18 +612,19 @@ impl StoredTable for DeltaStored {
             .map(|k| column("target", k).eq(column("source", k)))
             .reduce(Expr::and)
             .ok_or_else(|| Error::InvalidArgument("merge needs at least one key".into()))?;
-        let names: Vec<String> = source
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        let source = delta_context(&[])?.read_batch(source)?;
+        let schema = source.schema();
+        // Scans keep plain string and binary types, so merged files record the same Arrow
+        // types as files the Python `deltalake` merge writes.
+        let ctx = delta_context(&[(
+            "datafusion.execution.parquet.schema_force_view_types",
+            "false".to_string(),
+        )])?;
+        let source = ctx.read_batch(source)?;
         let plain = |name: &str| DeltaColumn::from(Column::new_unqualified(name));
         let committing = self.committing();
         self.table
             .merge(source, predicate)
-            .with_session_state(delta_merge_session()?)
+            .with_session_state(Arc::new(ctx.state()))
             .with_source_alias("source")
             .with_target_alias("target")
             .with_writer_properties(self.properties)
@@ -650,8 +637,8 @@ impl StoredTable for DeltaStored {
             })
             .map_err(delta_err)?
             .when_not_matched_insert(|mut i| {
-                for n in &names {
-                    i = i.set(plain(n), column("source", n));
+                for f in schema.fields() {
+                    i = i.set(plain(f.name()), column("source", f.name()));
                 }
                 i
             })
@@ -714,7 +701,7 @@ impl StoredTable for DeltaStored {
         let committed = |version: u64| {
             let store = store.clone();
             async move {
-                let path = deltalake::Path::from(format!("_delta_log/{version:020}.json"));
+                let path = StorePath::from(format!("_delta_log/{version:020}.json"));
                 let meta = store.head(&path).await.map_err(|e| delta_err(e.into()))?;
                 Ok(meta.last_modified.timestamp_micros())
             }
@@ -905,12 +892,10 @@ impl StoredTable for DeltaStored {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::TryStreamExt;
 
     #[test]
     fn restore_searches_only_the_retained_log() {
         use deltalake::arrow::array::Int64Array;
-        use deltalake::arrow::datatypes::Field;
 
         let dir = tempfile::TempDir::new().unwrap();
         let store = DeltaStore::new(dir.path().to_str().unwrap(), DeltaOptions::default()).unwrap();
@@ -989,7 +974,6 @@ mod tests {
     #[test]
     fn revert_undoes_only_the_tagged_commits() {
         use deltalake::arrow::array::{ArrayRef, Int64Array};
-        use deltalake::arrow::datatypes::Field;
 
         let dir = tempfile::TempDir::new().unwrap();
         let store = DeltaStore::new(dir.path().to_str().unwrap(), DeltaOptions::default()).unwrap();
@@ -1090,7 +1074,6 @@ mod tests {
     #[test]
     fn window_scans_read_fewer_files() {
         use deltalake::arrow::array::Int64Array;
-        use deltalake::arrow::datatypes::Field;
         use deltalake::datafusion::physical_plan::displayable;
         use gamma_lake_core::{Op, Term};
 

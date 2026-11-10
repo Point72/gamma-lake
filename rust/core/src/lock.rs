@@ -88,17 +88,11 @@ where
             let _ = done_tx.send(guard.release());
         })
         .map_err(|e| error(Box::new(e)))?;
-    match held_rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(error(e)),
-        Err(_) => return Err(error("the lock thread exited".into())),
-    }
+    let exited = |_| Err("the lock thread exited".into());
+    held_rx.await.unwrap_or_else(exited).map_err(error)?;
     let result = op.await;
     let _ = release_tx.send(());
-    let released = match done_rx.await {
-        Ok(released) => released,
-        Err(_) => Err("the lock thread exited".into()),
-    };
+    let released = done_rx.await.unwrap_or_else(exited);
     match (result, released) {
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(e)) => Err(Error::Write {

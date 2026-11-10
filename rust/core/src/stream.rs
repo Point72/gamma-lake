@@ -1,16 +1,16 @@
 //! Record batch streams returned by the core.
 
-use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::vec;
 
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 
 use crate::runtime;
 
@@ -22,10 +22,9 @@ pub struct AsyncBatchStream {
 
 impl AsyncBatchStream {
     pub(crate) fn from_plan(stream: SendableRecordBatchStream) -> Self {
-        let schema = stream.schema();
         Self {
-            schema,
-            inner: Box::pin(stream.map(|batch| batch.map_err(crate::Error::from))),
+            schema: stream.schema(),
+            inner: Box::pin(stream.map_err(crate::Error::from)),
         }
     }
 
@@ -44,7 +43,7 @@ impl Stream for AsyncBatchStream {
 
 enum Source {
     Plan(SendableRecordBatchStream),
-    Memory(VecDeque<RecordBatch>),
+    Memory(vec::IntoIter<RecordBatch>),
 }
 
 /// A blocking iterator of record batches sharing one schema.
@@ -84,7 +83,7 @@ impl BatchStream {
         LIVE.fetch_add(1, Ordering::SeqCst);
         Self {
             schema,
-            source: Some(Source::Memory(batches.into())),
+            source: Some(Source::Memory(batches.into_iter())),
         }
     }
 
@@ -109,7 +108,7 @@ impl Iterator for BatchStream {
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = match self.source.as_mut()? {
-            Source::Memory(batches) => return batches.pop_front().map(Ok),
+            Source::Memory(batches) => return batches.next().map(Ok),
             Source::Plan(stream) => {
                 catch_unwind(AssertUnwindSafe(|| runtime::block_on(stream.next())))
             }
@@ -145,7 +144,6 @@ mod tests {
     use arrow::ffi_stream::FFI_ArrowArrayStream;
     use datafusion::error::{DataFusionError, Result as DfResult};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::Stream;
     use std::ffi::CStr;
     use std::sync::Arc;
 

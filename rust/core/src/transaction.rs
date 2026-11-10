@@ -73,11 +73,11 @@ fn parts(error: Error) -> (String, Vec<String>, Box<Error>) {
 
 /// `committed` and the tables of `more` not in it.
 fn union(mut committed: Vec<String>, more: Vec<String>) -> Vec<String> {
-    let more: Vec<_> = more
-        .into_iter()
-        .filter(|t| !committed.contains(t))
-        .collect();
-    committed.extend(more);
+    for table in more {
+        if !committed.contains(&table) {
+            committed.push(table);
+        }
+    }
     committed
 }
 
@@ -92,7 +92,7 @@ enum Undo {
 
 /// One logged write.
 struct Transaction<'a> {
-    id: String,
+    id: &'a str,
     owner: &'a str,
     signal_type: &'a str,
     started_at: i64,
@@ -119,7 +119,7 @@ impl Lake {
         body: impl Future<Output = Result<Vec<String>>>,
     ) -> Result<()> {
         let tx = Transaction {
-            id: commits.tag().to_string(),
+            id: commits.tag(),
             owner,
             signal_type,
             started_at: now_micros(),
@@ -229,7 +229,7 @@ impl Lake {
                 Arc::new(TimestampMicrosecondArray::from(vec![t]).with_timezone("UTC")) as ArrayRef
             };
             HashMap::from([
-                ("transaction_id", string(Some(&tx.id))),
+                ("transaction_id", string(Some(tx.id))),
                 ("status", string(Some(status.as_str()))),
                 ("owner", string(Some(tx.owner))),
                 ("signal_type", string(Some(tx.signal_type))),

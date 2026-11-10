@@ -561,20 +561,11 @@ impl StoredTable for MemoryStored {
         extends(&self.version.schema, batch.schema_ref(), &self.name)?;
         self.store
             .commit(&self.name, &self.version, self.tag.as_deref(), |latest| {
-                // The new schema is the batch's wider one. Every existing batch is padded with
-                // all-null arrays for the added columns (`schema.fields()[n..]` is the tail
-                // slice beyond the old column count), then the new batch is appended.
                 let schema = batch.schema();
                 let mut batches = latest
                     .batches
                     .iter()
-                    .map(|old| {
-                        let mut columns = old.columns().to_vec();
-                        for field in &schema.fields()[old.num_columns()..] {
-                            columns.push(new_null_array(field.data_type(), old.num_rows()));
-                        }
-                        Ok(RecordBatch::try_new(schema.clone(), columns)?)
-                    })
+                    .map(|old| fit(&schema, old))
                     .collect::<Result<Vec<_>>>()?;
                 batches.push(batch);
                 Ok((schema, batches))
@@ -789,6 +780,11 @@ fn merge_batches(
             .map(|i| i as u32),
     );
     let update: HashSet<&str> = update.iter().map(String::as_str).collect();
+    let indices: Vec<(usize, usize)> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, m)| m.map_or((0, i), |j| (1, j)))
+        .collect();
     let mut updated = vec![];
     let mut new = vec![];
     for field in schema.fields() {
@@ -796,11 +792,6 @@ fn merge_batches(
         let incoming = source.column_by_name(field.name());
         updated.push(match incoming {
             Some(incoming) if update.contains(field.name().as_str()) => {
-                let indices: Vec<(usize, usize)> = matches
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| m.map_or((0, i), |j| (1, j)))
-                    .collect();
                 interleave(&[old.as_ref(), incoming.as_ref()], &indices)?
             }
             _ => old.clone(),
@@ -845,28 +836,20 @@ mod tests {
     #[test]
     fn version_at_finds_the_newest_of_equal_times() {
         let times = [10, 20, 20, 20, 30];
-        let at =
-            |t: i64| {
-                futures::executor::block_on(version_at(0, 4, t, |v| async move {
-                    Ok(times[v as usize])
-                }))
-                .unwrap()
-            };
-        assert_eq!(at(5), None);
-        assert_eq!(at(10), Some(0));
-        assert_eq!(at(19), Some(0));
-        assert_eq!(at(20), Some(3));
-        assert_eq!(at(25), Some(3));
-        assert_eq!(at(30), Some(4));
-        assert_eq!(at(99), Some(4));
-        let retained =
-            |t: i64| {
-                futures::executor::block_on(version_at(2, 4, t, |v| async move {
-                    Ok(times[v as usize])
-                }))
-                .unwrap()
-            };
-        assert_eq!(retained(15), None);
-        assert_eq!(retained(20), Some(3));
+        let at = |earliest: u64, t: i64| {
+            futures::executor::block_on(version_at(earliest, 4, t, |v| async move {
+                Ok(times[v as usize])
+            }))
+            .unwrap()
+        };
+        assert_eq!(at(0, 5), None);
+        assert_eq!(at(0, 10), Some(0));
+        assert_eq!(at(0, 19), Some(0));
+        assert_eq!(at(0, 20), Some(3));
+        assert_eq!(at(0, 25), Some(3));
+        assert_eq!(at(0, 30), Some(4));
+        assert_eq!(at(0, 99), Some(4));
+        assert_eq!(at(2, 15), None);
+        assert_eq!(at(2, 20), Some(3));
     }
 }

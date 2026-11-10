@@ -126,11 +126,11 @@ pub(crate) fn coverage_values(tm: &RecordBatch) -> Result<BTreeMap<String, Array
         let (Some(addr), true) = (addr, stamps.is_valid(r)) else {
             continue;
         };
-        match newest.get(addr) {
-            Some(&o) if stamps.value(o) >= stamps.value(r) => {}
-            _ => {
-                newest.insert(addr.clone(), r);
-            }
+        if newest
+            .get(addr)
+            .is_none_or(|&o| stamps.value(o) < stamps.value(r))
+        {
+            newest.insert(addr.clone(), r);
         }
     }
     Ok(newest
@@ -149,10 +149,8 @@ pub(crate) fn new_table_addr(prefix: &str) -> String {
 fn storage_type(data_type: &DataType) -> Option<DataType> {
     use DataType::*;
     Some(match data_type {
-        Boolean | Int8 | Int16 | Int32 | Int64 | Float32 | Float64 | Date32 | Utf8 | Binary => {
-            data_type.clone()
-        }
-        Decimal128(..) => data_type.clone(),
+        Boolean | Int8 | Int16 | Int32 | Int64 | Float32 | Float64 | Date32 | Utf8 | Binary
+        | Decimal128(..) => data_type.clone(),
         // Stored as the signed type of the same width; values that do not fit are rejected.
         UInt8 => Int8,
         UInt16 => Int16,
@@ -260,7 +258,7 @@ fn sort_by_keys(batch: RecordBatch, keys: &[String]) -> Result<RecordBatch> {
         return Ok(batch);
     }
     let mut order: Vec<u32> = (0..rows.num_rows() as u32).collect();
-    order.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
+    order.sort_by_key(|&r| rows.row(r as usize));
     Ok(take_record_batch(&batch, &UInt32Array::from(order))?)
 }
 
@@ -317,8 +315,9 @@ pub(crate) enum Action {
 impl Action {
     fn addr(&self) -> &str {
         match self {
-            Action::Append { addr, .. } | Action::Create { addr, .. } => addr,
-            Action::Merge { addr, .. } => addr,
+            Action::Append { addr, .. }
+            | Action::Create { addr, .. }
+            | Action::Merge { addr, .. } => addr,
         }
     }
 }
@@ -770,16 +769,13 @@ impl Lake {
             columns.push(cast_into(values, key, "the index")?);
             fields.push(Field::new(key.name(), key.data_type().clone(), true));
         }
-        let features: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .filter(|n| !self.sort_keys.contains(n))
-            .collect();
-        for name in &features {
-            let field = schema.field_with_name(name)?;
-            columns.push(batch.column_by_name(name).unwrap().clone());
-            fields.push(Field::new(name, field.data_type().clone(), true));
+        let mut features = vec![];
+        for (field, values) in schema.fields().iter().zip(batch.columns()) {
+            if !self.sort_keys.contains(field.name()) {
+                features.push(field.name().clone());
+                columns.push(values.clone());
+                fields.push(Field::new(field.name(), field.data_type().clone(), true));
+            }
         }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
 
@@ -804,15 +800,9 @@ impl Lake {
         let keys = key_converter.convert_columns(&batch.columns()[..nkeys])?;
         let pk_index = self.index_schema.index_of(&self.options.primary_sort_key)?;
         let pk = pk_converter.convert_columns(&[batch.column(pk_index).clone()])?;
-        let (mut min, mut max) = (0, 0);
-        for r in 1..pk.num_rows() {
-            if pk.row(r) < pk.row(min) {
-                min = r;
-            }
-            if pk.row(r) > pk.row(max) {
-                max = r;
-            }
-        }
+        let rows = 0..pk.num_rows();
+        let min = rows.clone().min_by_key(|&r| pk.row(r)).unwrap_or_default();
+        let max = rows.max_by_key(|&r| pk.row(r)).unwrap_or_default();
         let bound = |r: usize| Bound {
             value: batch.column(pk_index).slice(r, 1),
             row: pk.row(r).as_ref().to_vec(),
@@ -1417,10 +1407,8 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), columns).unwrap()
     }
 
-    /// Plans a write of a new key for an existing feature, lets another writer commit to its
-    /// feature table or else the index, then commits the plan. Returns the error and the number
-    /// of index rows after it.
-    fn raced_write(feature: bool) -> (Error, usize) {
+    /// A lake in `store` keyed on `ts` and `sym`.
+    fn lake(store: Arc<dyn TableStore>) -> Lake {
         let index = Schema::new(vec![
             Field::new("ts", DataType::Int64, true),
             Field::new("sym", DataType::Utf8, true),
@@ -1429,8 +1417,14 @@ mod tests {
             primary_sort_key: "ts".into(),
             ..Default::default()
         };
-        let store = Arc::new(MemoryStore::new());
-        let lake = Lake::create_with_store(store, Arc::new(index), options).unwrap();
+        Lake::create_with_store(store, Arc::new(index), options).unwrap()
+    }
+
+    /// Plans a write of a new key for an existing feature, lets another writer commit to its
+    /// feature table or else the index, then commits the plan. Returns the error and the number
+    /// of index rows after it.
+    fn raced_write(feature: bool) -> (Error, usize) {
+        let lake = lake(Arc::new(MemoryStore::new()));
         lake.add(vec![frame(&[1, 2])], &AddOptions::default())
             .unwrap();
         block_on(async {
@@ -1583,20 +1577,11 @@ mod tests {
             defaults.table_metadata_path,
         ] {
             let armed = Arc::new(AtomicBool::new(false));
-            let store = Racing {
+            let lake = lake(Arc::new(Racing {
                 inner: MemoryStore::new(),
                 raced: raced.clone(),
                 armed: armed.clone(),
-            };
-            let index = Schema::new(vec![
-                Field::new("ts", DataType::Int64, true),
-                Field::new("sym", DataType::Utf8, true),
-            ]);
-            let options = LakeOptions {
-                primary_sort_key: "ts".into(),
-                ..Default::default()
-            };
-            let lake = Lake::create_with_store(Arc::new(store), Arc::new(index), options).unwrap();
+            }));
             lake.add(vec![frame(&[1, 2])], &AddOptions::default())
                 .unwrap();
             // A new feature, so that the write commits to the metadata tables too.
@@ -1623,15 +1608,7 @@ mod tests {
     #[test]
     fn a_conflict_beside_another_failure_is_not_reported_as_a_bare_conflict() {
         let store = Arc::new(MemoryStore::new());
-        let index = Schema::new(vec![
-            Field::new("ts", DataType::Int64, true),
-            Field::new("sym", DataType::Utf8, true),
-        ]);
-        let options = LakeOptions {
-            primary_sort_key: "ts".into(),
-            ..Default::default()
-        };
-        let lake = Lake::create_with_store(store.clone(), Arc::new(index), options).unwrap();
+        let lake = lake(store.clone());
         block_on(async {
             for name in ["a", "b"] {
                 store
