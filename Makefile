@@ -1,81 +1,119 @@
-#########
-# BUILD #
-#########
-.PHONY: develop build install
-
-develop:  ## install dependencies and build library
+.PHONY: develop-py develop-rs develop
+develop-py:
 	uv pip install -e .[develop]
 
-requirements:  ## install prerequisite python build requirements
-	python -m pip install --upgrade pip toml
-	python -m pip install `python -c 'import toml; c = toml.load("pyproject.toml"); print("\n".join(c["build-system"]["requires"]))'`
-	python -m pip install `python -c 'import toml; c = toml.load("pyproject.toml"); print(" ".join(c["project"]["optional-dependencies"]["develop"]))'`
+develop-rs:
+	make -C rust develop
 
-build:  ## build the python library
-	python -m build -n
+develop: develop-rs develop-py  ## setup project for development
 
-install:  ## install library
+.PHONY: requirements-py requirements-rs requirements
+requirements-py:  ## install prerequisite python build requirements
+	uv pip install -r pyproject.toml --extra develop
+
+requirements-rs:  ## install prerequisite rust build requirements
+	make -C rust requirements
+
+requirements: requirements-rs requirements-py  ## setup project for development
+
+.PHONY: build-py build-rs build
+build-py:
+	python -m build -w -n
+
+build-rs:
+	make -C rust build
+
+build: build-rs build-py  ## build the project
+
+.PHONY: install
+install:  ## install python library
 	uv pip install .
 
-#########
-# LINTS #
-#########
-.PHONY: lint-py lint-docs fix-py fix-docs lint lints fix format
-
-lint-py:  ## lint python with ruff
+.PHONY: lint-py lint-rs lint-docs lint lints
+lint-py:  ## run python linter with ruff
 	python -m ruff check gammalake benchmarks
 	python -m ruff format --check gammalake benchmarks
 
-lint-docs:  ## lint docs with mdformat and codespell
-	python -m mdformat --check README.md docs/wiki/
-	python -m codespell_lib README.md docs/wiki/
+lint-rs:  ## run rust linter
+	make -C rust lint
 
-fix-py:  ## autoformat python code with ruff
+lint-docs:  ## lint docs with mdformat and codespell
+	python -m mdformat --check README.md $(wildcard docs/src) docs/wiki/
+	python -m codespell_lib README.md $(wildcard docs/src) docs/wiki/
+
+lint: lint-rs lint-py lint-docs  ## run project linters
+
+lints: lint
+
+.PHONY: fix-py fix-rs fix-docs fix format
+fix-py:  ## fix python formatting with ruff
 	python -m ruff check --fix gammalake benchmarks
 	python -m ruff format gammalake benchmarks
 
-fix-docs:  ## autoformat docs with mdformat and codespell
-	python -m mdformat README.md docs/wiki/
-	python -m codespell_lib --write README.md docs/wiki/
+fix-rs:  ## fix rust formatting
+	make -C rust fix
 
-lint: lint-py lint-docs  ## run all linters
-lints: lint
-fix: fix-py fix-docs  ## run all autoformatters
+fix-docs:  ## autoformat docs with mdformat and codespell
+	python -m mdformat README.md $(wildcard docs/src) docs/wiki/
+	python -m codespell_lib --write README.md $(wildcard docs/src) docs/wiki/
+
+fix: fix-rs fix-py fix-docs  ## run project autoformatters
+
 format: fix
 
-################
-# Other Checks #
-################
 .PHONY: check-dist check-types checks check
 
 check-dist:  ## check python sdist and wheel with check-dist
 	check-dist -v
 
 check-types:  ## check python types with ty
-	ty check --python $$(which python)
+	python -m ty check
 
 checks: check-dist
 
-# Alias
 check: checks
 
-#########
-# TESTS #
-#########
-.PHONY: test coverage tests
-
-test:  ## run python tests
+.PHONY: test-py tests-py coverage-py
+test-py:  ## run python tests
 	python -m pytest -v gammalake/tests
 
-coverage:  ## run tests and collect test coverage
+tests-py: test-py
+
+coverage-py:  ## run python tests and collect test coverage
 	python -m pytest -v gammalake/tests --cov=gammalake --cov-report term-missing --cov-report xml
 
-# Alias
+.PHONY: test-rs tests-rs coverage-rs
+test-rs: fixtures  ## run rust tests
+	make -C rust test
+
+tests-rs: test-rs
+
+coverage-rs:  ## run rust tests and collect test coverage
+	make -C rust coverage
+
+COMPAT_REF ?= v0.2.0
+.PHONY: test-compat
+test-compat:  ## compare reads and written files with the pure-Python engine of COMPAT_REF (default v0.2.0)
+	rm -rf build/compat && mkdir -p build/compat
+	git archive $(COMPAT_REF) gammalake | tar -x -C build/compat
+	GAMMA_LAKE_OLD_SRC=$(CURDIR)/build/compat python -m pytest -v gammalake/tests/test_compat.py
+
+FIXTURES := rust/tests/fixtures/queries.json
+.PHONY: fixtures
+fixtures: $(FIXTURES)  ## generate the Rust parity fixtures with the pure-Python engine of COMPAT_REF
+
+$(FIXTURES): rust/tests/fixtures/make_fixtures.py
+	rm -rf build/fixtures && mkdir -p build/fixtures
+	git archive $(COMPAT_REF) gammalake | tar -x -C build/fixtures
+	PYTHONPATH=$(CURDIR)/build/fixtures python rust/tests/fixtures/make_fixtures.py
+
+.PHONY: test coverage tests
+test: test-py test-rs  ## run all tests
+
+coverage: coverage-py coverage-rs  ## run all tests and collect test coverage
+
 tests: test
 
-###########
-# VERSION #
-###########
 .PHONY: show-version patch minor major
 
 show-version:  ## show current library version
@@ -90,24 +128,24 @@ minor:  ## bump a minor version
 major:  ## bump a major version
 	@bump-my-version bump major
 
-########
-# DIST #
-########
-.PHONY: dist dist-build dist-sdist dist-local-wheel publish
+.PHONY: dist-py-wheel dist-py-sdist dist-rs dist-check dist publish
 
-dist-build:  # build python dists
-	python -m build -w -s
+dist-py-wheel:  ## build python wheel
+	python -m cibuildwheel --output-dir dist
+
+dist-py-sdist:  ## build python sdist
+	python -m build --sdist -o dist
+
+dist-rs:  ## build rust dists
+	make -C rust dist
 
 dist-check:  ## run python dist checker with twine
 	python -m twine check dist/*
 
-dist: clean dist-build dist-check  ## build all dists
+dist: clean dist-rs dist-py-wheel dist-py-sdist dist-check  ## build all dists
 
 publish: dist  ## publish python assets
 
-#########
-# CLEAN #
-#########
 .PHONY: deep-clean clean
 
 deep-clean: ## clean everything from the repository
@@ -116,7 +154,6 @@ deep-clean: ## clean everything from the repository
 clean: ## clean the repository
 	rm -rf .coverage coverage cover htmlcov logs build dist *.egg-info
 
-############################################################################################
 
 .PHONY: help
 

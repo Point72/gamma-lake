@@ -1,4 +1,4 @@
-`gamma-lake` is written in Python. While prebuilt wheels are provided for end users, it is also straightforward to build `gamma-lake` from either the Python [source distribution](https://packaging.python.org/en/latest/specifications/source-distribution-format/) or the GitHub repository.
+`gamma-lake` is written in Python and Rust. While prebuilt wheels are provided for end users, it is also straightforward to build `gamma-lake` from either the Python [source distribution](https://packaging.python.org/en/latest/specifications/source-distribution-format/) or the GitHub repository.
 
 - [Make commands](#make-commands)
 - [Prerequisites](#prerequisites)
@@ -36,6 +36,10 @@ git clone https://github.com/Point72/gamma-lake.git
 cd gamma-lake
 ```
 
+## Install Rust
+
+Follow the instructions for [installing Rust](https://rustup.rs) for your system. The Rust core needs Rust 1.95 or later.
+
 ## Install Python dependencies
 
 Python build and develop dependencies are specified in the `pyproject.toml`, but you can manually install them:
@@ -61,36 +65,24 @@ make build
 | Language | Linter      | Autoformatter | Description |
 | :------- | :---------- | :------------ | :---------- |
 | Python   | `ruff`      | `ruff`        | Style       |
+| Python   | `ruff`      | `ruff`        | Imports     |
+| Rust     | `clippy`    | `rustfmt`     | Style       |
 | Markdown | `mdformat`  | `mdformat`    | Style       |
 | Markdown | `codespell` |               | Spelling    |
 
-**Python Linting**
+Run all linters or formatters together:
 
 ```bash
-make lint-py
+make lint
+make fix
 ```
 
-**Python Autoformatting**
-
-```bash
-make fix-py
-```
-
-**Documentation Linting**
-
-```bash
-make lint-docs
-```
-
-**Documentation Autoformatting**
-
-```bash
-make fix-docs
-```
+The corresponding language-specific targets are `lint-py`, `lint-rs`, `lint-docs`,
+`fix-py`, `fix-rs` and `fix-docs`.
 
 ## Testing
 
-`gamma-lake` has extensive Python tests. The tests can be run via `pytest`. First, install the Python development dependencies with
+`gamma-lake` has both Python and Rust tests. The bulk of the functionality is tested in Python, which can be run via `pytest`. First, install the Python development dependencies with
 
 ```bash
 make develop
@@ -99,5 +91,21 @@ make develop
 **Python**
 
 ```bash
-make test
+make test-py
 ```
+
+**Rust**
+
+```bash
+make test-rs
+```
+
+runs the tests of every crate in the `rust/` workspace. To test one crate, such as the core without delta-rs, run
+`cargo test -p gamma_lake_core` in `rust/`.
+
+The parity tests in `rust/tests/read_parity.rs` read Delta lakes written by the pure-Python engine of v0.2.0 and compare
+against its results. `make test-rs` first runs `make fixtures`, which extracts that engine with `git archive` and
+generates the lakes under `rust/tests/fixtures`; they are not committed. Without them `cargo test` skips the parity
+tests.
+
+`make test` runs the Python and Rust tests.

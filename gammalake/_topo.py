@@ -1,10 +1,16 @@
-"""Topological ``with_columns`` helper."""
+"""Helpers for runtime-computed features: deserializing and applying their expressions."""
 
+import io
 from graphlib import TopologicalSorter
 
 import polars as pl
 
-__all__ = ("with_columns_topo",)
+__all__ = ("deserialize_expression", "with_columns_topo")
+
+
+def deserialize_expression(params: str) -> pl.Expr:
+    """The expression a runtime-computed feature stores in ``feature_params``."""
+    return pl.Expr.deserialize(io.BytesIO(params.encode()), format="json")
 
 
 def with_columns_topo(lf: pl.LazyFrame, exprs: list[pl.Expr]) -> pl.LazyFrame:

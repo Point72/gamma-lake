@@ -57,6 +57,10 @@ the generated path, so cleanup does not depend on read parameter order.
   covering full and partial temporal overlaps, new feature columns, and full
   re-merges.
 - `GammaLakeReadSuite`: 1, 7, and 30 day windows across 1 or 3 feature groups.
+- `GammaLakeEngineReadSuite`: reading three feature groups in full, over a
+  window, for one symbol, with a projection, and as a row count.
+- `GammaLakeEngineWriteSuite`: creating a feature group, appending to it, and
+  overwriting part of it, on a fresh lake per sample.
 
 The sequential write scenarios use 3 features, 5 to 20 symbols, and 10-day
 windows. The overlap and read suites use 200 symbols, 50 features per group,

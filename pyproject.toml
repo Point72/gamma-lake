@@ -1,6 +1,7 @@
 [build-system]
 requires = [
     "hatchling",
+    "hatch-rs>=0.4.3",
 ]
 build-backend = "hatchling.build"
 
@@ -9,7 +10,7 @@ name = "gamma-lake"
 authors = [
     {name = "Point72, L.P.", email = "OpenSource@point72.com"},
 ]
-description = "High-performance feature store built on Delta Lake with optional Ray parallelism"
+description = "Feature store on Delta Lake with a Rust core and a Polars front end"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 version = "0.2.0"
@@ -17,13 +18,13 @@ requires-python = ">=3.11"
 keywords = [
     "feature store",
     "deltalake",
-    "ray",
     "polars",
     "finance",
 ]
 
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
     "Programming Language :: Python",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
@@ -36,40 +37,41 @@ classifiers = [
 
 dependencies = [
     "ccflow>=0.8",
-    "deltalake",
     "packaging",
     "polars>=1.33.1",
-    "polars-io-tools>=0.2.1,<0.3",
-    "pyarrow>=10",
+    "polars-io-tools>=0.2.6,<0.3",
+    "pyarrow>=16",
     "pydantic>=2",
-    "typing-extensions>=4.4.0",
 ]
 
 [project.optional-dependencies]
-ray = [
-    "ray",
-]
+# DataFusion SQL over feature tables. The major version must match the DataFusion that
+# gamma-lake is built with (through deltalake).
+datafusion = ["datafusion>=55,<56"]
 develop = [
     "asv",
     "boto3",
     "build",
     "bump-my-version",
     "check-dist",
+    "cibuildwheel",
     "codespell",
+    "datafusion>=55,<56",
+    "deltalake",
+    "hatch-rs>=0.4.3",
     "hatchling",
     "mdformat",
+    "mdformat-frontmatter",
     "mdformat-tables>=1",
+    "moto[server]>=5",
     "pytest",
     "pytest-cov",
-    "ray",
     "ruff",
     "twine",
     "ty",
     "uv",
     "wheel",
 ]
-
-[project.scripts]
 
 [project.urls]
 Repository = "https://github.com/Point72/gamma-lake"
@@ -80,6 +82,11 @@ current_version = "0.2.0"
 commit = true
 tag = true
 commit_args = "-s"
+pre_commit_hooks = [
+    "cargo update --workspace",
+    "cargo update --manifest-path rust/Cargo.toml --workspace",
+    "git add Cargo.lock rust/Cargo.lock",
+]
 
 [[tool.bumpversion.files]]
 filename = "gammalake/__init__.py"
@@ -91,11 +98,50 @@ filename = "pyproject.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 
+# Anchor Cargo version searches on the package name so dependency pins are never rewritten.
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = "name = \"gamma_lake_py\"\nversion = \"{current_version}\""
+replace = "name = \"gamma_lake_py\"\nversion = \"{new_version}\""
+
+[[tool.bumpversion.files]]
+filename = "rust/Cargo.toml"
+search = "[workspace.package]\nversion = \"{current_version}\""
+replace = "[workspace.package]\nversion = \"{new_version}\""
+
+# The exact pins of the workspace crates on each other.
+[[tool.bumpversion.files]]
+filename = "rust/Cargo.toml"
+search = 'version = "={current_version}"'
+replace = 'version = "={new_version}"'
+
+[tool.cibuildwheel]
+build = "cp311-*"
+test-command = "pytest --import-mode=importlib -vvv {project}/gammalake/tests"
+test-extras = "develop"
+
+[tool.cibuildwheel.linux]
+before-all = """
+curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain=stable --profile=minimal -y
+rustup target add aarch64-unknown-linux-gnu
+rustup target add x86_64-unknown-linux-gnu
+rustup show
+"""
+before-build = "cargo clean --manifest-path {package}/Cargo.toml && rm -f {package}/gammalake/*.so"
+environment = {PATH="$HOME/.cargo/bin:$PATH", CARGO_TERM_COLOR="always"}
+skip = "*i686* *musllinux*"
+
+[tool.cibuildwheel.macos]
+environment = {PATH="$HOME/.cargo/bin:$PATH", CARGO_TERM_COLOR="always", MACOS_DEPLOYMENT_TARGET=11.0}
+archs = "arm64"
+
+[tool.cibuildwheel.windows]
+environment = {PATH="$USERPROFILE/.cargo/bin;$PATH", CARGO_TERM_COLOR="always"}
+skip = "*win32 *arm64"
+
+
 [tool.coverage.run]
 branch = true
-omit = [
-    "gammalake/tests/integration/",
-]
 
 [tool.coverage.report]
 exclude_also = [
@@ -106,23 +152,48 @@ exclude_also = [
 ignore_errors = true
 fail_under = 50
 
-[tool.hatch.build]
-artifacts = []
-
 [tool.hatch.build.sources]
 src = "/"
+
+[tool.hatch.build.hooks.hatch-rs]
+verbose = true
+abi3 = true
+module = "gammalake"
+path = "."
+
+[[tool.hatch.build.hooks.hatch-rs.artifacts]]
+name = "gammalake"
+manifest = "Cargo.toml"
+destination = "gammalake/{python_extension_name}"
 
 [tool.hatch.build.targets.sdist]
 packages = [
     "gammalake",
+    "rust",
+    "Cargo.toml",
+    "Cargo.lock",
+]
+exclude = [
+    "*.dll",
+    "*.dylib",
+    "*.so",
+    "*.pyd",
+    "rust/Makefile",
+    "target",
 ]
 
 [tool.hatch.build.targets.wheel]
+artifacts = [
+    "gammalake/*.dll",
+    "gammalake/*.dylib",
+    "gammalake/*.so",
+]
 packages = [
     "gammalake",
 ]
-
-[tool.hatch.build.targets.wheel.shared-data]
+exclude = [
+    "rust",
+]
 
 [tool.pytest.ini_options]
 addopts = [

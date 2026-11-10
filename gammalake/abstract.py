@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import abc
 from functools import singledispatchmethod
-from typing import Literal
+from typing import Literal, Protocol
 
 import polars as pl
 from ccflow import BaseModel
 from pydantic import Field, model_validator
-
-from gammalake._types import Comparable, RayObjectReference
 
 __all__ = (
     "BaseFeatureLake",
@@ -21,6 +19,17 @@ __all__ = (
     "UninitializedDeltaLakeException",
     "UploadMergeModes",
 )
+
+
+class Comparable(Protocol):
+    """A class which allows for comparisons with itself"""
+
+    def __lt__(self, other) -> bool: ...
+    def __le__(self, other) -> bool: ...
+    def __gt__(self, other) -> bool: ...
+    def __ge__(self, other) -> bool: ...
+    def __eq__(self, other) -> bool: ...
+    def __ne__(self, other) -> bool: ...
 
 
 class MissingFeaturesException(KeyError):
@@ -72,13 +81,11 @@ class BaseFeatureLake(abc.ABC):
     def index_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         """Returns the index table. Used in query operations."""
 
-    def add_index_rows(self, df: pl.DataFrame | RayObjectReference) -> list:
+    def add_index_rows(self, df: pl.DataFrame) -> None:
         """Extend this FeatureLake's index without adding features.
 
         Args:
-            df: An input Polars DataFrame, or object reference pointing to one, containing the sort-key rows to add.
-
-        Returns: A list of write results.
+            df: An input Polars DataFrame containing the sort-key rows to add.
 
         """
         raise NotImplementedError
@@ -89,9 +96,8 @@ class BaseFeatureLake(abc.ABC):
 
     @read.register
     @abc.abstractmethod
-    def _(self, features: list, start: Comparable | None = None, end: Comparable | None = None, local: bool = True) -> pl.DataFrame:
-        """A specialization of .read(...) which takes a list of feature names as input, a start/end value for comparisons, and a boolean value 'local' indicating
-        whether or not the user wants to take advantage of parallelization on a ray cluster for this operation.
+    def _(self, features: list, start: Comparable | None = None, end: Comparable | None = None) -> pl.DataFrame:
+        """A specialization of .read(...) which takes a list of feature names as input and a start/end value for comparisons.
 
         .. code-block:: python
 
@@ -102,18 +108,14 @@ class BaseFeatureLake(abc.ABC):
             features: a list of feature names found in this FeatureLake's feature metadata table.
             start: A comparable value, the feature values of which will have their index entries >= start.
             end: A comparable value, the feature values of which will have their index entries <= end.
-            local: A flag indicating whether or not to use ray to parallelize the read operations.
 
         Returns: a polars DataFrame of indexed features
         """
 
     @read.register
     @abc.abstractmethod
-    def _(
-        self, features: pl.DataFrame | pl.LazyFrame, start: Comparable | None = None, end: Comparable | None = None, local: bool = True
-    ) -> pl.DataFrame:
-        """A specialization of .read(...) which takes a polars DataFrame (or LazyFrame) as input, a start/end value for comparisons, and a boolean value 'local' indicating
-        whether or not the user wants to take advantage of parallelization on a ray cluster for this operation. The input Data/LazyFrame is expected to be a filtered
+    def _(self, features: pl.DataFrame | pl.LazyFrame, start: Comparable | None = None, end: Comparable | None = None) -> pl.DataFrame:
+        """A specialization of .read(...) which takes a polars DataFrame (or LazyFrame) as input and a start/end value for comparisons. The input Data/LazyFrame is expected to be a filtered
         version of this class' feature_metadata_frame(...) method, and will read features based the rows present in that frame.
 
         .. code-block:: python
@@ -125,7 +127,6 @@ class BaseFeatureLake(abc.ABC):
             features: a possibly filtered version of this object's feature metadata table, used to identify which features to read and return to the user.
             start: A comparable value, the feature values of which will have their index entries >= start.
             end: A comparable value, the feature values of which will have their index entries <= end.
-            local: A flag indicating whether or not to use ray to parallelize the read operations.
 
         Returns: a polars DataFrame of indexed features
         """
@@ -133,38 +134,34 @@ class BaseFeatureLake(abc.ABC):
     @abc.abstractmethod
     def add_features(
         self,
-        df: pl.DataFrame | RayObjectReference,
+        df: pl.DataFrame,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
-    ) -> list:
+    ) -> None:
         """Add features to this FeatureLake object. An optional metadata frame argument allows users to increment very specific feature versions, otherwise we fallback
         to generic insertion logic around latest feature version value.
 
         Args:
-            df: an input polars DataFrame (or object reference pointing to a polars DataFrame) containing feature values to be added to this FeatureLake's underlying DeltaTables.
+            df: an input polars DataFrame containing feature values to be added to this FeatureLake's underlying DeltaTables.
             owner: a string argument for use in identifying ownership in metadata tables.
             metadata: an optional DataFrame object, expected to be a (possibly) filtered version of this object's feature metadata frame, identifying which DeltaTables to update
-
-        Returns: A list of write results.
         """
         ...
 
     @abc.abstractmethod
     def add_targets(
         self,
-        df: pl.DataFrame | RayObjectReference,
+        df: pl.DataFrame,
         owner: str = "missing_owner",
         metadata: pl.DataFrame | None = None,
-    ) -> list:
+    ) -> None:
         """Add targets to this FeatureLake object. An optional metadata frame argument allows users to increment very specific feature versions, otherwise we fallback
         to generic insertion logic around latest feature version value.
 
         Args:
-            df: an input polars DataFrame (or object reference pointing to a polars DataFrame) containing feature values to be added to this FeatureLake's underlying DeltaTables.
+            df: an input polars DataFrame containing feature values to be added to this FeatureLake's underlying DeltaTables.
             owner: a string argument for use in identifying ownership in metadata tables.
             metadata: an optional DataFrame object, expected to be a (possibly) filtered version of this object's feature metadata frame, identifying which DeltaTables to update
-
-        Returns: A list of write results.
         """
         ...
 

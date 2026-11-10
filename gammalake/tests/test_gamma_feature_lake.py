@@ -1,9 +1,5 @@
-import os
-import shutil
-import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
 
 import polars as pl
 import pyarrow as pa
@@ -11,31 +7,27 @@ import pytest
 from ccflow import ArrowSchema
 from deltalake import DeltaTable
 from polars.testing import assert_frame_equal
-from polars_io_tools import pushdown_combine as original_pushdown_combine
 from pydantic import ValidationError
 
-from gammalake import GammaFeatureLake
+from gammalake import DeltaOptions, GammaFeatureLake
 from gammalake.abstract import BaseFeatureLake
-from gammalake.gamma_feature_lake import write_metadata
-from gammalake.io import FrameIO, PolarsIO
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
-@pytest.mark.usefixtures("barebones_ray_cluster")
 class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
     """Unit test suite for GammaFeatureLake backed by local Delta tables.
 
     ``test_*`` wrappers for every ``_test_*(self, fs)`` method in the mixin are
     generated automatically via ``__init_subclass__``.  The ``fs`` fixture below
-    provides each auto-wired test with a fresh, local (non-Ray) GammaFeatureLake.
+    provides each auto-wired test with a fresh, local GammaFeatureLake.
 
-    Tests that require Ray, parametrize over ``use_remote_data`` / ``use_ray_cluster``,
-    need an uninitialised instance, or need ``fs_factory`` are defined explicitly here.
+    Tests that need an uninitialised instance, extra parameters or ``fs_factory``
+    are defined explicitly here.
     """
 
     @pytest.fixture
     def fs(self, tmp_path) -> GammaFeatureLake:
-        return GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+        return GammaFeatureLake(base_path=str(tmp_path)).initialize()
 
     # --- special cases ---
 
@@ -72,12 +64,15 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         table_path = fs.get_path(addr)
         later = generate_test_data(n_features=1, n_symbols=1, n_days=3, start_date=datetime(2021, 1, 1, tzinfo=UTC))
 
-        with patch.object(fs.io, "write_delta", wraps=fs.io.write_delta) as mock_write:
-            fs.add_features(later)
+        table = DeltaTable(table_path)
+        version, configuration = table.version(), table.metadata().configuration
 
-        feature_writes = [call for call in mock_write.call_args_list if call.args[1] == table_path]
-        assert feature_writes
-        assert all("configuration" not in call.kwargs["delta_write_options"] for call in feature_writes)
+        fs.add_features(later)
+
+        table = DeltaTable(table_path)
+        assert fs.feature_metadata_frame().collect()["table_addr"].unique().to_list() == [addr]
+        assert table.version() > version
+        assert table.metadata().configuration == configuration
 
     def test_exceptions(self, tmp_path):
         fs_uninit = GammaFeatureLake(base_path=str(tmp_path))
@@ -86,53 +81,11 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         self._test_exceptions(fs)
 
     def test_exceptions_uninitialized(self, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path))
-        self._test_exceptions_uninitialized(fs)
+        self._test_exceptions_uninitialized(GammaFeatureLake(base_path=str(tmp_path)))
 
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_simple_operations(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_simple_operations(fs, use_remote_data=use_remote_data, run_on_ray_cluster=use_ray_cluster)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_adding_days(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_adding_days(fs, use_remote_data=use_remote_data, run_on_ray_cluster=use_ray_cluster)
-
-    @pytest.mark.parametrize("use_ray_cluster", [True, False])
-    def test_read_with_filtered_metadata_resolves_runtime_upstream_features(self, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, enable_runtime_computed_features=True).initialize()
+    def test_read_with_filtered_metadata_resolves_runtime_upstream_features(self, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path), enable_runtime_computed_features=True).initialize()
         self._test_read_with_filtered_metadata_resolves_runtime_upstream_features(fs)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_adding_symbols(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_adding_symbols(fs, use_remote_data=use_remote_data, run_on_ray_cluster=use_ray_cluster)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_appending_new_features(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_appending_new_features(fs, use_remote_data=use_remote_data, run_on_ray_cluster=use_ray_cluster)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_features_with_holes(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_features_with_holes(fs, use_remote_data=use_remote_data, run_on_ray_cluster=use_ray_cluster)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_updating_old_features(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_updating_old_features(fs)
-
-    @pytest.mark.parametrize("use_ray_cluster", [True, False])
-    def test_non_unique_index_data(self, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_non_unique_index_data(fs)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_add_index_rows(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_add_index_rows(fs, use_remote_data=use_remote_data)
 
     @pytest.mark.parametrize("overlap_mode", ["copy", "merge"])
     def test_parametrized_overlap_modes_read_correctness(self, overlap_mode, fs):
@@ -146,23 +99,11 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         frame = pl.DataFrame({"timestamp": timestamps, "symbol": symbol})
         return frame.with_columns(*(pl.arange(0, frame.height).cast(pl.Float64).alias(f"feature_{i}") for i in feature_ids))
 
-    def test_feature_metadata_opened_once_per_read(self, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, enable_runtime_computed_features=True).initialize()
-        fs.add_as_of_features(self._clean_frame("A", 0), params={"strategy": "backward"})
-        fs.add_targets(self._clean_frame("A", 1))
-        fs.add_runtime_computed_features([(pl.col("feature_0") + 1).alias("runtime_feature")])
-
-        with patch.object(type(fs), "feature_metadata_frame", autospec=True, side_effect=type(fs).feature_metadata_frame) as spy:
-            fs.read(["runtime_feature"], targets=["feature_1"])
-            fs.read(["runtime_feature"], targets=["feature_1"])
-
-        assert spy.call_count == 2, "feature_metadata Delta table should be opened exactly once per read without a cross-call cache"
-
     def test_as_of_read_requires_feature_params(self, fs):
         fs.add_as_of_features(self._clean_frame("A", 0), params={})
         metadata = fs.feature_metadata_frame().collect().with_columns(pl.lit(None, dtype=pl.String).alias("feature_params"))
 
-        with pytest.raises(ValueError, match="as_of_feature table .* requires feature_params"):
+        with pytest.raises(ValueError, match='as-of feature "feature_0" has no feature_params'):
             fs.read(metadata)
 
     @pytest.mark.parametrize(
@@ -183,7 +124,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         end_index,
         expected,
     ):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         days = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(5)]
         fs.add_as_of_features(
             pl.DataFrame(
@@ -201,29 +142,8 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
         assert result["fundamental"].to_list() == expected
 
-    def test_parallel_read_passes_builtin_metadata_payload(self, fs):
-        fs.add_features(self._clean_frame("A", 0, 1))
-        tables = fs.feature_metadata_frame().collect()
-        calls = []
-
-        def switch(_self, function, **_kwargs):
-            def capture(*args):
-                calls.append(args)
-                return function(*args)
-
-            return capture
-
-        with patch.object(type(fs), "switch", autospec=True, side_effect=switch):
-            fs._load_features_from_tables_in_parallel(tables).collect()
-
-        _, table_meta, features, *_ = calls[0]
-        assert isinstance(table_meta, dict)
-        assert isinstance(features, list)
-        assert {"table_addr", "signal_type", "feature_params"} <= table_meta.keys()
-
-    @pytest.mark.parametrize("run_on_ray_cluster", [False, True])
-    def test_multi_table_read_preserves_horizontal_alignment(self, run_on_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    def test_multi_table_read_preserves_horizontal_alignment(self, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         days = pl.datetime_range(
             datetime(2020, 1, 1, tzinfo=UTC),
             datetime(2020, 1, 3, tzinfo=UTC),
@@ -236,80 +156,28 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         feature_1 = keys.with_columns(pl.Series("feature_1", [100.0, 101.0, 200.0, 201.0, 300.0, 301.0]))
         fs.add_features(feature_0)
         fs.add_features(feature_1)
-        reader = fs.model_copy(update={"run_on_ray_cluster": run_on_ray_cluster})
 
         expected = feature_0.join(feature_1, on=fs.sort_keys).select(["feature_0", "feature_1"] + fs.sort_keys)
 
-        assert_frame_equal(reader.read(["feature_0", "feature_1"]), expected, check_column_order=False)
-
-    def test_multi_table_read_uses_positional_concat(self, fs):
-        fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=0))
-        fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=1))
-        plans = []
-
-        def capture_combine(sources, combine):
-            result = combine({name: frame for name, (frame, _) in sources.items()})
-            plans.append(result.explain())
-            return result
-
-        with patch("gammalake.gamma_feature_lake.pushdown_combine", side_effect=capture_combine):
-            fs.read(["feature_0", "feature_1"], materialized=False).collect()
-
-        assert "HCONCAT" in plans[0]
-        assert "JOIN" not in plans[0]
+        assert_frame_equal(fs.read(["feature_0", "feature_1"]), expected, check_column_order=False)
 
     def test_multi_source_filter_plan_and_exact_equivalence(self, fs):
         fs.add_features(generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_ids_start=0))
         fs.add_features(generate_test_data(n_features=2, n_symbols=3, n_days=5, feature_ids_start=1))
         user_filter = pl.col("symbol") == "Symbol_1"
         features = ["feature_0", "feature_1", "feature_2"]
-        expected = fs.read(features, materialized=False).collect().filter(user_filter).select("feature_0", *fs.sort_keys)
-        source_calls = {}
-        source_plans = {}
-        source_schemas = {}
+        expected = fs.read(features).filter(user_filter).select("feature_0", *fs.sort_keys)
 
-        def tracked_source(name, frame):
-            source_schemas[name] = frame.collect_schema()
-
-            def source_generator(with_columns, predicate, n_rows, batch_size):
-                source_calls.setdefault(name, []).append((with_columns, predicate))
-                query = frame.filter(predicate) if predicate is not None else frame
-                source_plans[name] = query.explain(optimized=True)
-                if n_rows is not None:
-                    query = query.head(n_rows)
-                if with_columns is not None:
-                    query = query.select(with_columns)
-                result = query.collect()
-                if batch_size is None or result.is_empty():
-                    yield result
-                else:
-                    yield from result.iter_slices(n_rows=batch_size)
-
-            return pl.io.plugins.register_io_source(source_generator, schema=frame.collect_schema(), is_pure=True)
-
-        def capture_sources(sources, combine):
-            tracked = {name: (tracked_source(name, frame), filter_specs) for name, (frame, filter_specs) in sources.items()}
-            return original_pushdown_combine(tracked, combine)
-
-        with patch("gammalake.gamma_feature_lake.pushdown_combine", side_effect=capture_sources):
-            lazy = fs.read(features, materialized=False).filter(user_filter).select("feature_0", *fs.sort_keys)
-            outer_plan = lazy.explain(optimized=True)
-            first = lazy.collect()
-            second = lazy.collect()
+        lazy = fs.read(features, materialized=False).filter(user_filter).select("feature_0", *fs.sort_keys)
+        outer_plan = lazy.explain(optimized=True)
+        first = lazy.collect()
+        second = lazy.collect()
 
         assert_frame_equal(first, expected)
         assert_frame_equal(second, expected)
         assert "PYTHON" in outer_plan and "SCAN" in outer_plan
         assert 'col("symbol")' in outer_plan
         assert '"Symbol_1"' in outer_plan
-        assert len(source_calls) == 3
-        assert all(len(calls) == 2 for calls in source_calls.values())
-        assert all(calls[0][1] is not None and calls[0][1].meta.root_names() == ["symbol"] for calls in source_calls.values())
-        assert all('col("symbol")' in plan and '"Symbol_1"' in plan for plan in source_plans.values())
-        unused_source = next(name for name, schema in source_schemas.items() if "feature_1" in schema)
-        unused_columns = source_calls[unused_source][0][0]
-        assert "symbol" in unused_columns
-        assert set(unused_columns) & {"feature_1", "feature_2"}
 
     def test_feature_filter_matches_filtering_unmaterialized_result(self, fs):
         fs.add_features(generate_test_data(n_features=2, n_symbols=3, n_days=5))
@@ -332,7 +200,6 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
     def test_runtime_features_compute_before_lazy_filter(self, tmp_path):
         fs = GammaFeatureLake(
             base_path=str(tmp_path),
-            run_on_ray_cluster=False,
             enable_runtime_computed_features=True,
         ).initialize()
         days = [datetime(2020, 1, day, tzinfo=UTC) for day in range(1, 6)]
@@ -415,7 +282,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
     def test_non_leading_primary_sort_key_preserves_alignment_and_bounds(self, tmp_path):
         schema = ArrowSchema.make(pa.schema([("symbol", pa.string()), ("timestamp", pa.timestamp("us", tz="UTC"))]))
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, primary_sort_key="timestamp").initialize(schema=schema)
+        fs = GammaFeatureLake(base_path=str(tmp_path), primary_sort_key="timestamp").initialize(schema=schema)
         days = [datetime(2020, 1, day, tzinfo=UTC) for day in range(1, 4)]
         full = pl.DataFrame(
             {
@@ -444,7 +311,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         def fs_factory():
             p = tmp_path / uuid.uuid4().hex
             p.mkdir()
-            return GammaFeatureLake(base_path=str(p), run_on_ray_cluster=False).initialize()
+            return GammaFeatureLake(base_path=str(p)).initialize()
 
         self._test_read_equivalence_across_overlap_modes(fs_factory, modes)
 
@@ -453,24 +320,13 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         def fs_factory():
             p = tmp_path / uuid.uuid4().hex
             p.mkdir()
-            return GammaFeatureLake(base_path=str(p), run_on_ray_cluster=False).initialize()
+            return GammaFeatureLake(base_path=str(p)).initialize()
 
         self._test_read_equivalence_multi_symbol(fs_factory, modes)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_runtime_computed_features(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, enable_runtime_computed_features=True).initialize()
-        self._test_runtime_computed_features(fs, use_remote_data=use_remote_data)
-
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_runtime_transforms(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, enable_runtime_computed_features=True).initialize()
-        self._test_runtime_transforms(fs, use_remote_data=use_remote_data)
 
     def test_runtime_transform_rejects_sort_key_collision(self, tmp_path):
         fs = GammaFeatureLake(
             base_path=str(tmp_path),
-            run_on_ray_cluster=False,
             primary_sort_key="value__abs",
             enable_runtime_computed_features=True,
         ).initialize(ArrowSchema.make(pa.schema([("value__abs", pa.int64()), ("symbol", pa.string())])))
@@ -480,7 +336,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
             fs.add_runtime_transforms(features=["value"], transforms=["abs"])
 
     def test_runtime_computed_features_require_opt_in(self, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         df = generate_test_data(n_features=2, n_symbols=2, n_days=2)
         fs.add_features(df, owner="test-owner")
         runtime_expr = (pl.col("feature_0") + pl.col("feature_1")).alias("runtime_feature")
@@ -490,26 +346,25 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
             fs.add_runtime_transforms(["feature_0"], ["abs"])
 
-        enabled_fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, enable_runtime_computed_features=True)
+        enabled_fs = GammaFeatureLake(base_path=str(tmp_path), enable_runtime_computed_features=True)
         enabled_fs.add_runtime_computed_features([runtime_expr])
         enabled_fs.add_runtime_transforms(["feature_0"], ["abs"])
         runtime_metadata = enabled_fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "runtime_feature")
         transform_metadata = enabled_fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "feature_0__abs")
 
-        with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
+        with pytest.raises(ValueError, match="Runtime-computed features are disabled"):
             fs.read(["runtime_feature"])
-        with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
+        with pytest.raises(ValueError, match="Runtime-computed features are disabled"):
             fs.read(runtime_metadata)
-        with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
+        with pytest.raises(ValueError, match="Runtime-computed features are disabled"):
             fs.read(["feature_0__abs"])
-        with pytest.raises(ValueError, match="enable_runtime_computed_features=True"):
+        with pytest.raises(ValueError, match="Runtime-computed features are disabled"):
             fs.read(transform_metadata)
 
     # --- inline test not in mixin: tests Polars compression field ---
 
-    @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
-    def test_updating_old_features_while_changing_write_compression_level(self, use_remote_data, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+    def test_updating_old_features_while_changing_write_compression_level(self, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         n_symbols = 10
         n_days = 10
         n_features = 5
@@ -529,7 +384,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         )
 
         df2 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date, feature_suffix="F2")
-        fs = GammaFeatureLake(base_path=str(tmp_path), compression="gzip", run_on_ray_cluster=use_ray_cluster)
+        fs = GammaFeatureLake(base_path=str(tmp_path), delta_options=DeltaOptions(compression="gzip"))
         fs.add_features(df2)
         df2 = df2.unique(subset=fs.sort_keys).filter(pl.all_horizontal(pl.col(key).is_not_null() for key in fs.sort_keys))
         self.assertExpected(
@@ -545,7 +400,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         df3 = generate_test_data(
             n_features=n_features, n_symbols=n_symbols, n_days=2 * n_days, start_date=start_date + timedelta(days=10), feature_suffix="F1"
         )
-        fs = GammaFeatureLake(base_path=str(tmp_path), compression="lz4", run_on_ray_cluster=use_ray_cluster)
+        fs = GammaFeatureLake(base_path=str(tmp_path), delta_options=DeltaOptions(compression="lz4"))
         fs.add_features(df3)
         df3 = df3.unique(subset=fs.sort_keys).filter(pl.all_horizontal(pl.col(key).is_not_null() for key in fs.sort_keys))
         self.assertExpected(
@@ -561,7 +416,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         df4 = generate_test_data(
             n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date + timedelta(days=20), feature_suffix="F2"
         )
-        fs = GammaFeatureLake(base_path=str(tmp_path), compression="SNAPPY", run_on_ray_cluster=use_ray_cluster)
+        fs = GammaFeatureLake(base_path=str(tmp_path), delta_options=DeltaOptions(compression="SNAPPY"))
         fs.add_features(df4)
         df4 = df4.unique(subset=fs.sort_keys).filter(pl.all_horizontal(pl.col(key).is_not_null() for key in fs.sort_keys))
         self.assertExpected(
@@ -591,30 +446,10 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         assert tbl.select(features).equals(local_table)
 
         with pytest.raises(ValidationError):
-            GammaFeatureLake(base_path=str(tmp_path), compression="MIDDLE_OUT", run_on_ray_cluster=use_ray_cluster)
+            GammaFeatureLake(base_path=str(tmp_path), delta_options={"compression": "MIDDLE_OUT"})
 
-    @pytest.mark.parametrize("use_ray_cluster", [True, False])
-    def test_consolidate_feature_groups(self, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_consolidate_feature_groups(fs)
-
-    @pytest.mark.parametrize("use_ray_cluster", [True, False])
-    def test_consolidate_independent_groups_stay_separate(self, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
-        self._test_consolidate_independent_groups_stay_separate(fs)
-
-    @pytest.mark.parametrize("use_ray_cluster", [True, False])
-    def test_consolidate_rejects_non_consolidatable_signal_types(self, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(
-            base_path=str(tmp_path),
-            run_on_ray_cluster=use_ray_cluster,
-            enable_runtime_computed_features=True,
-        ).initialize()
-        self._test_consolidate_rejects_non_consolidatable_signal_types(fs)
-
-    @pytest.mark.parametrize("use_ray_cluster", [True, False])
-    def test_consolidate_features_and_targets(self, use_ray_cluster, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+    def test_consolidate_features_and_targets(self, tmp_path):
+        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         features = generate_test_data(n_features=2, n_symbols=3, n_days=5)
         targets = generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_suffix="target")
         fs.add_features(features)
@@ -670,7 +505,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
                 }
             ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
 
-        lake = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+        lake = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         lake.add_features(frame([(1, "A"), (2, "A"), (3, "A")], x=1))
         lake.add_features(frame([(3, "B")], y=10))
         lake.add_features(frame([(4, "A")], x=1))
@@ -685,8 +520,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
         assert_frame_equal(result, expected)
 
-    @pytest.mark.parametrize("use_ray_cluster", [True, False])
-    def test_partial_future_feature_updates(self, use_ray_cluster, tmp_path):
+    def test_partial_future_feature_updates(self, tmp_path):
         def frame(days, **features):
             return pl.DataFrame(
                 {
@@ -696,288 +530,77 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
                 }
             ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
 
-        fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster).initialize()
+        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         fs.add_features(frame([1, 2, 3], x=1, y=10))  # x and y share one feature table
         fs.add_features(frame([1, 2, 3, 4, 5], z=100))  # the index now runs to day 5
         fs.add_features(frame([4], x=1), overlap_mode="merge")  # write x alone for day 4
+
+        expected = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, d, tzinfo=UTC) for d in range(1, 6)],
+                "symbol": ["A"] * 5,
+                "x": [1.0, 2.0, 3.0, 4.0, None],
+                "y": [10.0, 20.0, 30.0, None, None],
+                "z": [100.0, 200.0, 300.0, 400.0, 500.0],
+            }
+        ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+        assert_frame_equal(fs.read(["x", "y", "z"]).sort(fs.sort_keys), expected, check_column_order=False)
 
 
 def test_primary_sort_key_not_in_schema_raises(tmp_path):
     """initialize() raises ValueError when primary_sort_key is absent from the provided schema."""
     schema = ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())]))
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, primary_sort_key="not_a_column")
+    fs = GammaFeatureLake(base_path=str(tmp_path), primary_sort_key="not_a_column")
     with pytest.raises(ValueError, match="not_a_column"):
         fs.initialize(schema=schema)
 
 
 def test_primary_sort_key_not_in_existing_index_raises(tmp_path):
     """Re-opening an existing lake with a primary_sort_key absent from the on-disk index raises ValidationError."""
-    GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    GammaFeatureLake(base_path=str(tmp_path)).initialize()
     with pytest.raises(ValidationError, match="not_a_column"):
-        GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, primary_sort_key="not_a_column")
+        GammaFeatureLake(base_path=str(tmp_path), primary_sort_key="not_a_column")
 
 
-def test_failed_write_does_not_corrupt_feature_metadata(tmp_path):
-    """Regression test for primary sort key validation.
-
-    If a feature write fails after the feature data is written but before table_metadata
-    is written, a subsequent retry must not crash with a TypeError from comparing
-    input_comparable_min against a null last_updated.
-
-    We simulate the failure by patching write_delta to raise on the table_metadata write.
-    """
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    df = generate_test_data(n_features=2, n_symbols=3, n_days=5)
-
-    real_write_delta = fs.io.write_delta
-
-    def fail_on_table_metadata(frame, path, **kwargs):
-        if path == fs.table_metadata:
-            raise RuntimeError("simulated table_metadata write failure")
-        return real_write_delta(frame, path, **kwargs)
-
-    with patch.object(fs.io, "write_delta", side_effect=fail_on_table_metadata), pytest.raises(RuntimeError, match="simulated"):
-        fs.add_features(df, owner="test-owner")
-
-    # feature_metadata must be empty: its write was deferred past the failing call.
-    assert fs.feature_metadata_frame().collect().is_empty()
-
-    # A retry must succeed without crashing on a null last_updated comparison.
-    fs.add_features(df, owner="test-owner")
-    assert fs.read([f"feature_{i}" for i in range(2)]).height > 0
+def test_removed_options_are_rejected(tmp_path):
+    for option in ({"engine": "native"}, {"run_on_ray_cluster": False}, {"io": None}):
+        with pytest.raises(ValidationError):
+            GammaFeatureLake(base_path=str(tmp_path), **option)
 
 
-def test_write_metadata_single_commit(tmp_path):
-    """write_metadata must issue exactly one write_delta call for any number of rows."""
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    row1 = pa.table({"col_a": [1], "col_b": ["x"]})
-    row2 = pa.table({"col_a": [2], "col_b": ["y"]})
-    with patch.object(fs.io, "write_delta") as mock_write:
-        write_metadata(fs, fs.table_metadata, row1, None, row2)
-        assert mock_write.call_count == 1
+def test_adds_take_data_frames_and_return_nothing(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    df = generate_test_data(n_features=1, n_symbols=2, n_days=3)
+
+    assert fs.add_features(df) is None
+    assert fs.add_targets(df.rename({"feature_0": "target_0"})) is None
+    assert fs.add_index_rows(df.select(fs.sort_keys)) is None
+    for add in (fs.add_features, fs.add_targets, fs.add_index_rows, fs.add_sparse_features):
+        with pytest.raises(ValidationError):
+            add(df.lazy())
+    with pytest.raises(ValidationError):
+        fs.add_as_of_features(df.to_dict(), params={})
 
 
 def test_add_features_empty_table_no_crash(tmp_path):
     """_get_latest_feature_tables must return an empty frame when feature_columns contains only sort keys."""
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     df = generate_test_data(n_symbols=3, n_days=5).select(["timestamp", "symbol"])
     fs.add_features(df, owner="test")
     assert fs._get_latest_feature_tables(fs.sort_keys, fs.feature_metadata_frame().collect()).is_empty()
     assert fs.feature_metadata_frame().collect().is_empty()
 
 
-def test_add_features_scans_index_and_metadata_once(tmp_path):
-    """Each add must reuse one snapshot of the index and metadata tables."""
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    df = generate_test_data(n_features=2, n_symbols=3, n_days=5)
-    fs.add_features(df, owner="test")
-
-    with patch.object(fs.io, "scan_delta", wraps=fs.io.scan_delta) as mock_scan:
-        fs.add_features(df.with_columns(pl.col("feature_0") + 1), owner="test")
-
-    scanned_paths = [call.args[0] for call in mock_scan.call_args_list]
-    assert scanned_paths.count(fs.index) == 1
-    assert scanned_paths.count(fs.feature_metadata) == 1
-    assert scanned_paths.count(fs.table_metadata) == 1
-
-
-def test_write_metadata_all_none_skips_write(tmp_path):
-    """write_metadata must not call write_delta when every row is None."""
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    with patch.object(fs.io, "write_delta") as mock_write:
-        write_metadata(fs, fs.table_metadata, None, None)
-        assert mock_write.call_count == 0
-
-
-def test_write_metadata_schema_mode_forwarded(tmp_path):
-    """write_metadata must pass schema_mode through to delta_write_options."""
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    row = pa.table({"col_a": [1], "col_b": ["x"]})
-    with patch.object(fs.io, "write_delta") as mock_write:
-        write_metadata(fs, fs.table_metadata, row, schema_mode="merge")
-        assert mock_write.call_count == 1
-        _, kwargs = mock_write.call_args
-        assert kwargs["delta_write_options"].get("schema_mode") == "merge"
-
-
-def test_failed_index_write_does_not_publish_metadata(tmp_path):
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    df = generate_test_data(n_features=2, n_symbols=3, n_days=5)
-
-    with (
-        patch("gammalake.gamma_feature_lake.update_index", side_effect=RuntimeError("simulated index failure")),
-        pytest.raises(RuntimeError, match="simulated index failure"),
-    ):
-        fs.add_features(df, owner="test-owner")
-
-    assert fs.index_frame().collect().is_empty()
-    assert fs.table_metadata_frame().collect().is_empty()
-    assert fs.feature_metadata_frame().collect().is_empty()
-
-    fs.add_features(df, owner="test-owner")
-    assert fs.read(["feature_0", "feature_1"]).height == fs.index_frame().collect().height
-
-
-class _FailingIO(PolarsIO):
-    """PolarsIO that fails writes to the table named by ``fail_on`` and delays writes to tables starting with ``slow_prefix``."""
-
-    def __init__(self, fail_on: str | None = None, slow_prefix: str | None = None):
-        self.fail_on = fail_on
-        self.slow_prefix = slow_prefix
-
-    def write_delta(self, df, target, **kwargs):
-        if self.fail_on is not None and os.path.basename(target) == self.fail_on:
-            raise RuntimeError(f"simulated failure writing {self.fail_on}")
-        if self.slow_prefix is not None and os.path.basename(target).startswith(self.slow_prefix):
-            time.sleep(1)
-        return super().write_delta(df, target, **kwargs)
-
-
-def _frame(days, value: float) -> pl.DataFrame:
-    """One feature ``f`` for symbols ``a`` and ``b`` on each of ``days`` (day-of-January offsets)."""
-    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=day) for day in days for _ in ("a", "b")]
-    return pl.DataFrame({"timestamp": timestamps, "symbol": ["a", "b"] * len(days), "f": [float(value)] * len(timestamps)}).with_columns(
-        pl.col("timestamp").dt.cast_time_unit("us")
-    )
-
-
-def _statuses(fs: GammaFeatureLake) -> list[str]:
-    return fs.transaction_log_frame().sort("updated_at").collect()["status"].to_list()
-
-
-def test_transaction_log_records_pending_then_success(tmp_path):
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    assert fs.transaction_log_frame().collect().is_empty()
-
-    fs.add_features(_frame(range(1, 3), 1), owner="me")
-
-    log = fs.transaction_log_frame().sort("updated_at").collect()
-    assert log["status"].to_list() == ["pending", "success"]
-    assert log["transaction_id"].n_unique() == 1
-    assert log["owner"].to_list() == ["me", "me"]
-    assert log["signal_type"].to_list() == ["feature", "feature"]
-
-
-def test_rejected_input_is_not_logged_as_a_transaction(tmp_path):
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-
-    with pytest.raises(ValueError, match="no rows"):
-        fs.add_features(_frame([1], 1).clear())
-
-    assert fs.transaction_log_frame().collect().is_empty()
-
-
-@pytest.mark.parametrize("use_ray_cluster", [False, True])
-def test_failed_add_is_rolled_back_and_later_writes_do_not_see_it(use_ray_cluster, tmp_path, barebones_ray_cluster):
-    """Regression test for issue #52: feature tables must not keep a failed write that the index never received.
-
-    With Ray, the feature table write is still in flight when the index write fails, so rollback has to wait for it.
-    """
-    io = _FailingIO()
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, io=io, table_name_prefix="data_").initialize()
-    fs.add_features(_frame(range(1, 6), 1), owner="me")
-    index_before = fs.index_frame().collect()
-
-    io.fail_on = "index"
-    io.slow_prefix = "data_" if use_ray_cluster else None
-    with pytest.raises(Exception, match="simulated failure writing index"):
-        fs.add_features(_frame([6, 7], 2), owner="me")
-
-    time.sleep(2)  # long enough for a write that rollback failed to wait for to land
-    assert_frame_equal(fs.index_frame().collect(), index_before)
-    assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10
-    log = fs.transaction_log_frame().sort("updated_at").collect()
-    assert log["status"].to_list()[-3:] == ["pending", "failed", "rolled_back"]
-    assert "simulated failure writing index" in log["error"][-1]
-
-    io.fail_on = None
-    io.slow_prefix = None
-    fs.add_features(_frame([8, 9], 3), owner="me")
-
-    assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10 + [3.0] * 4
-
-
-def test_failed_rollback_leaves_transaction_failed(tmp_path):
-    io = _FailingIO()
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False, io=io).initialize()
-    fs.add_features(_frame(range(1, 6), 1), owner="me")
-
-    io.fail_on = "index"
-    with (
-        patch.object(io, "restore_to_timestamp", side_effect=RuntimeError("restore exploded")),
-        pytest.raises(RuntimeError, match="restore exploded") as excinfo,
-    ):
-        fs.add_features(_frame([6, 7], 2), owner="me")
-
-    assert "simulated failure writing index" in str(excinfo.value.__context__)
-    assert _statuses(fs)[-2:] == ["pending", "failed"]
-
-
-def test_lake_created_before_the_transaction_log_creates_it_on_first_write(tmp_path):
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
-    shutil.rmtree(fs.transaction_log)
-
-    fs.add_features(_frame(range(1, 3), 1), owner="me")
-
-    assert _statuses(fs) == ["pending", "success"]
-
-
-def test_polars_io_restore_skips_tables_without_newer_commits(tmp_path):
-    io = PolarsIO()
-    path = str(tmp_path / "table")
-    io.write_delta(pl.DataFrame({"value": [1]}), path)
-    time.sleep(0.1)
-    cutoff = datetime.now(UTC)
-
-    io.restore_to_timestamp(path, cutoff)
-    assert DeltaTable(path).version() == 0
-
-    time.sleep(0.1)
-    io.write_delta(pl.DataFrame({"value": [2]}), path, mode="append")
-    io.restore_to_timestamp(path, cutoff)
-    assert io.scan_delta(path).collect()["value"].to_list() == [1]
-
-
 def test_optional_backend_extensions_remain_compatible():
-    assert {"annotate_table", "describe_table", "restore_to_timestamp"}.isdisjoint(FrameIO.__abstractmethods__)
     assert "add_index_rows" not in BaseFeatureLake.__abstractmethods__
-
-
-def test_polars_io_forwards_delta_configuration():
-    configuration = {"delta.dataSkippingStatsColumns": "timestamp,symbol"}
-    with patch("gammalake.io.piot.sink_delta") as mock_write:
-        PolarsIO().write_delta(pl.DataFrame({"value": [1]}), "unused", delta_write_options={"configuration": configuration})
-
-    frame, target = mock_write.call_args.args
-    assert isinstance(frame, pl.LazyFrame)
-    assert target == "unused"
-    assert mock_write.call_args.kwargs == {
-        "chunk_size": -1,
-        "delta_write_options": {"configuration": configuration},
-    }
-
-
-def test_polars_io_writes_lazy_frames(tmp_path):
-    frame = pl.LazyFrame(
-        {
-            "timestamp": pl.Series([datetime(2024, 1, 1, tzinfo=UTC)]).cast(pl.Datetime("us", "UTC")),
-            "value": [1.0],
-        }
-    )
-    io = PolarsIO()
-    path = str(tmp_path / "lazy_frame")
-
-    io.write_delta(frame, path, mode="overwrite")
-
-    assert_frame_equal(io.scan_delta(path).collect(), frame.collect())
 
 
 def test_add_features_single_commit_per_metadata_table(tmp_path):
     """add_features must batch metadata rows into one commit per non-empty metadata table."""
-    fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=False).initialize()
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     df = generate_test_data(n_symbols=5, n_days=3)
-    with patch.object(fs.io, "write_delta") as mock_write:
-        fs.add_features(df, owner="test")
-        metadata_paths = [call.args[1] for call in mock_write.call_args_list if call.args[1] in (fs.table_metadata, fs.feature_metadata)]
-        assert metadata_paths.count(fs.table_metadata) == 1
-        assert metadata_paths.count(fs.feature_metadata) == 1
+    before = {path: DeltaTable(path).version() for path in (fs.table_metadata, fs.feature_metadata)}
+
+    fs.add_features(df, owner="test")
+
+    assert {path: DeltaTable(path).version() for path in before} == {path: version + 1 for path, version in before.items()}

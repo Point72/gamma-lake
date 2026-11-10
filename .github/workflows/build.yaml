@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -25,7 +25,32 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        include:
+          - name: ubuntu-24.04
+            dist_path: dist
+            os: ubuntu-24.04
+            python: "3.11"
+            target: native
+          - name: ubuntu-24.04-arm
+            dist_path: dist
+            os: ubuntu-24.04-arm
+            python: "3.11"
+            target: native
+          - name: macos-26
+            dist_path: dist
+            os: macos-26
+            python: "3.11"
+            target: native
+          - name: windows-2025
+            dist_path: dist
+            os: windows-2025
+            python: "3.11"
+            target: native
 
     steps:
       - name: Checkout
@@ -36,55 +61,107 @@ jobs:
       - name: Setup Python
         uses: actions-ext/python/setup@c7ef9cbf13bc854a8d1422e9f8c6ee7a7ce1b911
         with:
-          version: "3.11"
+          version: ${{ matrix.python }}
+
+      - name: Setup Rust
+        uses: actions-ext/rust/setup@10df15e12bbd1cc1cf48089f2e232349f98c74e7
 
       - name: Install dependencies
         run: make develop
+        if: matrix.target == 'native'
 
       - name: Lint
         run: make lint
+        if: matrix.target == 'native'
 
       - name: Checks
         run: make checks
+        if: matrix.name == 'ubuntu-24.04'
 
       - name: Build
         run: make build
+        if: matrix.target == 'native'
 
       - name: Test
         run: make coverage
+        if: matrix.target == 'native'
+
+      - name: Build and test Pyodide wheel
+        run: make test-pyodide
+        if: matrix.target == 'pyodide'
 
       - name: Upload test results (Python)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: test-results
-          path: junit.xml
-        if: always()
+          name: test-results-${{ matrix.name }}
+          path: '**/junit.xml'
+        if: always() && matrix.target == 'native'
 
       - name: Publish test results
         uses: EnricoMi/publish-unit-test-result-action@7622c5bf3d112a72ab4fa3951c2aa5723d8ab92d  # v2.25.0
         with:
           files: '**/junit.xml'
+        if: matrix.name == 'ubuntu-24.04'
 
       - name: Upload coverage
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+        if: matrix.target == 'native'
 
-      - name: Build distributions
-        run: make dist
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift
+          df -h /
+        shell: bash
+        if: matrix.target == 'native' && runner.os == 'Linux'
+
+      - name: Build distributions (Linux x86_64)
+        run: |
+          rm -rf dist
+          make dist-rs
+          make dist-py-sdist
+          make dist-py-wheel
+          make dist-check
+        shell: bash
+        env:
+          CIBW_ARCHS_LINUX: native
+        if: matrix.name == 'ubuntu-24.04'
+
+      - name: Build distributions (Linux ARM64)
+        run: |
+          rm -rf dist
+          make dist-py-wheel
+          make dist-check
+        shell: bash
+        env:
+          CIBW_ARCHS_LINUX: native
+        if: matrix.name == 'ubuntu-24.04-arm'
+
+      - name: Build distributions (macOS/Windows)
+        run: |
+          rm -rf dist
+          make dist-py-wheel
+          make dist-check
+        shell: bash
+        env:
+          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=11.0
+        if: matrix.target == 'native' && runner.os != 'Linux'
 
       - name: Test wheel
         uses: actions-ext/python/test-wheel@c7ef9cbf13bc854a8d1422e9f8c6ee7a7ce1b911
         with:
           module: gammalake
+        if: matrix.target == 'native' && runner.os == 'Linux'
 
       - name: Test source distribution
         uses: actions-ext/python/test-sdist@c7ef9cbf13bc854a8d1422e9f8c6ee7a7ce1b911
         with:
           module: gammalake
+        if: matrix.name == 'ubuntu-24.04'
 
       - name: Upload distributions
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: dist
-          path: dist
+          name: dist-${{ matrix.name }}
+          path: ${{ matrix.dist_path }}

@@ -22,8 +22,8 @@ By default, `read()` returns the **latest version** of each feature. To read an 
 frame first:
 
 ```python
-# Read only the original version (version == 1)
-meta = lake.feature_metadata_frame().filter(pl.col("version") == 1).collect()
+# Read only the original version (version == 0)
+meta = lake.feature_metadata_frame().filter(pl.col("version") == 0).collect()
 result = lake.read(meta)
 ```
 
@@ -31,23 +31,14 @@ ______________________________________________________________________
 
 ## Batch Writes to Minimise Index Work
 
-Each `_add()` operation, including calls through `add_features()` and `add_targets()`, scans the global index once and
-appends newly discovered index rows once. Every call also pays fixed dispatch, metadata, and storage-commit overhead, so
-the shape and number of writes can matter more than the total row count.
+Each write of stored features or targets (`add_features()`, `add_targets()`, `add_as_of_features()` and
+`add_sparse_features()`) scans the global index once and appends newly discovered index rows once. Every call also pays
+fixed dispatch, metadata, and storage-commit overhead, so the shape and number of writes can matter more than the total
+row count.
 
 Prefer **wide-and-shallow** writes over **tall-and-skinny** writes. Here, wide means batching related value columns and
 all secondary-key values for a primary-sort-key period; shallow means writing fewer complete periods at a time. Avoid
 splitting the same period across many calls.
-
-Representative object-storage benchmarks for one feature group and one primary-sort-key period show the per-call cost:
-
-| Write shape                                        | Execution mode |   Time |
-| -------------------------------------------------- | -------------- | -----: |
-| 1,000 features × 1,000 secondary-key values        | Ray            |   ~4 s |
-| 1,000 features × 5,000 secondary-key values        | Ray            | ~6.5 s |
-| 1,000 features × 5,000 secondary-key values        | Local          |   ~9 s |
-| The same 5,000 values split across two local calls | Local          |  ~14 s |
-| Ten local calls of 1,000 values each               | Local          |  55+ s |
 
 For backfills, build blocks containing every secondary-key value for each primary-sort-key period, include as many
 complete periods as fit comfortably in memory, and write each block in one call. Do not repeatedly batch the same
@@ -79,8 +70,8 @@ ______________________________________________________________________
 
 ## Keep Feature Groups Logically Coherent
 
-Gamma Lake writes one Delta table per `add_features()` call. Features written in the same call share a Delta table
-(a *feature group*). Design your feature groups around:
+New features written in the same `add_features()` call share a new Delta table (a *feature group*). Later writes to
+those features append to that table or, when they overlap stored rows, follow the call's `overlap_mode`. Design your feature groups around:
 
 - **Update frequency** — features updated daily should be in the same group; intraday features in a separate group
 - **Ownership** — features owned by the same team are natural candidates for the same group
@@ -88,20 +79,6 @@ Gamma Lake writes one Delta table per `add_features()` call. Features written in
 
 Reads always select the minimum set of Delta tables required for the requested feature names, so smaller groups improve
 selective read performance.
-
-______________________________________________________________________
-
-## Use Local Mode for Local Development
-
-Local mode is the default and does not require Ray. When iterating locally — unit tests, notebooks, small experiments —
-you can construct a lake directly:
-
-```python
-lake = GammaFeatureLake(base_path="/tmp/my_lake")
-```
-
-Install the `ray` extra and set `run_on_ray_cluster=True` for production or large-scale workloads where parallel writes
-and reads provide significant speedups.
 
 ______________________________________________________________________
 
@@ -120,10 +97,13 @@ ______________________________________________________________________
 All read methods accept `start` and `end` parameters that are pushed down to the Delta table scan:
 
 ```python
-result = lake.read(["momentum", "vol_20d"], start="2023-01-01", end="2023-12-31")
+from datetime import date
+
+result = lake.read(["momentum", "vol_20d"], start=date(2023, 1, 1), end=date(2023, 12, 31))
 ```
 
-Always provide date ranges when reading from large lakes to avoid scanning all partitions.
+Always provide date ranges when reading from large lakes, so that scans can skip files whose statistics fall outside
+the range.
 
 ______________________________________________________________________
 
@@ -143,14 +123,14 @@ import tempfile, shutil
 
 tmp = tempfile.mkdtemp()
 try:
-    lake = GammaFeatureLake(base_path=tmp, run_on_ray_cluster=False)
+    lake = GammaFeatureLake(base_path=tmp)
     lake.initialize(schema)
     # ... work ...
 finally:
     shutil.rmtree(tmp)
 ```
 
-Or use `tempfile.TemporaryDirectory()` as a context manager (see [`examples/quickstart.py`](https://github.com/Point72/gamma-lake/blob/main/examples/quickstart.py)).
+Or use `tempfile.TemporaryDirectory()` as a context manager, as the [quick start](https://github.com/Point72/gamma-lake#quick-start) does.
 
 ______________________________________________________________________
 

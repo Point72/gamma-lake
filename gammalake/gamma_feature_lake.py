@@ -1,132 +1,10 @@
-"""
-A feature store implementation based on DeltaLake and ray, which focuses on supporting a sortable index on a polars frame and efficient appends/reads.
-
-Updates are 3-step process as follows:
-
-Step 1: Use rows existing in both the existing index and input frame, rows in the index but missing from the input frame, and rows in the input frame which are not yet in the index.
-  If there are no common rows between the index and input frame, this is strictly an append operation to the proper feature table(s) and an insertion into the index.
-  In the case of overlaps, we merge data in-place into the existing DeltaTable using Delta Lake's merge (upsert) operation. No new table is created. We insert null values in the case
-  where there is nonempty overlap, but rows present in the index which are not found in the input table. These operations can be performed in parallel across the set of DeltaTables.
-
-    Processes step 1 of the Gamma Lake add operation for new input frames. Index modification happens outside this function, in parallel, and only once.
-
-    We consider three types of tables to add to out Feature Store:
-    - Rows in both the index table AND input frame
-    - Rows in in the index table, but not the input frame
-    - Rows in the input frame, but not in the index table
-
-    When no rows from the input table are found in the index, we append rows into the provided delta table address,
-    and perform updates to the feature/table metadata tables.
-
-    .. code-block::
-
-        Existing Table                    Input Table               Modified Existing Table
-        +-------------------+           +-------------------+           +-------------------+
-        | Index   | Value   |           | Index  | Value    |           | Index  | Value    |
-        +-------------------+           +-------------------+           +-------------------+
-        | I1      | V1      |           |        |          |           | I1     | V1       |
-        | I2      | V2      |           |        |          |           | I2     | V2       |
-        | I3      | V3      |           |        |          |           | I3     | V3       |
-        | I4      | V4      |           |        |          |    =>     | I4     | V4       |
-        | I5      | V5      |           |        |          |           | I5     | V5       |
-        | I6      | V6      |           |        |          |           | I6     | V6       |
-        +-------------------+           | I7     | V7'      |           | I7     | V7'      |
-                                        | I8     | V8'      |           | I8     | V8'      |
-                                        | I9     | V9'      |           | I9     | V9'      |
-                                        +-------------------+           +-------------------+
-
-    When we have input rows where at least some already exist in the input frame, we proceed as follows:
-
-    If the input rows overlapping with the existing index are before the target table's "latest_update" timestamp,
-    we merge the intersection and alignment rows directly into the existing DeltaTable. Overlapping rows are updated
-    in-place; alignment rows (index rows not present in the input, with null feature values) are inserted. In the
-    example below, assume that the existing index at the processing of the input table ranges from I1 to I6.
-
-
-    .. code-block::
-
-          Existing Table                     Input Table                  Modified Existing Table (new Delta version)
-        +-------------------+           +-------------------+           +-------------------+
-        | Index  | Value    |           | Index  | Value    |           | Index  | Value    |
-        +-------------------+           +-------------------+           +-------------------+
-        | I1     | V1       |           |        |          |           | I1     | V1       |
-        | I2     | V2       |           |        |          |           | I2     | V2       |
-        | I3     | V3       |           | I3     | V3'      |           | I3     | V3'      |
-        | I4     | V4       |           |        |          |    =>     | I4     | null     |
-        | I5     | V5       |           | I5     | V5'      |           | I5     | V5'      |
-        | I6     | V6       |           |        |          |           | I6     | null     |
-        +-------------------+           | I7     | V7'      |           | I7     | V7'      |
-                                        | I8     | V8'      |           | I8     | V8'      |
-                                        | I9     | V9'      |           | I9     | V9'      |
-                                        +-------------------+           +-------------------+
-
-    Otherwise, we simply append the new rows and "pad" missing index values between the latest_update timestamp of the existing table and input table. In the
-    example below, assume the existing index at the processing of the input table ranges from I1 to I9.
-
-    .. code-block::
-
-        Existing Table                     Input Table               Modified Existing Table
-        +-------------------+           +-------------------+           +-------------------+
-        | Index  | Value    |           | Index  | Value    |           | Index  | Value    |
-        +-------------------+           +-------------------+           +-------------------+
-        | I1     | V1       |           |        |          |           | I1     | V1       |
-        | I2     | V2       |           |        |          |           | I2     | V2       |
-        | I3     | V3       |           |        |          |           | I3     | V3       |
-        | I4     | V4       |           |        |          |    =>     | I4     | V4       |
-        | I5     | V5       |           |        |          |           | I5     | V5       |
-        | I6     | V6       |           |        |          |           | I6     | V6       |
-        +-------------------+           | I7     | V7'      |           | I7     | V7'      |
-                                        |        |          |           | I8     | null     |
-                                        | I9     | V9'      |           | I9     | V9'      |
-                                        +-------------------+           +-------------------+
-
-
-Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
-  This step identifies the qualified tables (all feature tables which contain no features found in the input table).
-  This preserves index alignment across all our delta tables, and we can do this in parallel.
-
-    In step 2, we append new index values (ie, with null feature values) to all applicable tables - tables which were not updated in step 1, which we can
-    identify in parallel and perform updates to simultaneously.
-
-    Updated index values for tables which hold no features in common with the input table will only update up to the latest_update preexisting in that table.
-
-    Example:
-
-    .. code-block::
-
-           Feature Table 1                 Feature Table 2                  Input Table                    Feature Table 1                 Feature Table 2
-        +-------------------+           +-------------------+           +-------------------+           +-------------------+           +-------------------+
-        | Index  | Feature 1|           | Index  | Feature 2|           | Index  | Feature 2|           | Index  | Value    |           | Index  | Value    |
-        +-------------------+           +-------------------+           +-------------------+           +-------------------+           +-------------------+
-        | I1     | V1_1     |           | I1     | V1_2     |           | I1     |          |           | I1     | V1_1     |           | I1     | V1_2     |
-        |        |          |           |        |          |           | I2     | V2'      |           | I2     | null     |           | I2     | V2'      |
-        |        |          |           |        |          |           | I3     | V3'      |    ==>    | I3     | null     |           | I3     | V3'      |
-        | I4     | V4_1     |           | I4     | V4_2     |           | I4     |          |           | I4     | V4_1     |           | I4     | V4_2     |
-        |        |          |           |        |          |           | I5     | V5'      |           | I5     | null     |           | I5     | V5'      |
-        | I6     | V6_1     |           | I6     | V6_2     |           | I6     |          |           | I6     | V6_1     |           | I6     | V6_2     |
-        |        |          |           |        |          |           | I7     | V7'      |           |        |          |           | I7     | V7'      |
-        +-------------------+           +-------------------+           +-------------------+           +-------------------+           +-------------------+
-
-Step 3: Append the results of an anti-join between the new data and the index back into the master index. This can also be done in parallel.
-
-Two overlap modes are supported via the ``overlap_mode`` parameter on :meth:`add_features`,
-:meth:`add_targets`, :meth:`add_as_of_features`, and :meth:`add_sparse_features`:
-
-- ``"copy"`` *(default, backwards-compatible)*: On overlap, a brand-new Delta table is created
-  and ``feature_metadata`` records the new ``table_addr``.
-- ``"merge"``: On overlap, the existing Delta table is updated in-place via a merge (upsert).
-  All reads always use the latest physical version of the table.
-"""
+"""Polars-facing Gamma Lake API."""
 
 from __future__ import annotations
 
-import io
-import json
 import os
-import traceback
-import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from datetime import datetime
 from functools import singledispatchmethod, wraps
 from typing import Literal
@@ -135,468 +13,78 @@ import polars as pl
 import pyarrow as pa
 from ccflow import ArrowSchema, BaseModel
 from ccflow.exttypes.polars import PolarsExpression
-from deltalake import WriterProperties
-from deltalake.writer.properties import Compression
 from packaging import version
-from polars_io_tools import FilterSpec, pushdown_combine
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, model_validator, validate_call
 
-from gammalake._ray import get as ray_get, is_object_ref, remote as ray_remote, require_ray, wait as ray_wait
-from gammalake._telemetry import trace
-from gammalake._topo import with_columns_topo
-from gammalake._types import RayObjectReference
-from gammalake.abstract import (
-    BaseFeatureLake,
-    Comparable,
-    MissingFeaturesException,
-    MissingOrMisregisteredSignalsException,
-    UninitializedDeltaLakeException,
-)
-from gammalake.io import FrameIO, PolarsIO
-from gammalake.metadata import (
-    DEFAULT_INDEX_SCHEMA,
-    Transaction,
-    TransactionStatus,
-    empty_feature_metadata,
-    empty_table_metadata,
-    empty_transaction_log,
-    table_metadata_row,
-    transaction_log_row,
-)
+from gammalake.abstract import BaseFeatureLake, Comparable, UninitializedDeltaLakeException
+from gammalake.native import ConflictError, DeltaOptions, NativeLake, PartialWriteError, UnsupportedError
 
-__all__ = ("GammaFeatureLake", "align_feature_tables", "update_feature_tables", "update_index", "write_metadata")
+__all__ = ("ConflictError", "DeltaOptions", "GammaFeatureLake", "PartialWriteError", "UnsupportedError")
 
-
-def preprocess_df(feature_store, df):
-    if len(df) == 0:
-        raise ValueError("Provided dataframe has no rows!")
-    if df.select(pl.struct(*feature_store.sort_keys).is_duplicated().any()).item():
-        secondary_keys = [k for k in feature_store.sort_keys if k != feature_store.primary_sort_key]
-        first_distinct_expr = pl.col(feature_store.primary_sort_key).is_first_distinct()
-        if secondary_keys:
-            first_distinct_expr = first_distinct_expr.over(*secondary_keys)
-        df = df.lazy().filter(first_distinct_expr).collect(engine="streaming")
-    return df.filter(pl.all_horizontal(pl.col(key).is_not_null() for key in feature_store.sort_keys))
-
-
-def update_feature_tables(
-    feature_store: GammaFeatureLake,
-    table_addr: str | None,
-    input_length: int,
-    inner_join_ref: RayObjectReference[pl.DataFrame],
-    new_index_rows_ref: RayObjectReference[pl.DataFrame],
-    missing_index_rows_ref: RayObjectReference[pl.DataFrame],
-    input_comparable_max: Comparable,
-    input_comparable_min: Comparable,
-    columns: list[str],
-    owner: str,
-    signal_type: str,
-    overlap_mode: str = "copy",
-    feature_params: dict | None = None,
-    feature_metadata: pl.DataFrame | None = None,
-    table_metadata: pl.DataFrame | None = None,
-) -> tuple[pa.Table, pa.Table | None]:
-    """
-    Processes step 1 of the Gamma Lake add operation for new input frames. Index modification happens outside this function, in parallel, and only once.
-
-    This function processes the following three types of tables for a Gamma Lake feature store:
-    - Rows in both the index table AND input frame
-    - Rows in in the index table, but not the input frame
-    - Rows in the input frame, but not in the index table
-
-    When no rows from the input table are found in the index, we append rows into the provided delta table address,
-    and perform updates to the feature/table metadata tables::
-
-           Existing Table                    Input Table               Modified Existing Table
-        +-------------------+           +-------------------+           +-------------------+
-        | Index   | Value   |           | Index  | Value    |           | Index  | Value    |
-        +-------------------+           +-------------------+           +-------------------+
-        | I1      | V1      |           |        |          |           | I1     | V1       |
-        | I2      | V2      |           |        |          |           | I2     | V2       |
-        | I3      | V3      |           |        |          |           | I3     | V3       |
-        | I4      | V4      |           |        |          |    =>     | I4     | V4       |
-        | I5      | V5      |           |        |          |           | I5     | V5       |
-        | I6      | V6      |           |        |          |           | I6     | V6       |
-        +-------------------+           | I7     | V7'      |           | I7     | V7'      |
-                                        | I8     | V8'      |           | I8     | V8'      |
-                                        | I9     | V9'      |           | I9     | V9'      |
-                                        +-------------------+           +-------------------+
-
-
-    When we have input rows where at least some already exist in the input frame, we proceed as follows:
-
-    If the input rows overlaping with the existing index are before the target table's "latest_update" timestamp,
-    we filter the target table and append the intersection and missing rows (where applicable) to a new table. In the example below,
-    assume that the existing index at the processing of the input table ranges from I1 to I6::
-
-          Existing Table                     Input Table                  New Feature Table
-        +-------------------+           +-------------------+           +-------------------+
-        | Index  | Value    |           | Index  | Value    |           | Index  | Value    |
-        +-------------------+           +-------------------+           +-------------------+
-        | I1     | V1       |           |        |          |           | I1     | V1       |
-        | I2     | V2       |           |        |          |           | I2     | V2       |
-        | I3     | V3       |           | I3     | V3'      |           | I3     | V3'      |
-        | I4     | V4       |           |        |          |    =>     | I4     | null     |
-        | I5     | V5       |           | I5     | V5'      |           | I5     | V5'      |
-        | I6     | V6       |           |        |          |           | I6     | null     |
-        +-------------------+           | I7     | V7'      |           | I7     | V7'      |
-                                        | I8     | V8'      |           | I8     | V8'      |
-                                        | I9     | V9'      |           | I9     | V9'      |
-                                        +-------------------+           +-------------------+
-
-    Otherwise, we simply append the new rows and "pad" missing index values between the latest_update timestamp of the existing table and input table. In the
-    example below, assume the existing index at the processing of the input table ranges from I1 to I9::
-
-          Existing Table                     Input Table               Modified Existing Table
-        +-------------------+           +-------------------+           +-------------------+
-        | Index  | Value    |           | Index  | Value    |           | Index  | Value    |
-        +-------------------+           +-------------------+           +-------------------+
-        | I1     | V1       |           |        |          |           | I1     | V1       |
-        | I2     | V2       |           |        |          |           | I2     | V2       |
-        | I3     | V3       |           |        |          |           | I3     | V3       |
-        | I4     | V4       |           |        |          |    =>     | I4     | V4       |
-        | I5     | V5       |           |        |          |           | I5     | V5       |
-        | I6     | V6       |           |        |          |           | I6     | V6       |
-        +-------------------+           | I7     | V7'      |           | I7     | V7'      |
-                                        |        |          |           | I8     | null     |
-                                        | I9     | V9'      |           | I9     | V9'      |
-                                        +-------------------+           +-------------------+
-
-    Returns:
-        A 2-tuple ``(table_metadata_row, feature_metadata_row)`` where ``table_metadata_row`` is
-        always a ``pa.Table`` containing a single-row ``table_metadata`` record, and
-        ``feature_metadata_row`` is a ``pa.Table`` or ``None`` (``None`` when no feature metadata
-        update is required, e.g. append-only path with no version increment).
-
-    """
-    try:
-        if table_addr is None:
-            # These features have never been seen before. Add them to a new table, address the new/missing index rows where applicable, and return.
-            # sparse_feature tables never receive null sentinel rows — only rows with actual values are stored.
-            feature_df = feature_store._get_latest_feature_tables(columns, feature_metadata=feature_metadata).filter(pl.col("table_addr").is_null())
-            table_addr, new_feature_metadata_row = feature_store._write_new_feature_table(feature_df, owner, signal_type, feature_params)
-            rows_to_write = (
-                pl.concat([inner_join_ref, new_index_rows_ref], how="diagonal")
-                if signal_type == "sparse_feature"
-                else pl.concat([inner_join_ref, new_index_rows_ref, missing_index_rows_ref], how="diagonal")
-            )
-            feature_store.io.write_delta(
-                rows_to_write.lazy().sort(feature_store.sort_keys),
-                feature_store.get_path(table_addr),
-                mode="append",
-                delta_write_options={
-                    "writer_properties": WriterProperties(compression=feature_store.compression),
-                    "target_file_size": feature_store.target_file_size,
-                    "configuration": feature_store._feature_stats_configuration,
-                },
-            )
-            return (
-                table_metadata_row(table_addr, input_comparable_max).to_arrow(),
-                new_feature_metadata_row.to_arrow(),
-            )
-
-        feature_df = feature_store._get_latest_feature_tables(columns, feature_metadata=feature_metadata).filter(pl.col("table_addr") == table_addr)
-        columns = feature_store.sort_keys + feature_df["feature_name"].to_list()
-        last_updated = feature_store._get_last_updated(table_addr, table_metadata=table_metadata)
-        feature_metadata_row = None
-
-        if input_length == new_index_rows_ref.height:
-            # All input rows are new to the index. Write them to the feature table directly, padding with missing index rows.
-            feature_store.io.write_delta(
-                pl.concat([missing_index_rows_ref.filter(pl.col(feature_store.primary_sort_key) > last_updated), new_index_rows_ref], how="diagonal")
-                .lazy()
-                .sort(feature_store.sort_keys),
-                feature_store.get_path(table_addr),
-                mode="append",
-                delta_write_options={
-                    "writer_properties": WriterProperties(compression=feature_store.compression),
-                    "schema_mode": "merge",
-                    "target_file_size": feature_store.target_file_size,
-                },
-            )
-        else:
-            if input_comparable_min <= last_updated:
-                writer_props = WriterProperties(compression=feature_store.compression)
-                pk = feature_store.primary_sort_key
-                next_rank = feature_df["version"].max() + 1
-                source_path = feature_store.get_path(table_addr)
-
-                if overlap_mode == "merge":
-                    overlap_df = pl.concat(
-                        [
-                            inner_join_ref,
-                            new_index_rows_ref,
-                            missing_index_rows_ref.filter((pl.col(pk) >= input_comparable_min) & (pl.col(pk) <= input_comparable_max)),
-                        ],
-                        how="diagonal",
-                    ).select(columns)
-                    feature_store.io.merge_delta(overlap_df, source_path, on=feature_store.sort_keys, writer_properties=writer_props)
-                else:
-                    # copy mode: freeze old rows into the current table, write everything to a new address
-                    new_index_rows_slice = new_index_rows_ref.filter(pl.col(pk) <= last_updated)
-                    if new_index_rows_slice.height > 0:
-                        feature_store.io.write_delta(
-                            new_index_rows_slice.lazy().sort(feature_store.sort_keys),
-                            source_path,
-                            mode="append",
-                            delta_write_options={
-                                "writer_properties": writer_props,
-                                "schema_mode": "merge",
-                                "target_file_size": feature_store.target_file_size,
-                            },
-                        )
-                    old_features = feature_store.io.scan_delta(source_path).select(columns).filter(pl.col(pk) < input_comparable_min).collect()
-                    alignment_rows = (
-                        missing_index_rows_ref.filter(pl.col(pk) >= last_updated)
-                        if (old_features.height > 0 and signal_type not in ("as_of_feature", "sparse_feature"))
-                        else pl.DataFrame()
-                    )
-                    new_rows = pl.concat([inner_join_ref, new_index_rows_ref, alignment_rows], how="diagonal").select(columns)
-                    table_addr = feature_store.gen_table_addr()
-                    feature_store.io.write_delta(
-                        pl.concat([old_features, new_rows], how="vertical_relaxed").lazy().sort(feature_store.sort_keys),
-                        feature_store.get_path(table_addr),
-                        mode="append",
-                        delta_write_options={
-                            "writer_properties": writer_props,
-                            "target_file_size": feature_store.target_file_size,
-                            "configuration": feature_store._feature_stats_configuration,
-                        },
-                    )
-
-                feature_metadata_row = feature_df.with_columns(
-                    version=pl.lit(next_rank, dtype=pl.Int64),
-                    table_addr=pl.lit(table_addr),
-                    owner=pl.lit(owner),
-                    signal_type=pl.lit(signal_type),
-                    feature_params=pl.lit(json.dumps(feature_params)) if feature_params is not None else pl.col("feature_params"),
-                )
-
-            else:
-                feature_store.io.write_delta(
-                    pl.concat(
-                        [inner_join_ref, new_index_rows_ref, missing_index_rows_ref.filter(pl.col(feature_store.primary_sort_key) > last_updated)],
-                        how="diagonal",
-                    )
-                    .select(columns)
-                    .lazy()
-                    .sort(feature_store.sort_keys),
-                    feature_store.get_path(table_addr),
-                    mode="append",
-                    delta_write_options={
-                        "writer_properties": WriterProperties(compression=feature_store.compression),
-                        "target_file_size": feature_store.target_file_size,
-                        "schema_mode": "merge",
-                    },
-                )
-
-        return (
-            table_metadata_row(table_addr, input_comparable_max).to_arrow(),
-            feature_metadata_row.to_arrow() if feature_metadata_row is not None else None,
-        )
-
-    except Exception as e:
-        print(columns, e, traceback.format_exc())
-        raise
-
-
-def write_metadata(
-    feature_store,
-    table_path,
-    *rows,
-    schema_mode=None,
-    _ray_ordering_deps: list[RayObjectReference] | None = None,
-) -> None:
-    """Batch non-null metadata rows into one Delta commit."""
-    filtered = [row for row in rows if row is not None]
-    if not filtered:
-        return
-    unified = pa.unify_schemas([table.schema for table in filtered])
-    merged = pa.concat_tables([table.cast(unified) for table in filtered])
-    options = {"writer_properties": WriterProperties(compression=feature_store.compression)}
-    if schema_mode is not None:
-        options["schema_mode"] = schema_mode
-    feature_store.io.write_delta(pl.from_arrow(merged), table_path, mode="append", delta_write_options=options)
-
-
-def align_feature_tables(feature_store, new_index_rows_ref, row, input_comparable_min):
-    """
-    In step 2, we append new index values (ie, with null feature values) to all applicable tables - tables which were not updated in step 1, which we can
-    identify in parallel and perform updates to simultaneously.
-
-    Updated index values for tables which hold no features in common with the input table will only update up to the latest_update preexisting in that table.
-    as_of_feature tables are excluded upstream in _get_tables_to_update and never reach this function.
-    sparse_feature tables are likewise excluded upstream and never reach this function.
-
-    Args:
-        feature_store: the GammaFeatureLake object in question
-        new_index_rows_ref: A reference to index rows which were previously not in the index
-        row: a row from ``table_metadata_frame`` (fields: ``table_addr``, ``last_updated``)
-        input_comparable_min: The minimal sorted value of the input data
-
-    Returns: None
-    """
-    if input_comparable_min > row["last_updated"]:
-        return
-
-    filtered_antijoin = new_index_rows_ref.select(feature_store.sort_keys).filter(pl.col(feature_store.primary_sort_key) <= row["last_updated"])
-
-    if filtered_antijoin.height > 0:
-        table_path = feature_store.get_path(row["table_addr"])
-        feature_store.io.write_delta(
-            filtered_antijoin.lazy().sort(feature_store.sort_keys),
-            table_path,
-            mode="append",
-            delta_write_options={
-                "writer_properties": WriterProperties(compression=feature_store.compression),
-                "schema_mode": "merge",
-                "target_file_size": feature_store.target_file_size,
-            },
-        )
-
-
-def update_index(feature_store, new_index_rows_ref):
-    """
-    Step 3 is a single-time index update based on new index rows provided by the input table.
-    """
-    if new_index_rows_ref.height > 0:
-        feature_store.io.write_delta(
-            new_index_rows_ref.select(feature_store.sort_keys).lazy().sort(feature_store.sort_keys),
-            feature_store.index,
-            mode="append",
-            delta_write_options={
-                "writer_properties": WriterProperties(compression=feature_store.compression),
-                "schema_mode": "merge",
-                "target_file_size": feature_store.target_file_size,
-            },
-        )
-
-
-def compute_index_deltas(feature_store, df):
-    """Compute all index/input relationships needed by ``_add`` with one index scan."""
-    primary_sort_key = feature_store.primary_sort_key
-    input_comparable_max = df[primary_sort_key].max()
-    input_comparable_min = df[primary_sort_key].min()
-    index = feature_store.index_frame().filter(pl.col(primary_sort_key) <= input_comparable_max).collect()
-
-    inner_join_ref = index.join(df, how="inner", on=feature_store.sort_keys).select(df.columns)
-    new_index_rows = df.join(index, how="anti", on=feature_store.sort_keys)
-    missing_index_rows = index.join(df, how="anti", on=feature_store.sort_keys)
-    return (
-        inner_join_ref,
-        input_comparable_max,
-        input_comparable_min,
-        df.height,
-        df.columns,
-        new_index_rows,
-        new_index_rows[primary_sort_key].min(),
-        missing_index_rows,
+_DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
+    pa.schema(
+        [
+            ("timestamp", pa.timestamp("us", tz="UTC")),
+            ("symbol", pa.string()),
+        ]
     )
-
-
-def read_table(feature_store, table_meta: dict, features: list[str], start, end, materialize=False) -> pl.LazyFrame | pl.DataFrame:
-    """Read and sort a feature table using metadata resolved by the caller."""
-    flt = pl.col(feature_store.primary_sort_key) >= start if start is not None else pl.lit(True)
-    flt &= pl.col(feature_store.primary_sort_key) <= end if end is not None else pl.lit(True)
-    table = feature_store.io.scan_delta(feature_store.get_path(table_meta["table_addr"])).select(feature_store.sort_keys + features)
-
-    if table_meta["signal_type"] == "as_of_feature":
-        if table_meta["feature_params"] is None:
-            raise ValueError(f"as_of_feature table {table_meta['table_addr']} requires feature_params to be resolved and passed by the caller")
-        as_of_params = json.loads(table_meta["feature_params"])
-        strategy = as_of_params.get("strategy", "backward")
-        as_of_filter = pl.col(feature_store.primary_sort_key) <= end if end is not None and strategy == "backward" else pl.lit(True)
-        as_of_filter &= pl.col(feature_store.primary_sort_key) >= start if start is not None and strategy == "forward" else pl.lit(True)
-        by_keys = [key for key in feature_store.sort_keys if key != feature_store.primary_sort_key]
-        table = (
-            feature_store.index_frame()
-            .filter(flt)
-            .sort(by_keys + [feature_store.primary_sort_key])
-            .join_asof(
-                table.filter(as_of_filter).sort(by_keys + [feature_store.primary_sort_key]),
-                on=feature_store.primary_sort_key,
-                by=by_keys,
-                **as_of_params,
-            )
-        )
-
-    elif table_meta["signal_type"] == "sparse_feature":
-        left_lf = feature_store.index_frame().filter(flt).sort(feature_store.sort_keys)
-        right_lf = table.sort(feature_store.sort_keys)
-        if feature_store.sort_keys[0] == feature_store.primary_sort_key and version.parse(pl.__version__) >= version.parse("1.37.0"):
-            left_lf = left_lf.set_sorted(feature_store.primary_sort_key)
-            right_lf = right_lf.set_sorted(feature_store.primary_sort_key)
-        table = left_lf.join(right_lf, on=feature_store.sort_keys, how="left", coalesce=True)
-
-    else:
-        table = table.filter(flt)
-
-    result = table.sort(feature_store.sort_keys)
-    return result.collect() if materialize else result
-
-
-def _latest_per_feature(df: pl.DataFrame) -> pl.DataFrame:
-    """Return one row per feature_name — the row with the highest version (nulls last)."""
-    return df.sort("version", descending=True, nulls_last=True).unique(subset=["feature_name"], keep="first")
+)
 
 
 class GammaFeatureLake(BaseFeatureLake, BaseModel):
     """
-    A feature store implementation based on DeltaLake and ray, which focuses on supporting a sortable index on a polars frame and efficient appends/reads.
+    A feature store implementation based on Delta Lake, which focuses on supporting a sortable index on a polars frame and efficient appends/reads.
 
-    Overlapping uploads merge in-place via Delta Lake's merge (upsert) operation. No new DeltaTable is created on overlap.
+    Reads and writes go through the native core (:class:`gammalake.native.NativeLake`). Overlapping uploads either write
+    the overlapping features to a new table (``overlap_mode="copy"``) or merge them into the existing one (``"merge"``).
     """
 
     base_path: str = Field(
-        description="A local or s3:// qualified path, identifying the root directory for storing the DeltaTables associated with this class."
+        description="A local directory or a file://, s3://, az://, abfss:// or gs:// URL, identifying the root directory for storing the "
+        "DeltaTables associated with this class."
     )
     feature_metadata_path: str = Field("feature_metadata", description="The name of the DeltaTable holding feature metadata.")
     table_metadata_path: str = Field("table_metadata", description="The name of the DeltaTable holding table metadata.")
     index_path: str = Field("index", description="The name of the DeltaTable holding the global index.")
-    transaction_log_path: str = Field(
-        "transaction_log", description="The name of the DeltaTable holding the transaction log, which tracks the status of every write."
-    )
     table_name_prefix: str = Field(
         "",
-        description="Optional prefix prepended to every data table address generated by gen_table_addr(). "
+        description="Optional prefix prepended to the address of every data table this lake creates. "
         "Useful for integration tests to ensure each test's data tables are isolated and can be cleaned up by prefix.",
     )
     primary_sort_key: str = Field("timestamp", description="The name of the primary key in the index used for comparisons when inserting features.")
-    compression: str = Field("zstd", description="The compression level of the write_delta methods in this class")
-    target_file_size: int = Field(
-        128 * 1024 * 1024,
-        description="Target parquet file size in bytes when writing feature tables. Splitting large writes into "
-        "multiple files of this size enables file-level min/max skipping on timestamp-filtered reads.",
+    delta_options: DeltaOptions = Field(default_factory=DeltaOptions, description="Configuration for the default Delta storage backend.")
+    memory_limit: int | None = Field(
+        None,
+        description="Bytes a read may hold while sorting the tables it reads; beyond it the sorts spill to the system temporary "
+        "directory. None sorts in memory. The frame read() returns is held in memory either way.",
     )
-    run_on_ray_cluster: bool = Field(False, description="Toggles whether or not this class uses ray remote functions, or strictly local python calls")
     enable_runtime_computed_features: bool = Field(
         False,
         description="Enables runtime-computed features. Only enable this when feature metadata is trusted because Polars expressions may execute Python code.",
     )
-    io: FrameIO = Field(default_factory=PolarsIO, description="An IO object, abstracting how/where polars frames are read from storage.")
+    lock: Callable[[str], AbstractContextManager] | None = Field(
+        None,
+        repr=False,
+        exclude=True,
+        description="Called with the absolute path or URL of each table a write commits to; the context manager it returns is held "
+        "around that commit. Writers in several processes on an object store without atomic commits need one. Reads take no lock.",
+    )
     _is_initialized: bool = False
     _sort_keys: list[str] = None
+    _native: tuple | None = None
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, hide_input_in_errors=True)
 
     @model_validator(mode="after")
     def check(self) -> GammaFeatureLake:
-        """
-        Write the proper metadata holding DeltaTables if they do not exist upon creation of this object.
-        """
-        if self.run_on_ray_cluster:
-            require_ray()
-
-        compression_levels = {i.name for i in Compression}
-        if self.compression.upper() not in compression_levels:
-            raise ValueError(f"Please provide a valid compression level: {compression_levels}\n Found: {self.compression}")
-
-        self._is_initialized = self.io.is_deltatable(self.index)
-        if self._is_initialized:
-            self._sort_keys = self.io.scan_delta(self.index).collect_schema().names()
-            if self.primary_sort_key not in self._sort_keys:
-                raise ValueError(f"The provided primary sort key: {self.primary_sort_key} does not exist in the index keys: {self._sort_keys}")
-
+        """Open the lake if its tables exist; :meth:`initialize` creates them."""
+        try:
+            native = self._native_lake()
+        except UninitializedDeltaLakeException:
+            self._is_initialized = False
+            return self
+        self._is_initialized = True
+        self._sort_keys = native.sort_keys
         return self
 
     def ensure_deltalake_is_initialized(func):
@@ -616,11 +104,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return self._sort_keys
 
     @property
-    def _feature_stats_configuration(self) -> dict[str, str]:
-        """Restrict feature-table data-skipping statistics to the sort keys."""
-        return {"delta.dataSkippingStatsColumns": ",".join(self.sort_keys)}
-
-    @property
     def index(self) -> str:
         """Convenience method to find the correct path for this feature store's index table."""
         return os.path.join(self.base_path, self.index_path)
@@ -635,11 +118,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """Convenience method to find the correct path for this feature store's table metadata table"""
         return os.path.join(self.base_path, self.table_metadata_path)
 
-    @property
-    def transaction_log(self) -> str:
-        """Convenience method to find the correct path for this feature store's transaction log table"""
-        return os.path.join(self.base_path, self.transaction_log_path)
-
     def _apply_filters_to_lazy_frame(self, df: pl.LazyFrame, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
         """Apply optional filters to a lazyframe, and return it"""
         if start is not None:
@@ -648,30 +126,26 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             df = df.filter(pl.col(self.primary_sort_key) <= end)
         return df
 
+    @ensure_deltalake_is_initialized
     def table_metadata_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
-        """Convenience method to find the correct path for this feature store's table metadata table"""
-        return self._apply_filters_to_lazy_frame(self.io.scan_delta(self.table_metadata), start, end)
+        """This feature store's table metadata table."""
+        return self._apply_filters_to_lazy_frame(self._native_lake().scan_table_metadata(), start, end)
 
+    @ensure_deltalake_is_initialized
     def feature_metadata_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
-        """Convenience method to find the correct path for this feature store's feature metadata table"""
-        return self._apply_filters_to_lazy_frame(self.io.scan_delta(self.feature_metadata), start, end)
+        """This feature store's feature metadata table."""
+        return self._apply_filters_to_lazy_frame(self._native_lake().scan_feature_metadata(), start, end)
 
+    @ensure_deltalake_is_initialized
     def index_frame(self, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
-        """Convenience method to find the correct path for this feature store's index table."""
-        return self._apply_filters_to_lazy_frame(self.io.scan_delta(self.index), start, end)
-
-    def transaction_log_frame(self) -> pl.LazyFrame:
-        """Convenience method to find the correct path for this feature store's transaction log. A transaction's current status is its row with the latest ``updated_at``."""
-        return self.io.scan_delta(self.transaction_log)
+        """This feature store's index table, between ``start`` and ``end`` inclusive."""
+        return self._native_lake().scan_index(start, end)
 
     def get_path(self, addr) -> str:
         """Convenience method to join a feature store's base path to a provided table address"""
         return os.path.join(self.base_path, addr)
 
-    def gen_table_addr(self) -> str:
-        """Convenience method for generating new table addresses."""
-        return f"{self.table_name_prefix}delta_{uuid.uuid4().hex[:8]}"
-
+    @ensure_deltalake_is_initialized
     def annotate(self, annotations: pl.DataFrame) -> None:
         """Attach comments and tags to features one physical table at a time.
 
@@ -692,9 +166,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             .sort("version", descending=True)
             .unique(subset=["table_addr", "feature_name"], keep="first", maintain_order=True)
         )
-        for (table_addr,), group in annotations.group_by(["table_addr"]):
-            self.io.annotate_table(self.get_path(table_addr), group)
+        self._native_lake().annotate(annotations.select("feature_name", "table_addr", "comment", "tags").rows())
 
+    @ensure_deltalake_is_initialized
     def describe(self, features_metadata: pl.LazyFrame) -> pl.DataFrame:
         """Return selected feature metadata with physical-table annotations appended.
 
@@ -702,83 +176,22 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         versions sharing a physical table receive the same annotation.
         """
         metadata = features_metadata.collect()
-        frames = [
-            self.io.describe_table(self.get_path(table_addr), group["feature_name"].unique().to_list()).with_columns(table_addr=pl.lit(table_addr))
-            for (table_addr,), group in metadata.group_by(["table_addr"])
-        ]
-        annotations = (
-            pl.concat(frames)
-            if frames
-            else pl.DataFrame(schema={"feature_name": pl.String, "table_addr": pl.String, "comment": pl.String, "tags": pl.List(pl.String)})
-        )
-        return metadata.join(annotations, on=["feature_name", "table_addr"], how="left")
+        stored = metadata.filter((pl.col("signal_type") != "runtime_computed") & pl.col("table_addr").is_not_null() & (pl.col("table_addr") != "n/a"))
+        pairs = stored.select("feature_name", "table_addr").unique(maintain_order=True).rows()
+        annotations = self._native_lake().annotations(pairs)
+        described = metadata.join(annotations, on=["feature_name", "table_addr"], how="left")
+        return described.with_columns(pl.col("tags").fill_null(pl.lit([], dtype=pl.List(pl.String))))
 
-    def _ensure_runtime_computed_features_enabled(self) -> None:
-        if not self.enable_runtime_computed_features:
-            raise ValueError(
-                "Runtime-computed features are disabled. Set enable_runtime_computed_features=True only when feature metadata is trusted."
-            )
-
-    def initialize(self, schema: ArrowSchema = DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
+    def initialize(self, schema: ArrowSchema = _DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
         """
-        Write the proper metadata holding DeltaTables with the provided index schema.
+        Create the index and metadata tables with the provided index schema, where they do not exist yet.
         """
         if self.primary_sort_key not in schema.schema.names:
             raise ValueError(f"The provided primary sort key: {self.primary_sort_key} does not exist in the schema keys: {schema.schema.names}")
-
-        if not self.io.is_deltatable(self.index):
-            self.io.write_delta(pl.from_arrow(pa.Table.from_pylist([], schema=schema.schema)), self.index)
-
-        if not self.io.is_deltatable(self.feature_metadata):
-            self.io.write_delta(empty_feature_metadata(), self.feature_metadata)
-
-        if not self.io.is_deltatable(self.table_metadata):
-            primary_sort_key_type = schema.schema.field(self.primary_sort_key).type
-            self.io.write_delta(empty_table_metadata(primary_sort_key_type), self.table_metadata)
-
-        self._ensure_transaction_log()
-
+        native = self._native_lake(index_schema=schema.schema)
         self._is_initialized = True
-        self._sort_keys = schema.schema.names
+        self._sort_keys = native.sort_keys
         return self
-
-    def _ensure_transaction_log(self) -> None:
-        """Create the transaction log if missing, which is the case for lakes initialized before it existed."""
-        if not self.io.is_deltatable(self.transaction_log):
-            self.io.write_delta(empty_transaction_log(), self.transaction_log)
-
-    def _log_transaction(self, transaction: Transaction, status: TransactionStatus, error: str | None = None) -> None:
-        write_metadata(self, self.transaction_log, transaction_log_row(transaction, status, error))
-
-    @contextmanager
-    def _transaction(self, owner: str, signal_type: str, refs: list) -> Iterator[None]:
-        """Track a write in the transaction log and undo it if it fails.
-
-        The transaction is logged as ``pending``, then ``success`` once the body completes. If the body
-        raises, it is logged as ``failed``, the lake is restored to its state when the transaction began,
-        and it is logged as ``rolled_back``. The original exception is re-raised; if the restore itself
-        fails, that error is raised instead, chained to the original, and the transaction stays ``failed``.
-
-        Args:
-            owner: Owner recorded in the log.
-            signal_type: Signal type recorded in the log.
-            refs: Ray references the body submits, awaited on failure so no write is in flight during the
-                restore. Because ``get`` raises on the first failure, the restore cannot rely on it to wait.
-        """
-        self._ensure_transaction_log()
-        transaction = Transaction(owner, signal_type)
-        self._log_transaction(transaction, TransactionStatus.PENDING)
-        try:
-            yield
-            self._log_transaction(transaction, TransactionStatus.SUCCESS)
-        except BaseException as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            self._log_transaction(transaction, TransactionStatus.FAILED, error)
-            if self.run_on_ray_cluster and refs:
-                self.wait(refs, num_returns=len(refs))
-            self.restore_to_timestamp(transaction.started_at)
-            self._log_transaction(transaction, TransactionStatus.ROLLED_BACK, error)
-            raise
 
     @ensure_deltalake_is_initialized
     def restore_to_timestamp(self, timestamp: datetime) -> GammaFeatureLake:
@@ -806,94 +219,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             This feature store, restored in place.
 
         """
-        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-            raise ValueError("restore_to_timestamp requires a timezone-aware datetime")
-
-        for system_table in (self.index, self.table_metadata, self.feature_metadata):
-            self.io.restore_to_timestamp(system_table, timestamp)
-
-        restored = (
-            self.feature_metadata_frame()
-            .collect()
-            .filter((pl.col("signal_type") != "runtime_computed") & pl.col("table_addr").is_not_null() & (pl.col("table_addr") != "n/a"))
-        )
-        for table_addr in restored["table_addr"].unique():
-            self.io.restore_to_timestamp(self.get_path(table_addr), timestamp)
+        self._native_lake().restore_to_timestamp(timestamp)
         return self
 
-    def _get_correct_feature_tables(self, features: list[str], feature_metadata: pl.DataFrame) -> pl.DataFrame:
-        """Fetches the tables for the latest version of each feature provided in the input features list"""
-        tables = _latest_per_feature(feature_metadata.filter(pl.col("feature_name").is_in(features)))
-
-        # Verify that if runtime computed signal types are provided, we also ensure all required root signals are computed too.
-        runtime_features = tables.filter(pl.col("signal_type") == "runtime_computed")
-        if runtime_features.height > 0:
-            self._ensure_runtime_computed_features_enabled()
-            existing_root_feature_names = tables["feature_name"]
-            missing_root_feature_names = []
-            for expr in runtime_features["feature_params"]:
-                for name in pl.Expr.deserialize(source=io.BytesIO(expr.encode()), format="json").meta.root_names():
-                    if name not in existing_root_feature_names:
-                        missing_root_feature_names.append(name)
-
-            if len(missing_root_feature_names) > 0:
-                missing_root_features = _latest_per_feature(feature_metadata.filter(pl.col("feature_name").is_in(missing_root_feature_names)))
-                tables = pl.concat([tables, missing_root_features])
-
-        if tables.height == 0:
-            raise MissingFeaturesException(f"No FeatureTables exist for any of your input features: {features}")
-        return tables
-
-    def _load_features_from_tables(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
-        groups = [frame for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")]
-        feature_sources = {
-            frame["table_addr"].first(): read_table(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end) for frame in groups
-        }
-        index = self.index_frame(start, end).sort(self.sort_keys)
-        filter_specs = (
-            {}
-            if tables.filter(pl.col("signal_type") == "runtime_computed").height
-            else {key: FilterSpec() for key in self.sort_keys if not index.collect_schema()[key].is_temporal()}
-        )
-        sources = {"index": (index, filter_specs), **{name: (frame, filter_specs) for name, frame in feature_sources.items()}}
-
-        def combine(filtered_sources):
-            frames = [frame.drop(self.sort_keys) for name, frame in filtered_sources.items() if name != "index"]
-            return self._concat_root_features(tables, filtered_sources["index"], frames)
-
-        return pushdown_combine(sources, combine)
-
-    def _load_features_from_tables_in_parallel(self, tables, start: Comparable | None = None, end: Comparable | None = None) -> pl.LazyFrame:
-        groups = [frame for _, frame in tables.filter(pl.col("signal_type") != "runtime_computed").group_by("table_addr")]
-        table_load_refs = [
-            self.switch(read_table)(self, frame.row(0, named=True), frame["feature_name"].to_list(), start, end, self.run_on_ray_cluster)
-            for frame in groups
-        ]
-        frames = []
-        while table_load_refs:
-            ready, table_load_refs = self.wait(table_load_refs)
-            frames.append(self.get(ready[0]))
-
-        index = self.index_frame(start, end).sort(self.sort_keys)
-        return self._concat_root_features(tables, index, [frame.lazy().drop(self.sort_keys) for frame in frames])
-
-    def _concat_root_features(self, tables, index, frames) -> pl.LazyFrame:
-        """Prepend canonical sort keys to aligned feature-only frames."""
-        how = "horizontal_extend" if version.parse(pl.__version__) >= version.parse("2.0.0") else "horizontal"
-        features = pl.concat([index, *frames], how=how)
-        return self._compute_runtime_features(tables, features).select(tables["feature_name"].to_list() + self.sort_keys)
-
-    def _compute_runtime_features(self, feature_table, root_features):
-        runtime_computed_features = feature_table.filter(pl.col("signal_type") == "runtime_computed")
-        if runtime_computed_features.height > 0:
-            self._ensure_runtime_computed_features_enabled()
-        runtime_feature_expressions = [
-            pl.Expr.deserialize(source=io.BytesIO(expr.encode()), format="json") for expr in runtime_computed_features["feature_params"]
-        ]
-        return with_columns_topo(root_features, runtime_feature_expressions)
-
     @singledispatchmethod
-    @trace(always=True)
     @ensure_deltalake_is_initialized
     def read(self, *arg) -> pl.DataFrame:
         """Abstract base dispatch method for sequential reads of feature tables"""
@@ -902,7 +231,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         )
 
     @read.register
-    @trace(always=True)
     @ensure_deltalake_is_initialized
     def _(
         self,
@@ -916,27 +244,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             raise ValueError(
                 f"feature_metadata DataFrame contains the same feature at multiple versions: {duplicates}. Make separate read() calls per version."
             )
-        runtime_features = features.filter(pl.col("signal_type") == "runtime_computed")
-        if runtime_features.height > 0:
-            self._ensure_runtime_computed_features_enabled()
-            missing_root_feature_names = [
-                name
-                for expr in runtime_features["feature_params"]
-                for name in pl.Expr.deserialize(source=io.BytesIO(expr.encode()), format="json").meta.root_names()
-                if name not in features["feature_name"]
-            ]
-            if missing_root_feature_names:
-                feature_metadata = self.feature_metadata_frame().collect()
-                features = pl.concat([features, self._get_correct_feature_tables(missing_root_feature_names, feature_metadata)], how="diagonal")
-        result = (
-            self._load_features_from_tables(features, start, end)
-            if not self.run_on_ray_cluster
-            else self._load_features_from_tables_in_parallel(features, start, end)
-        ).select(features["feature_name"].to_list() + self.sort_keys)
-        return result.collect() if materialized else result
+        native = self._native_lake()
+        return native.read_selected(features, start, end) if materialized else native.scan_selected(features, start, end)
 
     @read.register
-    @trace(always=True)
     @ensure_deltalake_is_initialized
     def _(
         self,
@@ -948,133 +259,79 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     ) -> pl.DataFrame:
         """
         Given a list of features, identifies the delta tables with the most up-to-date versions of those features,
-        and reads/sorts/horizontally concatenates those tables. Pass ``materialized=False`` to apply downstream
-        filters lazily. Local sort-key filters are coordinated across the bounded global index and each feature
-        scan; Ray reads retain their materialized feature-table path. As-of joins retain right-hand carry-forward
-        context, while runtime-computed reads apply downstream filters after computation so neighbouring-row
-        semantics are preserved.
-
-        Projection-only aggregations such as ``select(pl.len())`` cannot yet prune whole feature sources, so they
-        may scan more data than a direct single-source aggregation.
+        and reads them aligned to the index. Pass ``materialized=False`` to apply downstream filters lazily: filters
+        on sort keys are pushed down into the index and every feature table. As-of joins retain right-hand
+        carry-forward context, while runtime-computed reads apply downstream filters after computation so
+        neighbouring-row semantics are preserved.
         """
+        native = self._native_lake()
         targets = targets or []
-        feature_metadata = self.feature_metadata_frame().collect()
-        missing_targets = [target for target in targets if target not in self._get_target_column_names(feature_metadata)]
-        if len(missing_targets) > 0:
-            raise MissingOrMisregisteredSignalsException(
-                f"The following target values were not found to be registered as target signal types: {missing_targets}"
-            )
-        tables = self._get_correct_feature_tables(features + targets, feature_metadata)
-        if not self.run_on_ray_cluster:
-            features = self._load_features_from_tables(tables, start, end)
-        else:
-            features = self._load_features_from_tables_in_parallel(tables, start, end)
-        return features.collect() if materialized else features
+        return native.read(features, targets, start, end) if materialized else native.scan(features, targets, start, end)
 
     @ensure_deltalake_is_initialized
+    def feature_table(self, features: list[str], targets: list[str] | None = None):
+        """The latest versions of ``features`` and ``targets`` as a table for DataFusion SQL.
+
+        Needs the ``datafusion`` extra. See :meth:`NativeLake.feature_table`::
+
+            ctx = datafusion.SessionContext()
+            ctx.register_table("features", lake.feature_table(["f1", "f2"]))
+            ctx.sql("SELECT * FROM features WHERE timestamp >= '2024-01-01'").to_polars()
+        """
+        return self._native_lake().feature_table(features, targets or [])
+
+    def __getstate__(self):
+        # The native handle is a cache that cannot be pickled.
+        state = super().__getstate__()
+        private = state.get("__pydantic_private__")
+        if private and private.get("_native") is not None:
+            state = {**state, "__pydantic_private__": {**private, "_native": None}}
+        return state
+
+    def _native_lake(self, index_schema: pa.Schema | None = None) -> NativeLake:
+        """The native lake for this lake's configuration, reopened when it changes.
+
+        With ``index_schema``, the lake's tables are created first where missing.
+        """
+        options = {
+            "index_path": self.index_path,
+            "feature_metadata_path": self.feature_metadata_path,
+            "table_metadata_path": self.table_metadata_path,
+            "primary_sort_key": self.primary_sort_key,
+            "table_name_prefix": self.table_name_prefix,
+            "delta_options": self.delta_options,
+            "memory_limit": self.memory_limit,
+            "runtime_computed_features": self.enable_runtime_computed_features,
+        }
+        config = (self.base_path, *options.values(), id(self.lock))
+        if index_schema is None and self._native is not None and self._native[0] == config:
+            return self._native[1]
+        options["lock"] = self.lock
+        lake = NativeLake(self.base_path, **options) if index_schema is None else NativeLake.create(self.base_path, index_schema, **options)
+        self._native = (config, lake)
+        return lake
+
     def _get_latest_feature_tables(self, feature_columns, feature_metadata: pl.DataFrame):
         pure_feature_columns = pl.Series("feature_name", list(set(feature_columns) - set(self.sort_keys)), dtype=pl.String)
-        return _latest_per_feature(feature_metadata).join(pure_feature_columns.to_frame(), how="right", on="feature_name")
+        latest = feature_metadata.sort("version", descending=True, nulls_last=True).unique(subset=["feature_name"], keep="first")
+        return latest.join(pure_feature_columns.to_frame(), how="right", on="feature_name")
 
-    @ensure_deltalake_is_initialized
-    def _write_new_feature_table(self, feature_df, owner, signal_type, feature_params) -> tuple[str, pl.DataFrame]:
-        """Prepares a new table address and the corresponding feature_metadata row.
-
-        Does NOT write to feature_metadata. Callers are responsible for writing the returned
-        DataFrame to feature_metadata only after all data and table_metadata writes succeed,
-        so that a failed feature write does not leave a stale feature_metadata entry.
-        """
-        table_addr = self.gen_table_addr()
-        feature_df = feature_df.with_columns(
-            table_addr=pl.lit(table_addr),
-            owner=pl.lit(owner),
-            signal_type=pl.lit(signal_type),
-            feature_params=pl.lit(json.dumps(feature_params) if feature_params is not None else "{}"),
-            version=pl.lit(0, dtype=pl.Int64),
-        )
-        return table_addr, feature_df
-
-    @ensure_deltalake_is_initialized
-    def _get_tables_to_update(
-        self,
-        feature_columns,
-        min_value,
-        metadata=None,
-        *,
-        feature_metadata: pl.DataFrame,
-        table_metadata: pl.DataFrame,
-    ) -> pl.DataFrame:
-        """
-        We need to append antijoined rows between the input frame and index in the following cases:
-          - A table has no overlap in columns with the input features AND its last_updated date is more recent than the oldest date in the antijoin.
-          - A table has overlap in columns with the input features AND does not hold the latest versions of those features AND its last_updated date
-            is more recent than the oldest date in the antijoin.
-
-        as_of_feature tables are excluded: they are read via join_asof against the global index, which naturally
-        carries forward the last known observation. Injecting null sentinels would corrupt that semantics.
-        sparse_feature tables are excluded for the same reason: they are read via a left join against the index
-        and must not receive null sentinel rows.
-        """
-        if min_value is None:
-            return pl.DataFrame()
-        do_not_update = (
-            self._get_latest_feature_tables(feature_columns, feature_metadata=feature_metadata).filter(pl.col("table_addr").is_not_null())
-            if metadata is None
-            else metadata
-        )
-        excluded_addrs = feature_metadata.filter(pl.col("signal_type").is_in(["as_of_feature", "sparse_feature"])).select("table_addr").unique()
-        return (
-            table_metadata.join(do_not_update, how="anti", on="table_addr")
-            .join(excluded_addrs, how="anti", on="table_addr")
-            .filter(pl.col("last_updated") >= min_value)
-        )
-
-    @ensure_deltalake_is_initialized
-    def _get_target_column_names(self, feature_metadata: pl.DataFrame) -> pl.Series:
-        """Returns the column names of uploaded target signals"""
-        return feature_metadata.filter(pl.col("signal_type") == "target")["feature_name"].unique().to_list()
-
-    @ensure_deltalake_is_initialized
-    def _get_last_updated(self, table_addr, table_metadata: pl.DataFrame):
-        """Shorthand to find the last updated value for a given table address"""
-        return (
-            table_metadata.lazy()
-            .filter(pl.col("table_addr") == table_addr)
-            .select(pl.col("last_updated").filter(pl.col("update_timestamp") == pl.col("update_timestamp").max()).first().alias("last_updated"))
-            .collect()
-            .item()
-        )
-
-    def switch(self, function, num_returns=1, **kwargs):
-        """Returns a remote function OR local function depending on the run_on_ray_cluster parameter"""
-        return function if not self.run_on_ray_cluster else ray_remote(function, num_returns=num_returns, **kwargs)
-
-    def get(self, potential_ref):
-        """Wrap the getting of references (or actual objects) behind a switch"""
-        return ray_get(potential_ref) if self.run_on_ray_cluster else potential_ref
-
-    def wait(self, list_of_potential_refs, **kwargs):
-        """Wrap waiting on ray references (or actual object) behind a switch"""
-        if self.run_on_ray_cluster:
-            return ray_wait(list_of_potential_refs, **kwargs)
-        return [list_of_potential_refs.pop(0)], list_of_potential_refs
-
-    @ensure_deltalake_is_initialized
-    @trace(always=True)
+    @validate_call(config=ConfigDict(arbitrary_types_allowed=True))
     def _add(
         self,
-        df: pl.DataFrame | RayObjectReference,
+        df: pl.DataFrame,
         signal_type,
         owner: str = "missing_owner",
-        metadata: pl.DataFrame | None = None,
         feature_params: dict | None = None,
         overlap_mode: str = "copy",
-    ) -> list:
+        comments: Mapping[str, str] | None = None,
+        tags: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         """
         Onboards a new table of features to our FeatureStore.
 
         Args:
-            overlap_mode: ``"copy"`` (default) creates a new DeltaTable on overlap, preserving the
+            overlap_mode: ``"copy"`` (default) writes overlapping features to a new DeltaTable, preserving the
                 old table as an immutable snapshot.  ``"merge"`` upserts into the existing table in-place.
 
         Performance:
@@ -1083,163 +340,79 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             value columns and all secondary-key values for each primary-sort-key period instead of
             splitting the same period across calls. For backfills, write blocks of complete periods
             sized to fit memory. See the ``Best-Practices`` wiki page.
-
-        Transactions:
-            The write phase is recorded in the transaction log as ``pending``, then ``success``. If it
-            fails, the lake is restored to its state before the write, and the original error is re-raised.
-            See :meth:`restore_to_timestamp` for the limits that rollback inherits.
         """
-
-        if is_object_ref(df) and not self.run_on_ray_cluster:
-            raise ValueError("Invalid RayObjectRef input! This class is configured not to use remote functions.")
-
-        df = self.switch(preprocess_df)(self, df)
-        (
-            inner_join_ref,
-            primary_sort_key_max,
-            primary_sort_key_min,
-            input_length,
-            columns,
-            new_index_rows_ref,
-            earliest_new_index_rows_ref,
-            missing_index_rows_ref,
-        ) = self.switch(compute_index_deltas, num_returns=8)(self, df)
-        feature_metadata = self.feature_metadata_frame().collect()
-        table_metadata = self.table_metadata_frame().collect()
-        feature_tables = self._get_latest_feature_tables(self.get(columns), feature_metadata=feature_metadata)
-        tables_to_update = self._get_tables_to_update(
-            self.get(columns),
-            self.get(earliest_new_index_rows_ref),
-            metadata if metadata is not None else feature_tables.filter(pl.col("table_addr").is_not_null()),
-            feature_metadata=feature_metadata,
-            table_metadata=table_metadata,
-        )
-        refs = []
-        # Everything below this point writes to the lake. If any of it fails, the transaction restores the lake
-        # to its state before the writes began, so that feature tables never run ahead of the index.
-        # The metadata writes depend on every other task, so waiting on refs also waits for the feature table updates.
-        with self._transaction(owner, signal_type, refs):
-            # Step 1: Append-only if no overlap; otherwise merge in-place into the existing DeltaTable (upsert).
-            # New index rows are inserted; overlapping rows are updated. Alignment rows (index rows absent from the
-            # input, with null feature values) are merged in to maintain index alignment across all tables.
-            feature_table_update_refs = [
-                self.switch(update_feature_tables, num_returns=2)(
-                    feature_store=self,
-                    table_addr=table_addr,
-                    input_length=input_length,
-                    inner_join_ref=inner_join_ref,
-                    new_index_rows_ref=new_index_rows_ref,
-                    missing_index_rows_ref=missing_index_rows_ref,
-                    input_comparable_max=primary_sort_key_max,
-                    input_comparable_min=primary_sort_key_min,
-                    columns=columns,
-                    owner=owner,
-                    signal_type=signal_type,
-                    feature_params=feature_params,
-                    overlap_mode=overlap_mode,
-                    feature_metadata=feature_metadata,
-                    table_metadata=table_metadata,
-                )
-                for table_addr in feature_tables["table_addr"].unique()
-            ]
-            # Step 2: In the case of overlaps between the index and input table we must modify tables which are updated beyond the earliest rows in the intersection to preserve feature table alignment.
-            # This step identifies the qualified tables (all feature tables which contain no features found in the input table, OR contain a non-latest version of a feature found in the input table).
-            # This preserves index alignment across all our delta tables, and we can do this in parallel.
-            alignment_refs = []
-            for row in tables_to_update.iter_rows(named=True):
-                alignment_refs.append(self.switch(align_feature_tables)(self, new_index_rows_ref, row, primary_sort_key_min))
-            refs.extend(alignment_refs)
-
-            # Step 3: Append the results of an anti-join between the new data and the index back into the master index.
-            # This can also be done in parallel.
-            index_ref = self.switch(update_index)(self, new_index_rows_ref)
-            refs.append(index_ref)
-
-            if feature_table_update_refs:
-                # Metadata becomes visible only after all data and index writes succeed.
-                table_metadata_rows, feature_metadata_rows = zip(*feature_table_update_refs)
-                table_metadata_ref = self.switch(write_metadata)(
-                    self,
-                    self.table_metadata,
-                    *table_metadata_rows,
-                    _ray_ordering_deps=[*alignment_refs, index_ref],
-                )
-                refs.append(table_metadata_ref)
-                refs.append(
-                    self.switch(write_metadata)(
-                        self,
-                        self.feature_metadata,
-                        *feature_metadata_rows,
-                        schema_mode="merge",
-                        _ray_ordering_deps=[table_metadata_ref],
-                    )
-                )
-
-            return self.get(refs) if self.run_on_ray_cluster else refs
+        annotated = [*(comments or {}), *(tags or {})]
+        if unknown := sorted({name for name in annotated if name not in df.columns or name in self.sort_keys}):
+            raise ValueError(f"comments and tags name columns that are not written features: {unknown}")
+        native = self._native_lake()
+        if set(df.columns) <= set(self.sort_keys):
+            native.add_index_rows(df)
+        else:
+            native._add(df, signal_type, owner, overlap_mode, feature_params, comments, tags)
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
     def add_targets(
         self,
-        df: pl.DataFrame | RayObjectReference,
+        df: pl.DataFrame,
         owner: str = "missing_owner",
-        metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
-    ) -> list:
+        comments: Mapping[str, str] | None = None,
+        tags: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         """Add target columns to the lake.
 
         Each call scans and appends to the global index once, so batch related columns and
         complete primary-sort-key periods rather than splitting them across calls. See ``_add``
         and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
+
+        ``comments`` and ``tags`` map written columns to the comment and tags of the versions
+        written, as :meth:`annotate` stores them. A feature given a comment but no tags keeps
+        the tags stored with its table, and the reverse.
         """
-        return self._add(df=df, signal_type="target", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
+        self._add(df=df, signal_type="target", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
     def add_features(
         self,
-        df: pl.DataFrame | RayObjectReference,
+        df: pl.DataFrame,
         owner: str = "missing_owner",
-        metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
-    ) -> list:
+        comments: Mapping[str, str] | None = None,
+        tags: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         """Add feature columns to the lake.
 
         Each call scans and appends to the global index once, so batch related columns and
         complete primary-sort-key periods rather than splitting them across calls. See ``_add``
         and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
+
+        ``comments`` and ``tags`` map written columns to the comment and tags of the versions
+        written, as :meth:`annotate` stores them. A feature given a comment but no tags keeps
+        the tags stored with its table, and the reverse.
         """
-        return self._add(df=df, signal_type="feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
+        self._add(df=df, signal_type="feature", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
-    def add_index_rows(self, df: pl.DataFrame | RayObjectReference) -> list:
+    @validate_call(config=ConfigDict(arbitrary_types_allowed=True))
+    def add_index_rows(self, df: pl.DataFrame) -> None:
         """Extend the global index without adding features.
 
-        Equivalent to :meth:`add_features` with only the sort-key columns retained. No
-        feature or table metadata is created. Dense feature tables are padded only where
+        No feature or table metadata is created. Dense feature tables are padded only where
         the new rows overlap their covered range. Non-overlapping dense tables, as-of
         tables, and sparse tables are left untouched.
 
         Args:
-            df: A DataFrame or Ray object reference containing the sort-key columns.
-                Non-sort-key DataFrame columns are dropped. Object references are
-                forwarded unchanged and should contain only sort-key columns.
-
-        Returns:
-            The list returned by the underlying add operation.
+            df: A DataFrame containing the sort-key columns. Other columns are ignored.
 
         """
-        if isinstance(df, pl.DataFrame):
-            df = df.select(self.sort_keys)
-        return self._add(df=df, signal_type="feature")
+        self._native_lake().add_index_rows(df.select(self.sort_keys))
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
     def consolidate_feature_groups(self, features: list[str]) -> str | None:
         """Merge the current FeatureGroup tables for the given features into one table.
 
-        Only ``"feature"`` and ``"target"`` signal types may be consolidated.
+        Only ``"feature"`` and ``"target"`` signal types may be consolidated. Each feature
+        gets a new version in the new table, with its comment and tags.
 
         Args:
             features: Feature names to consolidate. They should share an update cadence.
@@ -1251,147 +424,55 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             MissingFeaturesException: If any requested feature does not exist.
             ValueError: If any requested feature has a non-consolidatable signal type.
         """
-        candidates = (
-            self.feature_metadata_frame()
-            .collect()
-            .sort("version", descending=True)
-            .group_by("feature_name")
-            .agg(pl.all().first())
-            .filter(pl.col("feature_name").is_in(features))
-        )
-        if missing := set(features) - set(candidates["feature_name"]):
-            raise MissingFeaturesException(f"Features not found in lake: {missing}")
-        if (bad := candidates.filter(~pl.col("signal_type").is_in({"feature", "target"}))).height:
-            raise ValueError(f"Non-consolidatable signal types: {list(zip(bad['feature_name'], bad['signal_type']))}")
-        if candidates["table_addr"].n_unique() <= 1:
-            return None
-
-        new_addr = self.gen_table_addr()
-        writer_options = {"writer_properties": WriterProperties(compression=self.compression)}
-        merged_last_updated = (
-            self.table_metadata_frame()
-            .collect()
-            .sort("update_timestamp", descending=True)
-            .group_by("table_addr")
-            .agg(pl.col("last_updated").first())
-            .filter(pl.col("table_addr").is_in(candidates["table_addr"].unique().to_list()))["last_updated"]
-            .max()
-        )
-        consolidated = (
-            self._load_features_from_tables_in_parallel(candidates) if self.run_on_ray_cluster else self._load_features_from_tables(candidates)
-        )
-        self.io.write_delta(
-            consolidated,
-            self.get_path(new_addr),
-            mode="append",
-            delta_write_options={**writer_options, "configuration": self._feature_stats_configuration},
-        )
-        self.io.write_delta(
-            table_metadata_row(new_addr, merged_last_updated),
-            self.table_metadata,
-            mode="append",
-            delta_write_options=writer_options,
-        )
-        self.io.write_delta(
-            candidates.with_columns(version=pl.col("version") + 1, table_addr=pl.lit(new_addr)),
-            self.feature_metadata,
-            mode="append",
-            delta_write_options=writer_options,
-        )
-        return new_addr
+        return self._native_lake().consolidate_feature_groups(features)
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
     def add_as_of_features(
         self,
-        df: pl.DataFrame | RayObjectReference,
+        df: pl.DataFrame,
         params: dict,
         owner: str = "missing_owner",
-        metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
-    ) -> list:
-        """Calls _add for as_of feature signal_types"""
-        return self._add(df=df, signal_type="as_of_feature", owner=owner, metadata=metadata, feature_params=params, overlap_mode=overlap_mode)
+        comments: Mapping[str, str] | None = None,
+        tags: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
+        """Calls _add for as_of feature signal_types; see :meth:`add_features` for ``comments`` and ``tags``."""
+        self._add(df=df, signal_type="as_of_feature", owner=owner, feature_params=params, overlap_mode=overlap_mode, comments=comments, tags=tags)
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
     def add_sparse_features(
         self,
-        df: pl.DataFrame | RayObjectReference,
+        df: pl.DataFrame,
         owner: str = "missing_owner",
-        metadata: pl.DataFrame | None = None,
         overlap_mode: Literal["copy", "merge"] = "copy",
-    ) -> list:
+        comments: Mapping[str, str] | None = None,
+        tags: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         """Add sparse features to this FeatureLake.
 
         Sparse features are stored without null sentinel rows — only rows with actual values
-        are written to the physical Delta table.  At read time they are joined back to the
-        global index via a left join using Polars' streaming sort-merge engine, so every index
-        row is returned with ``null`` where the sparse feature has no observation.
+        are written to the physical Delta table.  At read time they are left-joined back to the
+        global index, so every index row is returned with ``null`` where the sparse feature has
+        no observation.
 
         Use sparse features for data that is genuinely sparse (e.g. corporate actions, earnings
         events, issuer attributes) where storing a null for every missing index row would be
         wasteful.  For slowly-changing data where you want the last known value carried forward,
-        use :meth:`add_as_of_features` instead.
+        use :meth:`add_as_of_features` instead. See :meth:`add_features` for ``comments`` and
+        ``tags``.
         """
-        return self._add(df=df, signal_type="sparse_feature", owner=owner, metadata=metadata, overlap_mode=overlap_mode)
+        self._add(df=df, signal_type="sparse_feature", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
     def add_runtime_computed_features(self, exprs=list[PolarsExpression], owner: str = "missing_owner") -> None:
         """Add (and possibly increment the version) a serialized expression representing an adhoc runtime feature computation"""
-        self._ensure_runtime_computed_features_enabled()
-        for expr in exprs:
-            if expr.meta.output_name() in expr.meta.root_names():
-                raise ValueError(
-                    f"Invalid input: the expression {expr} provides the same output name as a provided root name. Please alias your runtime features uniquely!"
-                )
-        all_output_names = {expr.meta.output_name() for expr in exprs}
-        existing_feature_names = self.feature_metadata_frame().select("feature_name").collect()["feature_name"].unique()
-        missing_root_names = []
-        for expr in exprs:
-            for name in expr.meta.root_names():
-                if name not in existing_feature_names and name not in all_output_names:
-                    missing_root_names.append(name)
-
-        if len(missing_root_names) > 0:
+        if not self.enable_runtime_computed_features:
             raise ValueError(
-                f"Your expressions require the following root names which are not yet stored in (or computed by) this Gamma Lake: {missing_root_names}"
+                "Runtime-computed features are disabled. Set enable_runtime_computed_features=True only when feature metadata is trusted."
             )
-
-        new_features = pl.DataFrame(
-            {
-                "feature_name": [expr.meta.output_name() for expr in exprs],
-                "table_addr": ["n/a"] * len(exprs),
-                "owner": [owner] * len(exprs),
-                "signal_type": ["runtime_computed"] * len(exprs),
-                "feature_params": [expr.meta.serialize(format="json") for expr in exprs],
-            }
-        )
-
-        already_registered = [n for n in new_features["feature_name"].to_list() if n in existing_feature_names]
-        if already_registered:
-            raise ValueError(
-                f"The following feature names are already registered and cannot be re-registered: {already_registered}. "
-                "Use a unique alias for each runtime computed feature."
-            )
-
-        existing_versions = (
-            self.feature_metadata_frame()
-            .filter(pl.col("feature_name").is_in(new_features["feature_name"]))
-            .group_by("feature_name")
-            .agg(pl.col("version").max().alias("_max_version"))
-            .collect()
-        )
-        new_features = (
-            new_features.join(existing_versions, on="feature_name", how="left")
-            .with_columns(version=(pl.col("_max_version").fill_null(-1) + 1).cast(pl.Int64))
-            .drop("_max_version")
-        )
-        self.io.write_delta(new_features, self.feature_metadata, mode="append", delta_write_options={"schema_mode": "merge"})
+        self._native_lake().add_runtime_computed_features(exprs, owner)
 
     @ensure_deltalake_is_initialized
-    @trace(always=True)
     def add_runtime_transforms(self, features: list[str], transforms: list[str], owner: str = "missing_owner") -> None:
         """Register row-local transforms over stored features as runtime features.
 
