@@ -11,19 +11,7 @@ Python exchanges Arrow record batch streams with Rust through the
 
 ## Using it from Python
 
-`GammaFeatureLake` always uses the core:
-
-```python
-from datetime import date
-
-from gammalake import GammaFeatureLake
-
-lake = GammaFeatureLake(base_path="/data/features")
-lake.add_features(df, owner="team-a")
-lake.read(["feature_a", "feature_b"], start=date(2024, 1, 1), end=date(2024, 2, 1))
-```
-
-Stored features are read and written in Rust. Runtime-computed features are Polars expressions, so they are evaluated
+`GammaFeatureLake` always uses the core. Stored features are read and written in Rust. Runtime-computed features are Polars expressions, so they are evaluated
 in Python with Polars over columns the core reads; Rust callers see them in the metadata but cannot read them.
 Requests the core cannot serve raise `UnsupportedError`.
 
@@ -31,17 +19,16 @@ Requests the core cannot serve raise `UnsupportedError`.
 the index and feature table scans. `scan()` returns a `LazyFrame`. Filters applied to it later that compare sort keys
 with literals, test membership with `is_in`, use `is_between` or test for nulls, combined with `&`, `|` and `~`, reach the
 scans, for example `pl.col("timestamp") >= start` or `pl.col("symbol").is_in(symbols)`. The rest, and filters on float
-columns, run after alignment.
-`scan_index()`, `scan_feature_metadata()`, `scan_table_metadata()` and `scan_transaction_log()` push the same filters, on any of their columns, into
-their scans. `read_arrow()` returns a single-use Arrow C stream, which `pyarrow.RecordBatchReader.from_stream` and
+columns, run after alignment. `scan_index()`, `scan_feature_metadata()`, `scan_table_metadata()` and
+`scan_transaction_log()` push the same filters, on any of their columns, into their scans. `read_arrow()` returns a single-use Arrow C stream, which `pyarrow.RecordBatchReader.from_stream` and
 `polars.DataFrame` accept.
 
 ## How reads work
 
 Every dense feature table holds the same sort keys in the same order as the index, up to the last row it covers. A read
 filters the index, scans each requested dense table with the same filter, and concatenates the batches horizontally by
-position. Rows of the index past the end of a table read as nulls. Dense features need no join, which is what makes
-gamma-lake reads fast. As-of and sparse features are stored with their own keys and are joined to the index.
+position. Rows of the index past the end of a table read as nulls. Dense features need no join. As-of and sparse features are
+stored with their own keys and are joined to the index.
 
 Filters arrive as a predicate in disjunctive normal form (an OR of ANDs of column comparisons). They can only reference
 sort keys, since those are the only columns shared by the index and every feature table. DataFusion executes the scan of
@@ -60,7 +47,8 @@ A write splits its input by the feature table that holds the latest version of e
   new table; in merge mode the existing table is updated with a Delta merge.
 
 The index and feature tables are written first and the metadata tables last, so a reader never sees a feature before its
-data. Writes to one lake are serialized within a process; separate processes writing the same lake must coordinate.
+data. See [concurrent writers](https://github.com/Point72/gamma-lake#concurrent-writers) for writes from several
+processes.
 
 Each write is logged as `pending`, then `success`, in the transaction log. The core marks each commit it makes with the
 write's transaction id, in the Delta `commitInfo`, and records the version of each table it read. If the write fails
@@ -75,8 +63,8 @@ added, added rows to columns the write added, or changed a schema the write chan
 ## Files
 
 Every table of the default backend is an unpartitioned Delta table of parquet files, compressed with zstd unless
-`DeltaOptions.compression` selects another codec. Rows are in key order, except in files written by merges, and a row group holds up to
-about a million rows.
+`DeltaOptions.compression` selects another codec. Rows are in key order, except in files written by merges, and a row
+group holds up to about a million rows.
 
 ## Threads
 
@@ -112,12 +100,6 @@ reads for a whole row group, and feature files hold row groups of up to a millio
 tables, the feature metadata and the output batches are also held outside the limit. A share too small to sort one
 batch fails the read with a resources-exhausted error; for features with long strings or nested values, a smaller
 `batch_size` avoids this.
-
-## Performance
-
-The ASV suites in `benchmarks/gammalake_benchmarks.py` time reads and writes. See
-[docs/benchmarking.md](https://github.com/Point72/gamma-lake/blob/main/docs/benchmarking.md) for how to run them, and
-[Performance](Performance) for results.
 
 ## Using it from Rust
 

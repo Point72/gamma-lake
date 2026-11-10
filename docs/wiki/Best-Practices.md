@@ -71,7 +71,8 @@ ______________________________________________________________________
 ## Keep Feature Groups Logically Coherent
 
 New features written in the same `add_features()` call share a new Delta table (a *feature group*). Later writes to
-those features append to that table or, when they overlap stored rows, follow the call's `overlap_mode`. Design your feature groups around:
+those features append to that table or, when they overlap stored rows, follow the call's `overlap_mode`. Design your
+feature groups around:
 
 - **Update frequency** — features updated daily should be in the same group; intraday features in a separate group
 - **Ownership** — features owned by the same team are natural candidates for the same group

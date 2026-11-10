@@ -62,13 +62,12 @@ make build
 
 `gamma-lake` has linting and auto formatting.
 
-| Language | Linter      | Autoformatter | Description |
-| :------- | :---------- | :------------ | :---------- |
-| Python   | `ruff`      | `ruff`        | Style       |
-| Python   | `ruff`      | `ruff`        | Imports     |
-| Rust     | `clippy`    | `rustfmt`     | Style       |
-| Markdown | `mdformat`  | `mdformat`    | Style       |
-| Markdown | `codespell` |               | Spelling    |
+| Language | Linter      | Autoformatter | Description    |
+| :------- | :---------- | :------------ | :------------- |
+| Python   | `ruff`      | `ruff`        | Style, imports |
+| Rust     | `clippy`    | `rustfmt`     | Style          |
+| Markdown | `mdformat`  | `mdformat`    | Style          |
+| Markdown | `codespell` |               | Spelling       |
 
 Run all linters or formatters together:
 
@@ -82,7 +81,8 @@ The corresponding language-specific targets are `lint-py`, `lint-rs`, `lint-docs
 
 ## Testing
 
-`gamma-lake` has both Python and Rust tests. The bulk of the functionality is tested in Python, which can be run via `pytest`. First, install the Python development dependencies with
+`gamma-lake` has Python tests, run with `pytest`, and Rust tests, run with `cargo nextest`. First, install the
+development dependencies with
 
 ```bash
 make develop
@@ -105,7 +105,6 @@ runs the tests of every crate in the `rust/` workspace. To test one crate, such 
 
 The parity tests in `rust/tests/read_parity.rs` read Delta lakes written by the pure-Python engine of v0.2.0 and compare
 against its results. `make test-rs` first runs `make fixtures`, which extracts that engine with `git archive` and
-generates the lakes under `rust/tests/fixtures`; they are not committed. Without them `cargo test` skips the parity
-tests.
+generates the lakes under `rust/tests/fixtures`; they are not committed, and the parity tests fail without them.
 
 `make test` runs the Python and Rust tests.

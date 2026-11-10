@@ -32,7 +32,7 @@ The most common alternative — storing features in per-day Parquet files — br
 | Cross-group reads require expensive joins                | Gamma Lake maintains a master index; reads are aligned horizontal concatenations                |
 | Experimental features pollute production data            | Features carry `owner` and `version` metadata; `read()` accepts a filtered metadata frame       |
 
-See [performance](https://github.com/Point72/gamma-lake/wiki/Performance) for read and write times and how Gamma Lake compares with per-day Parquet files.
+See [performance](https://github.com/Point72/gamma-lake/wiki/Performance) for how Gamma Lake compares with per-day Parquet files.
 
 ## Key Features
 
@@ -219,10 +219,9 @@ ctx.register_table("features", lake.feature_table(["feature_a", "feature_b"]))
 ctx.sql("SELECT symbol, avg(feature_a) FROM features WHERE timestamp >= '2024-01-01' GROUP BY symbol").to_polars()
 ```
 
-The table has one row per index row and is sorted by the sort keys, so `SELECT *` returns what `read()` returns. Filters
-on sort keys are pushed into the read; DataFusion applies the others. The latest versions are chosen when the table is
-created, but each query reads the tables as they are when it runs, so later appends and merges are visible. The
-`datafusion` package must have the same major version as the DataFusion that gamma-lake is built with (55 at present).
+`SELECT *` returns what `read()` returns, and filters on sort keys are pushed into the read. The `datafusion` package
+must have the same major version as the DataFusion gamma-lake is built with (55); see
+[Native Engine](https://github.com/Point72/gamma-lake/wiki/Native-Engine#querying-with-datafusion) for details.
 
 ### Concurrent writers
 
@@ -236,21 +235,16 @@ it in between, the write stops there and the tables it already committed to are
 run again. If the rollback cannot complete, it raises `PartialWriteError` instead, and the lake holds part of the
 write.
 
-A write is checked only against the tables it commits to. A write that adds no index rows, and
-`consolidate_feature_groups`, read the index without committing to it, so they can miss keys another process adds at
-the same time; neither fails, and the tables they create or extend lack rows for those keys. Writers in several
-processes should therefore coordinate each `add_*` and `consolidate_feature_groups` call externally. Reads
-through a `gammalake.native.NativeLake` opened with `validate=True` detect misaligned tables among those they read.
-
 For writers in several processes, pass `lock`: a callable that takes the absolute path or URL of a table and returns
 a context manager. Gamma Lake enters it around each commit to that table, so commits to one table from different
 processes run one at a time, which object stores without atomic commits need. Reads take no lock.
 
 The lock serialises commits; it does not make a write atomic. A write plans where its rows go in the index before it
-commits, so if another process extends the index in between, the tables can end up misaligned, even when the two
-writes touch different keys and different features. Writes from several processes that may add index rows must be
-coordinated by the caller around the whole `add_*` call, for example by holding one lake-wide lock. Reading with
-`validate=True` detects misaligned tables.
+commits, and a write that adds no index rows, like `consolidate_feature_groups`, reads the index without committing
+to it. If another process extends the index in between, the tables can end up misaligned, even when the two writes
+touch different keys and features. Writers in several processes must therefore coordinate each `add_*` and
+`consolidate_feature_groups` call, for example by holding one lake-wide lock. Reading through a
+`gammalake.native.NativeLake` opened with `validate=True` detects misaligned tables.
 
 ```python
 import hashlib
@@ -282,7 +276,6 @@ version explicitly.
 | New index rows        | Extend the index once; preserve aligned prefixes                  |
 | Overlapping rows      | Versioned copy or Delta merge                                     |
 | Cross-group assembly  | Predicate-distributed positional horizontal concatenation         |
-| Engine                | Rust core on delta-rs and DataFusion                              |
 | Versioning            | Append-only metadata records owner and version per feature column |
 | Write tracking        | Append-only transaction log; failed writes are rolled back        |
 
@@ -301,13 +294,13 @@ write cannot be undone without removing another writer's changes, it remains `fa
 
 ## Documentation
 
-| Document                                                                             | Description                                                   |
-| ------------------------------------------------------------------------------------ | ------------------------------------------------------------- |
-| [Architecture](#how-gamma-lake-works)                                                | Index design, feature groups, and append/merge semantics      |
-| [Best practices](https://github.com/Point72/gamma-lake/wiki/Best-Practices)          | Recommended versioning, update, and parallel-write patterns   |
-| [Performance](https://github.com/Point72/gamma-lake/wiki/Performance)                | Read and write times, and the comparison with per-day Parquet |
-| [Benchmarking](https://github.com/Point72/gamma-lake/blob/main/docs/benchmarking.md) | Running the read/write benchmarks                             |
-| [Native engine](https://github.com/Point72/gamma-lake/wiki/Native-Engine)            | Rust reads and writes, from Python and Rust                   |
+| Document                                                                             | Description                                                 |
+| ------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| [Architecture](#how-gamma-lake-works)                                                | Index design, feature groups, and append/merge semantics    |
+| [Best practices](https://github.com/Point72/gamma-lake/wiki/Best-Practices)          | Recommended versioning, update, and parallel-write patterns |
+| [Performance](https://github.com/Point72/gamma-lake/wiki/Performance)                | Comparison with per-day Parquet files                       |
+| [Benchmarking](https://github.com/Point72/gamma-lake/blob/main/docs/benchmarking.md) | Running the read/write benchmarks                           |
+| [Native engine](https://github.com/Point72/gamma-lake/wiki/Native-Engine)            | Rust reads and writes, from Python and Rust                 |
 
 ## Core API
 
