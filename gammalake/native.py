@@ -242,8 +242,11 @@ def _scan(schema: pl.Schema, open_stream, base: list[list[Term]], filter_schema:
         reader = pa.RecordBatchReader.from_stream(open_stream(with_columns, _dnf(_and(base, pushed))))
         frames = _head((pl.from_arrow(batch) for batch in reader), n_rows)
         if node is not None and _row_aligned(node):
+            # Per-row literals must see the whole frame at once, and Polars 1 splits even an eager
+            # filter across threads, so the mask is computed first.
             collected = list(frames)
-            frames = [pl.concat(collected, rechunk=True) if collected else pl.DataFrame(schema=schema)]
+            frame = pl.concat(collected, rechunk=True) if collected else pl.DataFrame(schema=schema)
+            frames, predicate = [frame.filter(frame.select(predicate).to_series())], None
         for frame in frames:
             if predicate is not None:
                 frame = frame.filter(predicate)

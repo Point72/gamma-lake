@@ -509,18 +509,22 @@ def test_scan_slices_before_filtering(lake_path):
 
 
 def test_scans_take_row_aligned_predicates(lake_path):
+    # Eager polars evaluates a row-aligned is_in per chunk and fails on multi-chunk frames, so the
+    # expected frames use the equivalent predicates: every row's value is in its own one-element list.
     lake = NativeLake(lake_path)
     metadata = lake.feature_metadata()
     first = metadata["feature_name"][0]
-    for predicate in [
-        pl.col("feature_name").is_in(pl.Series([[name] for name in metadata["feature_name"]])),
-        (pl.col("feature_name") == first) & pl.col("feature_name").is_in(pl.Series([[first]] * metadata.height)),
-        (pl.col("feature_name") != first) & pl.col("feature_name").is_in(pl.Series([[name] for name in metadata["feature_name"]])),
+    is_first = pl.col("feature_name") == first
+    own_name = pl.col("feature_name").is_in(pl.Series([[name] for name in metadata["feature_name"]]))
+    for predicate, expected in [
+        (own_name, metadata),
+        (is_first & pl.col("feature_name").is_in(pl.Series([[first]] * metadata.height)), metadata.filter(is_first)),
+        (~is_first & own_name, metadata.filter(~is_first)),
     ]:
-        assert_frame_equal(lake.scan_feature_metadata().filter(predicate).collect(), metadata.filter(metadata.select(predicate).to_series()))
+        assert_frame_equal(lake.scan_feature_metadata().filter(predicate).collect(), expected)
     index = lake.index()
     predicate = (pl.col("symbol") != "A") & pl.col("symbol").is_in(pl.Series([[symbol] for symbol in index["symbol"]]))
-    assert_frame_equal(lake.scan_index().filter(predicate).collect(), index.filter(index.select(predicate).to_series()))
+    assert_frame_equal(lake.scan_index().filter(predicate).collect(), index.filter(pl.col("symbol") != "A"))
 
 
 JOIN_PARAMS = [
