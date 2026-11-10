@@ -537,7 +537,7 @@ impl DeltaStored {
             .with_actions(vec![Action::Metadata(metadata)])
             .build(Some(snapshot), self.table.log_store(), operation)
             .await
-            .map_err(|e| commit_err(name, e.into()))?;
+            .map_err(|e| commit_err(name, e))?;
         Ok(())
     }
 }

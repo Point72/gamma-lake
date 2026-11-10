@@ -28,6 +28,9 @@ use crate::write::{
 const COMMENT: &str = "comment";
 const TAGS: &str = "tags";
 
+/// Metadata updates per column, as `StoredTable::set_columns_metadata` takes them.
+type ColumnUpdates = Vec<(String, HashMap<String, String>)>;
+
 /// A comment and tags for one version of a feature.
 ///
 /// They are stored as the `comment` and `tags` (a JSON list of strings) metadata of the
@@ -126,7 +129,7 @@ impl Lake {
             let best = latest(&rows);
             let mut missing = vec![];
             // Updates per table and column, in first-appearance order.
-            let mut tables: Vec<(String, Vec<(String, HashMap<String, String>)>)> = vec![];
+            let mut tables: Vec<(String, ColumnUpdates)> = vec![];
             for a in &annotations {
                 let name = &a.feature_name;
                 let addr = match &a.table_addr {

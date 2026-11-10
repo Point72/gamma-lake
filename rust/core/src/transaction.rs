@@ -582,7 +582,7 @@ mod tests {
             "{err}"
         );
         assert!(phase.contains("rewrote what this write committed"), "{err}");
-        assert_eq!(committed, &[lake.options.index_path.clone()]);
+        assert_eq!(committed, std::slice::from_ref(&lake.options.index_path));
         assert_eq!(index_ts(&lake), [1, 2, 8, 9]);
         assert_eq!(statuses(&lake)[2..], ["pending", "failed"]);
     }
