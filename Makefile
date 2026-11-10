@@ -95,12 +95,14 @@ coverage-rs: fixtures  ## run rust tests and collect test coverage
 	make -C rust coverage
 
 # The pure-Python engine of COMPAT_REF, extracted into OLD_SRC. CI checkouts are shallow, without tags.
+# COMPAT_REF predates polars 2, so OLD_SRC carries its own polars.
 COMPAT_REF ?= v0.2.0
 OLD_SRC := $(CURDIR)/build/old-engine
 define extract-old-engine
 	git rev-parse -q --verify "$(COMPAT_REF)^{commit}" >/dev/null || git fetch --no-tags origin tag $(COMPAT_REF)
 	rm -rf $(OLD_SRC) && mkdir -p $(OLD_SRC)
 	git archive $(COMPAT_REF) gammalake | tar -x -C $(OLD_SRC)
+	uv pip install -q --python python --target $(OLD_SRC) "polars<2"
 endef
 
 .PHONY: test-compat

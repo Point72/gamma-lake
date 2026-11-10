@@ -849,7 +849,6 @@ impl Lake {
         })
         .map_err(to_py)
     }
-
 }
 
 /// Package version of the native library.

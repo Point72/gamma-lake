@@ -538,10 +538,10 @@ def test_scans_take_row_aligned_predicates(lake_path):
         (pl.col("feature_name") == first) & pl.col("feature_name").is_in(pl.Series([[first]] * metadata.height)),
         (pl.col("feature_name") != first) & pl.col("feature_name").is_in(pl.Series([[name] for name in metadata["feature_name"]])),
     ]:
-        assert_frame_equal(lake.scan_feature_metadata().filter(predicate).collect(), metadata.filter(predicate))
+        assert_frame_equal(lake.scan_feature_metadata().filter(predicate).collect(), metadata.filter(metadata.select(predicate).to_series()))
     index = lake.index()
     predicate = (pl.col("symbol") != "A") & pl.col("symbol").is_in(pl.Series([[symbol] for symbol in index["symbol"]]))
-    assert_frame_equal(lake.scan_index().filter(predicate).collect(), index.filter(predicate))
+    assert_frame_equal(lake.scan_index().filter(predicate).collect(), index.filter(index.select(predicate).to_series()))
 
 
 JOIN_PARAMS = [
