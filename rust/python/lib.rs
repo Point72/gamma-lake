@@ -302,10 +302,6 @@ impl LockGuard for PyGuard {
     }
 }
 
-fn pairs(features: &[(String, i64)]) -> Vec<(&str, i64)> {
-    features.iter().map(|(n, v)| (n.as_str(), *v)).collect()
-}
-
 type SelectedRow = (String, String, String, Option<String>);
 
 fn selected(rows: Vec<SelectedRow>) -> Vec<SelectedFeature> {
@@ -318,6 +314,13 @@ fn selected(rows: Vec<SelectedRow>) -> Vec<SelectedFeature> {
                 feature_params,
             },
         )
+        .collect()
+}
+
+fn selected_rows(features: Vec<SelectedFeature>) -> Vec<SelectedRow> {
+    features
+        .into_iter()
+        .map(|f| (f.name, f.table_addr, f.signal_type, f.feature_params))
         .collect()
 }
 
@@ -537,46 +540,37 @@ impl Lake {
         .map_err(to_py)
     }
 
-    /// Schema [`read`] would produce, without reading any feature data.
+    /// The `(name, table_addr, signal_type, feature_params)` rows `read` reads, in output order.
     #[pyo3(signature = (features, targets = None))]
-    fn read_schema(
+    fn resolve(
         &self,
         py: Python<'_>,
         features: Vec<String>,
         targets: Option<Vec<String>>,
-    ) -> PyResult<ArrowSchema> {
+    ) -> PyResult<Vec<SelectedRow>> {
         let targets = targets.unwrap_or_default();
         py.detach(|| {
             let features: Vec<&str> = features.iter().map(String::as_str).collect();
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
-            self.inner.read_schema(&features, &targets)
+            self.inner.resolve_latest(&features, &targets)
         })
-        .map(|schema| ArrowSchema { schema })
+        .map(selected_rows)
         .map_err(to_py)
     }
 
-    /// Reads each `(name, version)` pair as [`read`] reads the latest versions.
-    #[pyo3(signature = (features, predicate = None))]
-    fn read_versions(
+    /// The rows of each `(name, version)` pair, in order.
+    fn resolve_versions(
         &self,
         py: Python<'_>,
         features: Vec<(String, i64)>,
-        predicate: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<ArrowStream> {
-        let dnf = import_dnf(predicate.as_ref())?;
-        py.detach(|| self.inner.read_versions(&pairs(&features), &dnf))
-            .map(ArrowStream::new)
-            .map_err(to_py)
-    }
-
-    fn read_versions_schema(
-        &self,
-        py: Python<'_>,
-        features: Vec<(String, i64)>,
-    ) -> PyResult<ArrowSchema> {
-        py.detach(|| self.inner.read_versions_schema(&pairs(&features)))
-            .map(|schema| ArrowSchema { schema })
-            .map_err(to_py)
+    ) -> PyResult<Vec<SelectedRow>> {
+        py.detach(|| {
+            let features: Vec<(&str, i64)> =
+                features.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+            self.inner.resolve_versions(&features)
+        })
+        .map(selected_rows)
+        .map_err(to_py)
     }
 
     /// Reads the features that `(name, table_addr, signal_type, feature_params)` rows of

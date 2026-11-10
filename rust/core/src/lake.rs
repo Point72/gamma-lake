@@ -535,6 +535,20 @@ impl Lake {
         block_on(async { self.select(&self.context()?, selection).await })?
     }
 
+    /// The feature metadata rows [`Lake::read`] reads, in output order.
+    pub fn resolve_latest(
+        &self,
+        features: &[&str],
+        targets: &[&str],
+    ) -> Result<Vec<SelectedFeature>> {
+        self.resolve(Selection::Latest { features, targets })
+    }
+
+    /// The feature metadata rows [`Lake::read_versions`] reads, in output order.
+    pub fn resolve_versions(&self, features: &[(&str, i64)]) -> Result<Vec<SelectedFeature>> {
+        self.resolve(Selection::Versions(features))
+    }
+
     fn selection_schema(&self, selection: Selection<'_>) -> Result<SchemaRef> {
         block_on(async {
             let plan = self.read_inputs(selection, &Dnf::default()).await?;
