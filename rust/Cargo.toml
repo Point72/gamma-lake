@@ -64,5 +64,10 @@ url.workspace = true
 [profile.release]
 strip = "symbols"
 
+# Every test binary links datafusion and deltalake; with their debuginfo, parallel links outgrow
+# CI runner memory.
+[profile.dev.package."*"]
+debug = false
+
 [profile.test.junit]
 path = "junit.xml"
