@@ -11,8 +11,9 @@ path = "rust/python/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-gamma_lake = { path = "./rust", version = "*", features = ["mimalloc"] }
-pyo3 = { version = "0.29.2", features = ["abi3", "extension-module", "multiple-pymethods"] }
+gamma_lake = { path = "./rust", version = "*" }
+mimalloc = { version = "0.1", default-features = false }
+pyo3 = { version = "0.29.2", features = ["abi3", "extension-module"] }
 # DataFusion's FFI, for `FeatureTable.__datafusion_table_provider__`. It must match the
 # DataFusion version of the core (through deltalake), and datafusion-python must have the same
 # major version.

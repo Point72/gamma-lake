@@ -2523,10 +2523,8 @@ dependencies = [
 name = "gamma_lake"
 version = "0.2.0"
 dependencies = [
- "arrow",
  "gamma_lake_core",
  "gamma_lake_delta",
- "mimalloc",
 ]
 
 [[package]]
@@ -2561,6 +2559,7 @@ version = "0.2.0"
 dependencies = [
  "datafusion-ffi",
  "gamma_lake",
+ "mimalloc",
  "pyo3",
 ]
 
@@ -2956,15 +2955,6 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
-]
-
-[[package]]
-name = "inventory"
-version = "0.3.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6928282826c822ad91bf1c9a1cb90a30ba1c26770749929b4656cd6be829cd7c"
-dependencies = [
- "rustversion",
 ]
 
 [[package]]
@@ -3716,7 +3706,6 @@ version = "0.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "700d18fa267b73b9b521fd7e13580e2f446916f176cacee1ab63fcc8191f1655"
 dependencies = [
- "inventory",
  "libc",
  "once_cell",
  "portable-atomic",

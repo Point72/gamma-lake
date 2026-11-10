@@ -42,10 +42,8 @@ keywords = ["feature-store", "delta-lake", "arrow", "datafusion"]
 exclude = ["tests/fixtures"]
 
 [dependencies]
-arrow.workspace = true
 gamma_lake_core.workspace = true
 gamma_lake_delta.workspace = true
-mimalloc = { version = "0.1", optional = true, default-features = false }
 
 [features]
 default = ["s3"]
@@ -53,8 +51,6 @@ default = ["s3"]
 s3 = ["gamma_lake_delta/s3"]
 azure = ["gamma_lake_delta/azure"]
 gcs = ["gamma_lake_delta/gcs"]
-# Sets mimalloc as the global allocator for the Python extension.
-mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 async-trait.workspace = true

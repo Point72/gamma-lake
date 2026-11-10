@@ -2,10 +2,7 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
+use gamma_lake_core::arrow::datatypes::SchemaRef;
 pub use gamma_lake_core::*;
 pub use gamma_lake_delta::{DeltaOptions, DeltaStore};
 
@@ -15,15 +12,6 @@ pub fn open(store: DeltaStore, options: LakeOptions) -> Result<Lake> {
 }
 
 /// Creates any missing index and metadata tables, then opens the lake.
-pub fn create(
-    store: DeltaStore,
-    index_schema: arrow::datatypes::SchemaRef,
-    options: LakeOptions,
-) -> Result<Lake> {
+pub fn create(store: DeltaStore, index_schema: SchemaRef, options: LakeOptions) -> Result<Lake> {
     Lake::create_with_store(Arc::new(store), index_schema, options)
-}
-
-/// Package version of the Rust library.
-pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
 }

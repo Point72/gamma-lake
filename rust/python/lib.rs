@@ -25,6 +25,9 @@ use pyo3::exceptions::{PyImportError, PyRuntimeError, PyTypeError, PyValueError}
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods, PyTuple};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // `import_exception!` declares a Rust handle to an exception class defined in Python, looked up
 // lazily (the first time such an error is raised) from the package's public namespace.
 pyo3::import_exception!(gammalake, MissingFeaturesException);
@@ -854,7 +857,7 @@ impl Lake {
 /// Package version of the native library.
 #[pyfunction]
 fn version() -> &'static str {
-    gamma_lake::version()
+    env!("CARGO_PKG_VERSION")
 }
 
 /// Number of native streams not yet released, for leak tests.
