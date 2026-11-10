@@ -21,7 +21,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from gammalake import GammaFeatureLake
-from gammalake.tests.test_native_write import KEYS, SCENARIOS, Model, frame, keys
+from gammalake.tests._model import KEYS, SCENARIOS, Model, frame, keys
 
 OLD_SRC = os.environ.get("GAMMA_LAKE_OLD_SRC")
 pytestmark = pytest.mark.skipif(not OLD_SRC, reason="GAMMA_LAKE_OLD_SRC is not set")
@@ -41,9 +41,6 @@ _RUNNER = textwrap.dedent(
     assert gammalake.__file__.startswith(src), gammalake.__file__
     for op in ops:
         lake = GammaFeatureLake(base_path=path)
-        if op["method"] == "initialize":
-            lake.initialize()
-            continue
         args = [pl.read_parquet(op["frame"])] if "frame" in op else op.get("args", [])
         result = getattr(lake, op["method"])(*args, **op.get("kwargs", {}))
         if "out" in op:
@@ -92,12 +89,6 @@ class Engines:
                 (result.collect() if isinstance(result, pl.LazyFrame) else result).write_parquet(op["out"])
         return pl.read_parquet(op["out"]) if out else None
 
-    def initialize(self, engine: str) -> None:
-        if engine == "old":
-            self.run("old", "initialize")
-        else:
-            GammaFeatureLake(base_path=str(self.path)).initialize()
-
     def read(self, engine: str, names) -> pl.DataFrame:
         return canonical(self.run(engine, "read", out=True, args=[list(names)]))
 
@@ -116,10 +107,10 @@ class Engines:
 
 def canonical(df: pl.DataFrame) -> pl.DataFrame:
     df = df.select(sorted(df.columns))
-    keys = [c for c in KEYS if c in df.columns]
-    if not keys:
-        keys = [c for c in df.columns if df.schema[c].is_temporal() or df.schema[c] in (pl.String, pl.Int64, pl.Float64)]
-    return df.sort(keys, nulls_last=False, maintain_order=True)
+    order = [c for c in KEYS if c in df.columns]
+    if not order:
+        order = [c for c in df.columns if df.schema[c].is_temporal() or df.schema[c] in (pl.String, pl.Int64, pl.Float64)]
+    return df.sort(order, nulls_last=False, maintain_order=True)
 
 
 def engines_for(pattern: str, n: int) -> list[str]:
@@ -132,7 +123,7 @@ def engines_for(pattern: str, n: int) -> list[str]:
 def test_engines_take_turns_writing(tmp_path, scenario, pattern):
     steps = SCENARIOS[scenario]
     lake = Engines(tmp_path / "lake")
-    lake.initialize(engines_for(pattern, 1)[0])
+    lake.run(engines_for(pattern, 1)[0], "initialize")
     model, written = Model(), set()
     for engine, (rows, mode, scales) in zip(engines_for(pattern, len(steps)), steps, strict=True):
         lake.run(engine, "add_features", frame(rows, **scales), owner="compat", overlap_mode=mode)
@@ -151,7 +142,7 @@ def _as_of_frame(days, value: float) -> pl.DataFrame:
 @pytest.mark.parametrize("writer", ["old", "new"])
 def test_signal_types_written_by_one_engine_read_by_the_other(tmp_path, writer):
     lake = Engines(tmp_path / "lake")
-    lake.initialize(writer)
+    lake.run(writer, "initialize")
     lake.run(writer, "add_features", frame(keys(range(1, 8), "ab"), f=1), owner="compat")
     lake.run(writer, "add_targets", frame(keys(range(1, 6), "ab"), y=2), owner="compat")
     params = {"strategy": "backward", "tolerance": None, "allow_exact_matches": True}
@@ -166,7 +157,7 @@ def test_signal_types_written_by_one_engine_read_by_the_other(tmp_path, writer):
 
 def test_core_maintenance_is_readable_by_the_old_engine(tmp_path):
     lake = Engines(tmp_path / "lake")
-    lake.initialize("old")
+    lake.run("old", "initialize")
     lake.run("old", "add_features", frame(keys(range(1, 5), "ab"), f=1), owner="compat")
     lake.run("old", "add_features", frame(keys(range(1, 5), "ab"), g=2), owner="compat")
     before = lake.agree(["f", "g"])
@@ -184,7 +175,7 @@ def test_core_maintenance_is_readable_by_the_old_engine(tmp_path):
     lake.agree(["f", "g"])
 
 
-def _file(path: Path, merged: bool) -> tuple:
+def _file_settings(path: Path, merged: bool) -> tuple:
     """The parquet settings, Arrow schema, row groups and row order of one file.
 
     Row order is left out for files a merge wrote.
@@ -266,7 +257,7 @@ def _settings(path: Path) -> dict[str, list[tuple]]:
                             tuple(sorted(add)),
                             tuple(sorted(stats)),
                             tuple(sorted(stats.get("minValues", {}))),
-                            _file(table / add["path"], merge),
+                            _file_settings(table / add["path"], merge),
                         )
                     )
                 else:
@@ -291,7 +282,7 @@ def test_both_engines_write_files_with_the_same_settings(tmp_path):
     params = {"strategy": "backward", "tolerance": None, "allow_exact_matches": True}
     for writer in ("old", "new"):
         lake = Engines(tmp_path / writer)
-        lake.initialize(writer)
+        lake.run(writer, "initialize")
         lake.run(writer, "add_features", frame(keys(range(1, 6), "ab"), f=1, g=2), owner="compat")
         lake.run(writer, "add_features", frame(keys(range(6, 9), "ab"), f=1, g=2), owner="compat")
         lake.run(writer, "add_features", frame(keys(range(7, 10), "ab"), f=3), owner="compat", overlap_mode="merge")

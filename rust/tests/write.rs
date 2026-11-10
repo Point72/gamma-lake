@@ -1219,7 +1219,7 @@ fn restore_undoes_later_writes_and_leaves_untouched_tables() {
         let cutoff = tick();
         let metadata = feature_metadata(&lake);
         // A bad merge into f's table, an annotation, a new index row and a new feature;
-        // g's table is padded.
+        // g's table gets no later commit.
         add(
             &lake,
             frame(&keys(2..=3, &["a"]), &[("f", 9.0)]),
