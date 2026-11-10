@@ -22,14 +22,7 @@ from gammalake.native import ConflictError, DeltaOptions, NativeLake, PartialWri
 
 __all__ = ("ConflictError", "DeltaOptions", "GammaFeatureLake", "PartialWriteError", "UnsupportedError")
 
-_DEFAULT_INDEX_SCHEMA = ArrowSchema.make(
-    pa.schema(
-        [
-            ("timestamp", pa.timestamp("us", tz="UTC")),
-            ("symbol", pa.string()),
-        ]
-    )
-)
+DEFAULT_INDEX_SCHEMA = ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())]))
 
 
 class GammaFeatureLake(BaseFeatureLake, BaseModel):
@@ -200,7 +193,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         described = metadata.join(annotations, on=["feature_name", "table_addr"], how="left")
         return described.with_columns(pl.col("tags").fill_null(pl.lit([], dtype=pl.List(pl.String))))
 
-    def initialize(self, schema: ArrowSchema = _DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
+    def initialize(self, schema: ArrowSchema = DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
         """
         Create the index and metadata tables with the provided index schema, where they do not exist yet.
         """
@@ -283,7 +276,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         neighbouring-row semantics are preserved.
         """
         native = self._native_lake()
-        targets = targets or []
         return native.read(features, targets, start, end) if materialized else native.scan(features, targets, start, end)
 
     @ensure_deltalake_is_initialized
@@ -296,7 +288,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             ctx.register_table("features", lake.feature_table(["f1", "f2"]))
             ctx.sql("SELECT * FROM features WHERE timestamp >= '2024-01-01'").to_polars()
         """
-        return self._native_lake().feature_table(features, targets or [])
+        return self._native_lake().feature_table(features, targets)
 
     def __getstate__(self):
         # The native handle is a cache that cannot be pickled.
@@ -379,16 +371,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
-        """Add target columns to the lake.
-
-        Each call scans and appends to the global index once, so batch related columns and
-        complete primary-sort-key periods rather than splitting them across calls. See ``_add``
-        and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
-
-        ``comments`` and ``tags`` map written columns to the comment and tags of the versions
-        written, as :meth:`annotate` stores them. A feature given a comment but no tags keeps
-        the tags stored with its table, and the reverse.
-        """
+        """Add target columns to the lake; see :meth:`add_features`."""
         self._add(df=df, signal_type="target", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
 
     @ensure_deltalake_is_initialized
@@ -403,8 +386,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """Add feature columns to the lake.
 
         Each call scans and appends to the global index once, so batch related columns and
-        complete primary-sort-key periods rather than splitting them across calls. See ``_add``
-        and the ``Best-Practices`` wiki page for write-shape and backfill guidance.
+        complete primary-sort-key periods rather than splitting them across calls. See the
+        ``Best-Practices`` wiki page for write-shape and backfill guidance.
 
         ``comments`` and ``tags`` map written columns to the comment and tags of the versions
         written, as :meth:`annotate` stores them. A feature given a comment but no tags keeps
@@ -456,7 +439,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
-        """Calls _add for as_of feature signal_types; see :meth:`add_features` for ``comments`` and ``tags``."""
+        """Add as-of feature columns; see :meth:`add_features` for ``comments`` and ``tags``."""
         self._add(df=df, signal_type="as_of_feature", owner=owner, feature_params=params, overlap_mode=overlap_mode, comments=comments, tags=tags)
 
     @ensure_deltalake_is_initialized
@@ -486,10 +469,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @ensure_deltalake_is_initialized
     def add_runtime_computed_features(self, exprs=list[PolarsExpression], owner: str = "missing_owner") -> None:
         """Add (and possibly increment the version) a serialized expression representing an adhoc runtime feature computation"""
-        if not self.enable_runtime_computed_features:
-            raise ValueError(
-                "Runtime-computed features are disabled. Set enable_runtime_computed_features=True only when feature metadata is trusted."
-            )
         self._native_lake().add_runtime_computed_features(exprs, owner)
 
     @ensure_deltalake_is_initialized
@@ -599,7 +578,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         def _read_lazy(lake: GammaFeatureLake, features: list | pl.DataFrame, targets: list | None) -> pl.LazyFrame:
             if isinstance(features, pl.DataFrame):
                 return lake.read(features, start=start, end=end, materialized=False)
-            return lake.read(features, targets or [], start=start, end=end, materialized=False)
+            return lake.read(features, targets, start=start, end=end, materialized=False)
 
         on = left.sort_keys
         left_lf = _read_lazy(left, left_features, left_targets)
