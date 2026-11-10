@@ -82,7 +82,7 @@ pub enum OverlapMode {
     Merge,
 }
 
-/// Options of [`Lake::add`]. The defaults match `GammaFeatureLake.add_features`.
+/// Options of [`Lake::add`].
 #[derive(Clone, Debug)]
 pub struct AddOptions {
     pub owner: String,
@@ -519,7 +519,7 @@ impl Planner<'_> {
 
 impl Lake {
     /// Creates the index, metadata and transaction log tables of a lake in `store` where they
-    /// are missing, as `GammaFeatureLake.initialize` does, and opens it.
+    /// are missing, and opens it.
     ///
     /// `index_schema` holds the sort keys; it must contain `options.primary_sort_key`.
     pub fn create_with_store(
@@ -618,8 +618,8 @@ impl Lake {
         Lake::open_locked(store, options)
     }
 
-    /// Adds dense features or targets, as `GammaFeatureLake.add_features` and `add_targets`
-    /// do. Non-key columns of `input` are the features; it must hold every sort key.
+    /// Adds dense features or targets. Non-key columns of `input` are the features; it must
+    /// hold every sort key.
     ///
     /// Rows with a null key are dropped and, of rows sharing keys, the first is kept. Keys
     /// new to the index are added to it, and every dense table whose coverage includes them
@@ -637,8 +637,8 @@ impl Lake {
     /// [`Error::Conflict`]. A write that adds no index rows does not commit to the index, so
     /// it can miss keys added by a concurrent writer without failing.
     ///
-    /// Each write that passes validation is a transaction in the transaction log, as in
-    /// `GammaFeatureLake`: `pending`, then `success`. A write that fails after committing a
+    /// Each write that passes validation is a transaction in the transaction log: `pending`,
+    /// then `success`. A write that fails after committing a
     /// table is logged `failed`, each table it committed to is restored to the version it
     /// read, newest commit first, and it is logged `rolled_back`; the write then fails as one
     /// that committed nothing does. Tables it created are left in place, unreferenced.
@@ -679,7 +679,7 @@ impl Lake {
         self.write(input, options)
     }
 
-    /// Adds keys to the index without features, as `GammaFeatureLake.add_index_rows` does.
+    /// Adds keys to the index without features.
     /// Non-key columns of `input` are ignored. Transactions are logged and rolled back as in
     /// [`Lake::add`], with the owner and signal type of [`AddOptions::default`].
     pub fn add_index_rows(&self, input: Vec<RecordBatch>) -> Result<()> {
@@ -722,7 +722,7 @@ impl Lake {
     }
 
     /// Table `name` and its rows that satisfy `dnf`, read through the handle later commits use.
-    async fn read_table(
+    pub(crate) async fn read_table(
         &self,
         name: &str,
         dnf: &Dnf,

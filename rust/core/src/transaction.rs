@@ -1,5 +1,5 @@
-//! The transaction log: an append-only table with a row for each state a write goes through,
-//! as `GammaFeatureLake` keeps it. A write that fails after committing is rolled back: its
+//! The transaction log: an append-only table with a row for each state a write goes through.
+//! A write that fails after committing is rolled back: its
 //! commits, marked with its transaction id, are undone on each table it committed to.
 
 use std::collections::HashMap;

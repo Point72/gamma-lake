@@ -31,7 +31,7 @@ use crate::write::SignalType;
 
 const INDEX: &str = "idx";
 
-/// Options for [`Lake::open_with_store`]. The defaults match `GammaFeatureLake`.
+/// Options for [`Lake::open_with_store`].
 #[derive(Clone)]
 pub struct LakeOptions {
     pub primary_sort_key: String,
@@ -122,7 +122,7 @@ struct TableInput {
 /// A feature to read, given as the feature metadata row that describes it.
 ///
 /// Features at one `table_addr` are read together, with the signal type and parameters of
-/// the first of them, as `GammaFeatureLake.read(feature_metadata_frame)` does.
+/// the first of them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectedFeature {
     pub name: String,
@@ -443,13 +443,11 @@ impl Lake {
     /// Each requested name resolves to its latest version; names without metadata are
     /// skipped. Every target must be registered as a `target` signal. Columns are the
     /// resolved names in request order followed by the sort keys. `dnf` may only reference
-    /// sort keys; it filters the index and every feature table before they are aligned, as
-    /// `GammaFeatureLake.read(start=, end=)` does. On row-aligned lakes that equals filtering
-    /// the aligned result.
+    /// sort keys; it filters the index and every feature table before they are aligned. On
+    /// row-aligned lakes that equals filtering the aligned result.
     ///
     /// `feature` and `target` tables are matched to the index by row position after sorting
-    /// each by the sort keys (nulls first), as `GammaFeatureLake.read` does; no join is
-    /// performed. Tables shorter than the index read as null at the end. Writers must keep
+    /// each by the sort keys (nulls first); no join is performed. Tables shorter than the index read as null at the end. Writers must keep
     /// these tables row-aligned with the index; with [`LakeOptions::validate`] the keys of
     /// each table are compared with the index while streaming and a mismatch fails the
     /// stream with [`Error::Integrity`].

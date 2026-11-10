@@ -7,7 +7,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, Int64Array, ListBuilder, RecordBatch, StringArray, StringBuilder,
     TimestampMicrosecondArray, UInt32Array,
 };
-use arrow::compute::{cast, take_record_batch};
+use arrow::compute::{cast, concat, concat_batches, take_record_batch, unary};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatchReader;
 use arrow::row::{RowConverter, SortField};
@@ -31,8 +31,7 @@ const TAGS: &str = "tags";
 /// A comment and tags for one version of a feature.
 ///
 /// They are stored as the `comment` and `tags` (a JSON list of strings) metadata of the
-/// feature's column in its table, as `GammaFeatureLake.annotate` stores them, so every
-/// version stored in that table shares them.
+/// feature's column in its table, so every version stored in that table shares them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Annotation {
     pub feature_name: String,
@@ -71,8 +70,31 @@ fn stored(row: &FeatureRow) -> Option<&str> {
     }
 }
 
+/// The latest row of each of `features`, without repeats, given the [`latest`] rows `best`.
+fn latest_rows<'a>(
+    rows: &'a [FeatureRow],
+    best: &HashMap<String, usize>,
+    features: &[&str],
+) -> Result<Vec<&'a FeatureRow>> {
+    let mut seen = HashSet::new();
+    let names: Vec<&str> = features
+        .iter()
+        .copied()
+        .filter(|n| seen.insert(*n))
+        .collect();
+    let missing: Vec<String> = names
+        .iter()
+        .filter(|n| !best.contains_key(**n))
+        .map(|n| n.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::MissingFeatures(missing));
+    }
+    Ok(names.iter().map(|n| &rows[best[*n]]).collect())
+}
+
 impl Lake {
-    /// Sets comments and tags of feature versions, as `GammaFeatureLake.annotate` does.
+    /// Sets comments and tags of feature versions.
     ///
     /// Annotations without a comment or tags are skipped. Every annotation is checked before
     /// the first one is stored; a later failure is an [`Error::Write`]. Each annotated table
@@ -88,10 +110,9 @@ impl Lake {
     pub(crate) async fn annotate_locked(
         &self,
         annotations: &[Annotation],
-        committed: Vec<String>,
+        mut committed: Vec<String>,
         commits: &Commits,
     ) -> Result<()> {
-        let phase = "annotating features".to_string();
         let annotations: Vec<&Annotation> = annotations
             .iter()
             .filter(|a| a.comment.is_some() || a.tags.is_some())
@@ -175,9 +196,10 @@ impl Lake {
             }
             Ok(tables.into_iter().zip(opened))
         };
-        let opened = plan
-            .await
-            .map_err(|e| after(phase.clone(), committed.clone(), e))?;
+        let opened = match plan.await {
+            Ok(opened) => opened,
+            Err(e) => return Err(after("annotating features".into(), committed, e)),
+        };
         let annotate = |((addr, columns), table): ((String, _), Box<dyn StoredTable>)| async move {
             let table = commits.tagged(table);
             let read = table.version();
@@ -185,7 +207,6 @@ impl Lake {
             let result = commits.count(&addr, read, result);
             (addr, result)
         };
-        let mut committed = committed;
         let mut failure = None;
         for (addr, result) in join_all(opened.map(annotate)).await {
             match result {
@@ -205,50 +226,68 @@ impl Lake {
     /// with columns `feature_name`, `table_addr`, `comment` and `tags`. Unannotated features
     /// have a null comment and no tags.
     pub fn annotations(&self, features: &[(&str, &str)]) -> Result<RecordBatch> {
-        block_on(self.annotations_of(features))?
+        block_on(async {
+            let pairs: Vec<_> = features.iter().copied().map(Some).collect();
+            let [comments, tags] = self.annotation_columns(&pairs).await?;
+            Ok(RecordBatch::try_new(
+                annotations_schema(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(features.iter().map(|f| f.0))),
+                    Arc::new(StringArray::from_iter_values(features.iter().map(|f| f.1))),
+                    comments,
+                    tags,
+                ],
+            )?)
+        })?
     }
 
-    async fn annotations_of(&self, features: &[(&str, &str)]) -> Result<RecordBatch> {
-        let mut schemas: HashMap<&str, SchemaRef> = HashMap::new();
-        for (_, addr) in features {
-            if !schemas.contains_key(addr) {
-                schemas.insert(addr, self.table(addr).await?.schema());
-            }
-        }
+    /// The `comment` and `tags` columns of `features`, one row each: the annotation of each
+    /// `(feature_name, table_addr)`, or a null comment and no tags for `None`.
+    async fn annotation_columns(&self, features: &[Option<(&str, &str)>]) -> Result<[ArrayRef; 2]> {
+        let mut seen = HashSet::new();
+        let addrs: Vec<&str> = features
+            .iter()
+            .flatten()
+            .map(|&(_, addr)| addr)
+            .filter(|addr| seen.insert(*addr))
+            .collect();
+        let opens: Vec<_> = addrs.iter().map(|addr| self.table(addr)).collect();
+        let tables: Vec<_> = futures::stream::iter(opens)
+            .buffered(16)
+            .try_collect()
+            .await?;
+        let schemas: HashMap<&str, SchemaRef> = addrs
+            .into_iter()
+            .zip(tables.iter().map(|t| t.schema()))
+            .collect();
         let mut comments = StringBuilder::new();
-        let mut tags = ListBuilder::new(StringBuilder::new())
-            .with_field(Arc::new(Field::new_list_field(DataType::Utf8, true)));
-        for (name, addr) in features {
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for &feature in features {
+            let Some((name, addr)) = feature else {
+                comments.append_null();
+                tags.append(true);
+                continue;
+            };
             let metadata = schemas[addr]
                 .field_with_name(name)
-                .map(|f| f.metadata().clone())
-                .unwrap_or_default();
-            comments.append_option(metadata.get(COMMENT));
-            match metadata.get(TAGS) {
-                None => {}
-                Some(json) => {
-                    let values: Vec<String> = serde_json::from_str(json).map_err(|e| {
-                        integrity(
-                            addr,
-                            format!("tags of column {name:?} are not a JSON list of strings: {e}"),
-                        )
-                    })?;
-                    for v in values {
-                        tags.values().append_value(v);
-                    }
+                .map(|f| f.metadata())
+                .ok();
+            let get = |key: &str| metadata.and_then(|m| m.get(key));
+            comments.append_option(get(COMMENT));
+            if let Some(json) = get(TAGS) {
+                let values: Vec<String> = serde_json::from_str(json).map_err(|e| {
+                    integrity(
+                        addr,
+                        format!("tags of column {name:?} are not a JSON list of strings: {e}"),
+                    )
+                })?;
+                for v in values {
+                    tags.values().append_value(v);
                 }
             }
             tags.append(true);
         }
-        Ok(RecordBatch::try_new(
-            annotations_schema(),
-            vec![
-                Arc::new(StringArray::from_iter_values(features.iter().map(|f| f.0))),
-                Arc::new(StringArray::from_iter_values(features.iter().map(|f| f.1))),
-                Arc::new(comments.finish()),
-                Arc::new(tags.finish()),
-            ],
-        )?)
+        Ok([Arc::new(comments.finish()), Arc::new(tags.finish())])
     }
 
     /// The latest feature metadata rows of `features`, in order, or of every feature when
@@ -264,70 +303,22 @@ impl Lake {
                 all.sort_unstable_by_key(|&i| rows[i].row);
                 all.into_iter().map(|i| &rows[i]).collect()
             } else {
-                let mut seen = HashSet::new();
-                let wanted: Vec<&str> = features
-                    .iter()
-                    .copied()
-                    .filter(|n| seen.insert(*n))
-                    .collect();
-                let missing: Vec<String> = wanted
-                    .iter()
-                    .filter(|n| !best.contains_key(**n))
-                    .map(|n| n.to_string())
-                    .collect();
-                if !missing.is_empty() {
-                    return Err(Error::MissingFeatures(missing));
-                }
-                wanted.iter().map(|n| &rows[best[*n]]).collect()
+                latest_rows(&rows, &best, features)?
             };
-            let pairs: Vec<(&str, &str)> = chosen
+            let pairs: Vec<_> = chosen
                 .iter()
-                .filter_map(|r| stored(r).map(|a| (r.name.as_str(), a)))
+                .map(|r| stored(r).map(|addr| (r.name.as_str(), addr)))
                 .collect();
-            let found = self.annotations_of(&pairs).await?;
-            // Rows of `found` per chosen row; runtime-computed rows take an empty annotation.
-            let empty = RecordBatch::try_new(
-                annotations_schema(),
-                vec![
-                    Arc::new(StringArray::from(vec![""])),
-                    Arc::new(StringArray::from(vec![""])),
-                    Arc::new(StringArray::from(vec![None::<&str>])),
-                    Arc::new({
-                        let mut b = ListBuilder::new(StringBuilder::new())
-                            .with_field(Arc::new(Field::new_list_field(DataType::Utf8, true)));
-                        b.append(true);
-                        b.finish()
-                    }),
-                ],
-            )?;
-            let both = arrow::compute::concat_batches(&annotations_schema(), [&found, &empty])?;
-            let mut next = 0u32;
-            let picks: Vec<u32> = chosen
-                .iter()
-                .map(|r| match stored(r) {
-                    Some(_) => {
-                        next += 1;
-                        next - 1
-                    }
-                    None => found.num_rows() as u32,
-                })
-                .collect();
-            let picks = take_record_batch(&both, &UInt32Array::from(picks))?;
+            let [comments, tags] = self.annotation_columns(&pairs).await?;
             let metadata = take_record_batch(
                 &fm,
                 &UInt32Array::from_iter_values(chosen.iter().map(|r| r.row as u32)),
             )?;
-            let mut fields: Vec<Field> = metadata
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect();
-            fields.push(Field::new(COMMENT, DataType::Utf8, true));
-            fields.push(tags_field());
+            let mut fields = metadata.schema().fields().to_vec();
+            fields.push(Arc::new(Field::new(COMMENT, DataType::Utf8, true)));
+            fields.push(Arc::new(tags_field()));
             let mut columns = metadata.columns().to_vec();
-            columns.push(picks.column(2).clone());
-            columns.push(picks.column(3).clone());
+            columns.extend([comments, tags]);
             Ok(RecordBatch::try_new(
                 Arc::new(Schema::new(fields)),
                 columns,
@@ -335,8 +326,7 @@ impl Lake {
         })?
     }
 
-    /// Restores the lake to how it was at `at`, in microseconds since the Unix epoch, as
-    /// `GammaFeatureLake.restore_to_timestamp` does.
+    /// Restores the lake to how it was at `at`, in microseconds since the Unix epoch.
     ///
     /// The index and the metadata tables are restored first, then every table the restored
     /// feature metadata refers to. A table with no commit after `at` is left as it is.
@@ -347,41 +337,38 @@ impl Lake {
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         block_on(async {
             let mut committed = vec![];
-            let restore = |addr: String, committed: Vec<String>| async move {
-                let phase = format!("restoring table {addr}");
-                let result = async { self.table(&addr).await?.restore(at).await }.await;
-                match result {
-                    Ok(true) => Ok((committed.into_iter().chain([addr]).collect(), ())),
-                    Ok(false) => Ok((committed, ())),
-                    Err(e) => Err(after(phase, committed, e)),
+            let restore = |addr: String, mut committed: Vec<String>| async move {
+                match async { self.table(&addr).await?.restore(at).await }.await {
+                    Ok(true) => committed.push(addr),
+                    Ok(false) => {}
+                    Err(e) => return Err(after(format!("restoring table {addr}"), committed, e)),
                 }
+                Ok(committed)
             };
             for addr in [
                 &self.options.index_path,
                 &self.options.table_metadata_path,
                 &self.options.feature_metadata_path,
             ] {
-                (committed, ()) = restore(addr.clone(), committed).await?;
+                committed = restore(addr.clone(), committed).await?;
             }
-            let fm = match self.read_batch(&self.options.feature_metadata_path).await {
-                Ok(fm) => fm,
-                Err(e) => return Err(after("reading feature metadata".into(), committed, e)),
+            let read = async {
+                feature_rows(&self.read_batch(&self.options.feature_metadata_path).await?)
             };
-            let rows = match feature_rows(&fm) {
+            let rows = match read.await {
                 Ok(rows) => rows,
                 Err(e) => return Err(after("reading feature metadata".into(), committed, e)),
             };
             let addrs: BTreeSet<&str> = rows.iter().filter_map(stored).collect();
             for addr in addrs {
-                (committed, ()) = restore(addr.to_string(), committed).await?;
+                committed = restore(addr.to_string(), committed).await?;
             }
             Ok(())
         })?
     }
 
-    /// Moves the latest versions of `features` into one new table, as
-    /// `GammaFeatureLake.consolidate_feature_groups` does, and returns its address, or
-    /// `None` when they already share a table.
+    /// Moves the latest versions of `features` into one new table and returns its address,
+    /// or `None` when they already share a table.
     ///
     /// Only `feature` and `target` signals can be consolidated. The new table holds the
     /// index rows up to the newest coverage of the tables merged, and each feature keeps
@@ -403,7 +390,7 @@ impl Lake {
         let read = self.read_selected(&plan.selected, &dnf)?;
         let schema = read.schema();
         let batches = read.collect::<std::result::Result<Vec<_>, _>>()?;
-        let read = arrow::compute::concat_batches(&schema, &batches)?;
+        let read = concat_batches(&schema, &batches)?;
         let addr = new_table_addr(&self.options.table_name_prefix);
         let columns = plan
             .schema
@@ -446,11 +433,7 @@ impl Lake {
                     .ok_or_else(|| integrity("feature_metadata", "missing column \"version\""))?,
                 &DataType::Int64,
             )?;
-            let versions: Int64Array = versions
-                .as_primitive::<Int64Type>()
-                .iter()
-                .map(|v| v.map(|v| v + 1))
-                .collect();
+            let versions: Int64Array = unary(versions.as_primitive::<Int64Type>(), |v| v + 1);
             let mut columns: HashMap<&str, ArrayRef> = HashMap::new();
             for field in fm_schema.fields() {
                 if let Some(values) = plan.base.column_by_name(field.name()) {
@@ -495,30 +478,21 @@ impl Lake {
     async fn consolidation(&self, features: &[&str]) -> Result<Option<Consolidation>> {
         // The metadata tables are committed to through the handles read here, so the commit
         // fails if another writer changed them in between.
-        let fm_table = self.table(&self.options.feature_metadata_path).await?;
-        let tm_table = self.table(&self.options.table_metadata_path).await?;
-        let fm = self.read_all(fm_table.as_ref()).await?;
-        let tm = self.read_all(tm_table.as_ref()).await?;
+        let all = Dnf::default();
+        let ((fm_table, fm), (tm_table, tm)) = futures::try_join!(
+            self.read_table(&self.options.feature_metadata_path, &all),
+            self.read_table(&self.options.table_metadata_path, &all),
+        )?;
         let rows = feature_rows(&fm)?;
-        let best = latest(&rows);
-        let mut seen = HashSet::new();
-        let names: Vec<&str> = features
+        let chosen = latest_rows(&rows, &latest(&rows), features)?;
+        let bad: Vec<(&str, &str)> = chosen
             .iter()
-            .copied()
-            .filter(|n| seen.insert(*n))
-            .collect();
-        let missing: Vec<String> = names
-            .iter()
-            .filter(|n| !best.contains_key(**n))
-            .map(|n| n.to_string())
-            .collect();
-        if !missing.is_empty() {
-            return Err(Error::MissingFeatures(missing));
-        }
-        let chosen: Vec<&FeatureRow> = names.iter().map(|n| &rows[best[*n]]).collect();
-        let bad: Vec<(String, String)> = chosen
-            .iter()
-            .map(|r| (r.name.clone(), r.signal_type.clone().unwrap_or_default()))
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.signal_type.as_deref().unwrap_or_default(),
+                )
+            })
             .filter(|(_, t)| !SignalType::parse(t).is_some_and(|t| t.dense()))
             .collect();
         if !bad.is_empty() {
@@ -552,7 +526,7 @@ impl Lake {
             );
         }
         let converter = RowConverter::new(vec![SortField::new(values[0].data_type().clone())])?;
-        let encoded = converter.convert_columns(&[arrow::compute::concat(
+        let encoded = converter.convert_columns(&[concat(
             &values.iter().map(|v| v.as_ref()).collect::<Vec<_>>(),
         )?])?;
         let newest = (0..encoded.num_rows())
@@ -560,7 +534,14 @@ impl Lake {
             .unwrap();
         let coverage = values[newest].clone();
 
-        let index = self.table(&self.options.index_path).await?.schema();
+        let opens: Vec<_> = addrs.iter().map(|addr| self.table(addr)).collect();
+        let (index, tables) = futures::try_join!(
+            self.table(&self.options.index_path),
+            futures::stream::iter(opens)
+                .buffered(16)
+                .try_collect::<Vec<_>>(),
+        )?;
+        let index = index.schema();
         let mut fields: Vec<Field> = self
             .sort_keys
             .iter()
@@ -571,10 +552,10 @@ impl Lake {
             })
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| integrity(&self.options.index_path, e.to_string()))?;
-        let mut schemas: HashMap<&str, SchemaRef> = HashMap::new();
-        for addr in &addrs {
-            schemas.insert(addr, self.table(addr).await?.schema());
-        }
+        let schemas: HashMap<&str, SchemaRef> = addrs
+            .into_iter()
+            .zip(tables.iter().map(|t| t.schema()))
+            .collect();
         for r in &chosen {
             let addr = r.table_addr.as_deref().unwrap();
             let field = schemas[addr]
