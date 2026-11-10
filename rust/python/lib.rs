@@ -5,17 +5,18 @@
 //! dependency on this module. The Polars-facing API lives in `gammalake/native.py`.
 
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 use gamma_lake::arrow::array::{make_array, new_empty_array, ArrayRef};
-use gamma_lake::arrow::datatypes::Schema;
-use gamma_lake::arrow::datatypes::{DataType, SchemaRef};
+use gamma_lake::arrow::datatypes::{DataType, Schema, SchemaRef};
 use gamma_lake::arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use gamma_lake::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use gamma_lake::arrow::record_batch::RecordBatch;
+use gamma_lake::arrow::record_batch::{RecordBatch, RecordBatchReader};
+use gamma_lake::datafusion::catalog::TableProvider;
 use gamma_lake::{
     AddOptions, Annotation, BatchStream, DeltaOptions, DeltaStore, Dnf, Error, Expression,
     FeatureTable as CoreFeatureTable, Lake as CoreLake, LakeOptions, LockError, LockGuard, Op,
@@ -23,13 +24,11 @@ use gamma_lake::{
 };
 use pyo3::exceptions::{PyImportError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyCapsule, PyCapsuleMethods, PyTuple};
+use pyo3::types::{PyCapsule, PyCapsuleMethods};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// `import_exception!` declares a Rust handle to an exception class defined in Python, looked up
-// lazily (the first time such an error is raised) from the package's public namespace.
 pyo3::import_exception!(gammalake, MissingFeaturesException);
 pyo3::import_exception!(gammalake, MissingOrMisregisteredSignalsException);
 pyo3::import_exception!(gammalake, UninitializedDeltaLakeException);
@@ -51,7 +50,6 @@ fn to_py(error: Error) -> PyErr {
         return raised;
     }
     let message = error.to_string();
-    // `match` consumes `error` (moved, not borrowed) so the arms can take ownership of fields.
     match error {
         Error::NotInitialized(_) => UninitializedDeltaLakeException::new_err(message),
         Error::MissingFeatures(_) => MissingFeaturesException::new_err(message),
@@ -66,19 +64,16 @@ fn to_py(error: Error) -> PyErr {
             phase,
             committed,
             source,
-        } => {
-            let raised = lock_exception(&source);
-            match raised {
-                // Nothing was written, so the lock's own exception is the whole story.
-                Some(raised) if committed.is_empty() => raised,
-                // Otherwise raise PartialWriteError, chaining any lock exception as `__cause__`.
-                _ => {
-                    let error = PartialWriteError::new_err((message, phase, committed));
-                    Python::attach(|py| error.set_cause(py, raised));
-                    error
-                }
+        } => match lock_exception(&source) {
+            // Nothing was written, so the lock's own exception is the whole story.
+            Some(raised) if committed.is_empty() => raised,
+            // Otherwise raise PartialWriteError, chaining any lock exception as `__cause__`.
+            raised => {
+                let error = PartialWriteError::new_err((message, phase, committed));
+                Python::attach(|py| error.set_cause(py, raised));
+                error
             }
-        }
+        },
         Error::InvalidPredicate(_) | Error::InvalidArgument(_) => PyValueError::new_err(message),
         _ => PyRuntimeError::new_err(message),
     }
@@ -116,7 +111,6 @@ struct ArrowStream {
 
 impl ArrowStream {
     fn new(stream: BatchStream) -> Self {
-        use gamma_lake::arrow::record_batch::RecordBatchReader;
         Self {
             schema: stream.schema(),
             stream: Mutex::new(Some(stream)),
@@ -172,9 +166,8 @@ fn import_dnf(predicate: Option<&Bound<'_, PyAny>>) -> PyResult<Dnf> {
     for conjunction in predicate.try_iter()? {
         let mut terms = vec![];
         for term in conjunction?.try_iter()? {
-            let term = term?;
             let (column, op, values): (String, String, Option<Bound<'_, PyAny>>) =
-                term.extract()?;
+                term?.extract()?;
             let op = op.parse::<Op>().map_err(to_py)?;
             let values = match values {
                 Some(values) => import_array(&values)?,
@@ -195,17 +188,12 @@ fn import_array(values: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
             values.get_type().name()?
         )));
     }
-    let pair = values.call_method0("__arrow_c_array__")?;
-    let pair = pair.cast::<PyTuple>()?;
-    if pair.len() != 2 {
-        return Err(PyTypeError::new_err(
-            "__arrow_c_array__ must return a (schema, array) capsule pair",
-        ));
-    }
-    let schema_capsule = pair.get_item(0)?;
-    let array_capsule = pair.get_item(1)?;
-    let schema_capsule = schema_capsule.cast::<PyCapsule>()?;
-    let array_capsule = array_capsule.cast::<PyCapsule>()?;
+    let (schema_capsule, array_capsule) = values
+        .call_method0("__arrow_c_array__")?
+        .extract::<(Bound<'_, PyCapsule>, Bound<'_, PyCapsule>)>()
+        .map_err(|_| {
+            PyTypeError::new_err("__arrow_c_array__ must return a (schema, array) capsule pair")
+        })?;
     let schema_ptr: NonNull<FFI_ArrowSchema> = schema_capsule
         .pointer_checked(Some(c"arrow_schema"))?
         .cast();
@@ -226,31 +214,29 @@ fn import_array(values: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
     }
 }
 
-/// Imports an object implementing `__arrow_c_stream__` and reads every batch.
-fn import_stream(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+/// Imports an object implementing `__arrow_c_stream__` as a reader of its batches.
+fn import_stream(data: &Bound<'_, PyAny>) -> PyResult<ArrowArrayStreamReader> {
     if !data.hasattr("__arrow_c_stream__")? {
         return Err(PyTypeError::new_err(format!(
             "input must implement __arrow_c_stream__ (e.g. polars.DataFrame), got {}",
             data.get_type().name()?
         )));
     }
-    let capsule = data.call_method0("__arrow_c_stream__")?;
-    let capsule = capsule.cast::<PyCapsule>()?;
+    let capsule = data
+        .call_method0("__arrow_c_stream__")?
+        .cast_into::<PyCapsule>()?;
     let ptr: NonNull<FFI_ArrowArrayStream> =
         capsule.pointer_checked(Some(c"arrow_array_stream"))?.cast();
     // SAFETY: the capsule name guarantees the pointee type. The stream is moved out and
     // replaced by a released one, so the capsule destructor only frees the allocation.
-    let reader = unsafe {
+    unsafe {
         if ptr.as_ref().release.is_none() {
             return Err(PyValueError::new_err(
                 "__arrow_c_stream__ returned a released stream",
             ));
         }
-        ArrowArrayStreamReader::from_raw(ptr.as_ptr()).map_err(|e| to_py(Error::Arrow(e)))?
-    };
-    reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| to_py(Error::Arrow(e)))
+        ArrowArrayStreamReader::from_raw(ptr.as_ptr()).map_err(|e| to_py(Error::Arrow(e)))
+    }
 }
 
 /// Imports an object implementing `__arrow_c_schema__`.
@@ -261,8 +247,9 @@ fn import_schema(schema: &Bound<'_, PyAny>) -> PyResult<SchemaRef> {
             schema.get_type().name()?
         )));
     }
-    let capsule = schema.call_method0("__arrow_c_schema__")?;
-    let capsule = capsule.cast::<PyCapsule>()?;
+    let capsule = schema
+        .call_method0("__arrow_c_schema__")?
+        .cast_into::<PyCapsule>()?;
     let ptr: NonNull<FFI_ArrowSchema> = capsule.pointer_checked(Some(c"arrow_schema"))?.cast();
     // SAFETY: the capsule name guarantees the pointee type.
     if unsafe { ptr.as_ref() }.release.is_none() {
@@ -272,45 +259,15 @@ fn import_schema(schema: &Bound<'_, PyAny>) -> PyResult<SchemaRef> {
     }
     // SAFETY: the schema is live (checked above) and only borrowed.
     let schema = unsafe { Schema::try_from(ptr.as_ref()) }.map_err(|e| to_py(Error::Arrow(e)))?;
-    Ok(std::sync::Arc::new(schema))
+    Ok(Arc::new(schema))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn lake_options(
-    primary_sort_key: Option<String>,
-    index_path: Option<String>,
-    feature_metadata_path: Option<String>,
-    table_metadata_path: Option<String>,
-    batch_size: Option<usize>,
-    validate: bool,
-    table_name_prefix: Option<String>,
-    compression: Option<String>,
-    target_file_size: Option<u64>,
-    storage_options: Option<HashMap<String, String>>,
-    lock: Option<Py<PyAny>>,
-    memory_limit: Option<usize>,
-    transaction_log_path: Option<String>,
-) -> (LakeOptions, DeltaOptions) {
-    let defaults = LakeOptions::default();
-    let delta = DeltaOptions::default();
-    let options = LakeOptions {
-        primary_sort_key: primary_sort_key.unwrap_or(defaults.primary_sort_key),
-        index_path: index_path.unwrap_or(defaults.index_path),
-        feature_metadata_path: feature_metadata_path.unwrap_or(defaults.feature_metadata_path),
-        table_metadata_path: table_metadata_path.unwrap_or(defaults.table_metadata_path),
-        batch_size: batch_size.unwrap_or(defaults.batch_size),
-        validate,
-        table_name_prefix: table_name_prefix.unwrap_or(defaults.table_name_prefix),
-        lock: lock.map(|factory| Arc::new(PyLock { factory }) as Arc<dyn TableLock>),
-        memory_limit,
-        transaction_log_path: transaction_log_path.unwrap_or(defaults.transaction_log_path),
-    };
-    let delta = DeltaOptions {
-        compression: compression.unwrap_or(delta.compression),
-        target_file_size: target_file_size.unwrap_or(delta.target_file_size),
-        storage_options: storage_options.unwrap_or_default(),
-    };
-    (options, delta)
+/// A `gammalake.DeltaOptions`, read from its attributes.
+#[derive(FromPyObject)]
+struct PyDeltaOptions {
+    compression: String,
+    target_file_size: u64,
+    storage_options: HashMap<String, String>,
 }
 
 /// A lock made by a Python callable that takes the table location and returns a context
@@ -337,12 +294,8 @@ impl TableLock for PyLock {
 impl LockGuard for PyGuard {
     fn release(self: Box<Self>) -> Result<(), LockError> {
         Python::attach(|py| {
-            let none = py.None();
-            self.context.call_method1(
-                py,
-                "__exit__",
-                (none.clone_ref(py), none.clone_ref(py), none),
-            )?;
+            self.context
+                .call_method1(py, "__exit__", (py.None(), py.None(), py.None()))?;
             Ok(())
         })
         .map_err(|e: PyErr| Box::new(e) as LockError)
@@ -384,10 +337,6 @@ fn batch_stream(batch: RecordBatch) -> ArrowStream {
     ArrowStream::new(BatchStream::from_batches(batch.schema(), vec![batch]))
 }
 
-fn names(items: Option<Vec<String>>) -> Vec<String> {
-    items.unwrap_or_default()
-}
-
 /// A gamma-lake opened by the native core. Every call reads the latest table versions.
 #[pyclass(frozen, module = "gammalake.gammalake")]
 struct Lake {
@@ -396,10 +345,13 @@ struct Lake {
 
 #[pymethods]
 impl Lake {
+    /// Opens the lake at `base_path`, first creating its index and metadata tables where
+    /// missing when `index_schema` is given.
     #[new]
     #[pyo3(signature = (
         base_path,
         *,
+        index_schema = None,
         primary_sort_key = None,
         index_path = None,
         feature_metadata_path = None,
@@ -407,9 +359,7 @@ impl Lake {
         batch_size = None,
         validate = false,
         table_name_prefix = None,
-        compression = None,
-        target_file_size = None,
-        storage_options = None,
+        delta_options = None,
         lock = None,
         memory_limit = None,
         transaction_log_path = None,
@@ -418,6 +368,7 @@ impl Lake {
     fn new(
         py: Python<'_>,
         base_path: String,
+        index_schema: Option<Bound<'_, PyAny>>,
         primary_sort_key: Option<String>,
         index_path: Option<String>,
         feature_metadata_path: Option<String>,
@@ -425,96 +376,37 @@ impl Lake {
         batch_size: Option<usize>,
         validate: bool,
         table_name_prefix: Option<String>,
-        compression: Option<String>,
-        target_file_size: Option<u64>,
-        storage_options: Option<HashMap<String, String>>,
+        delta_options: Option<PyDeltaOptions>,
         lock: Option<Py<PyAny>>,
         memory_limit: Option<usize>,
         transaction_log_path: Option<String>,
     ) -> PyResult<Self> {
-        let (options, delta) = lake_options(
-            primary_sort_key,
-            index_path,
-            feature_metadata_path,
-            table_metadata_path,
-            batch_size,
+        let index_schema = index_schema.as_ref().map(import_schema).transpose()?;
+        let defaults = LakeOptions::default();
+        let options = LakeOptions {
+            primary_sort_key: primary_sort_key.unwrap_or(defaults.primary_sort_key),
+            index_path: index_path.unwrap_or(defaults.index_path),
+            feature_metadata_path: feature_metadata_path.unwrap_or(defaults.feature_metadata_path),
+            table_metadata_path: table_metadata_path.unwrap_or(defaults.table_metadata_path),
+            batch_size: batch_size.unwrap_or(defaults.batch_size),
             validate,
-            table_name_prefix,
-            compression,
-            target_file_size,
-            storage_options,
-            lock,
+            table_name_prefix: table_name_prefix.unwrap_or(defaults.table_name_prefix),
+            lock: lock.map(|factory| Arc::new(PyLock { factory }) as Arc<dyn TableLock>),
             memory_limit,
-            transaction_log_path,
-        );
+            transaction_log_path: transaction_log_path.unwrap_or(defaults.transaction_log_path),
+        };
+        let delta = delta_options.map_or_else(DeltaOptions::default, |o| DeltaOptions {
+            compression: o.compression,
+            target_file_size: o.target_file_size,
+            storage_options: o.storage_options,
+        });
         let inner = py
             .detach(|| {
                 let store = DeltaStore::new(&base_path, delta)?;
-                gamma_lake::open(store, options)
-            })
-            .map_err(to_py)?;
-        Ok(Self { inner })
-    }
-
-    /// Creates the metadata and index tables of a lake, or opens it if they exist.
-    #[staticmethod]
-    #[pyo3(signature = (
-        base_path,
-        index_schema,
-        *,
-        primary_sort_key = None,
-        index_path = None,
-        feature_metadata_path = None,
-        table_metadata_path = None,
-        batch_size = None,
-        validate = false,
-        table_name_prefix = None,
-        compression = None,
-        target_file_size = None,
-        storage_options = None,
-        lock = None,
-        memory_limit = None,
-        transaction_log_path = None,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn create(
-        py: Python<'_>,
-        base_path: String,
-        index_schema: Bound<'_, PyAny>,
-        primary_sort_key: Option<String>,
-        index_path: Option<String>,
-        feature_metadata_path: Option<String>,
-        table_metadata_path: Option<String>,
-        batch_size: Option<usize>,
-        validate: bool,
-        table_name_prefix: Option<String>,
-        compression: Option<String>,
-        target_file_size: Option<u64>,
-        storage_options: Option<HashMap<String, String>>,
-        lock: Option<Py<PyAny>>,
-        memory_limit: Option<usize>,
-        transaction_log_path: Option<String>,
-    ) -> PyResult<Self> {
-        let schema = import_schema(&index_schema)?;
-        let (options, delta) = lake_options(
-            primary_sort_key,
-            index_path,
-            feature_metadata_path,
-            table_metadata_path,
-            batch_size,
-            validate,
-            table_name_prefix,
-            compression,
-            target_file_size,
-            storage_options,
-            lock,
-            memory_limit,
-            transaction_log_path,
-        );
-        let inner = py
-            .detach(|| {
-                let store = DeltaStore::new(&base_path, delta)?;
-                gamma_lake::create(store, schema, options)
+                match index_schema {
+                    Some(schema) => gamma_lake::create(store, schema, options),
+                    None => gamma_lake::open(store, options),
+                }
             })
             .map_err(to_py)?;
         Ok(Self { inner })
@@ -570,15 +462,15 @@ impl Lake {
             }
         };
         options.feature_params = feature_params;
-        let batches = import_stream(&data)?;
-        py.detach(|| self.inner.add(batches, &options))
+        let reader = import_stream(&data)?;
+        py.detach(|| self.inner.add(reader.collect::<Result<_, _>>()?, &options))
             .map_err(to_py)
     }
 
     /// Adds the sort keys of `data` to the index without features.
     fn add_index_rows(&self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = import_stream(&data)?;
-        py.detach(|| self.inner.add_index_rows(batches))
+        let reader = import_stream(&data)?;
+        py.detach(|| self.inner.add_index_rows(reader.collect::<Result<_, _>>()?))
             .map_err(to_py)
     }
 
@@ -613,7 +505,7 @@ impl Lake {
         features: Vec<String>,
         targets: Option<Vec<String>>,
     ) -> PyResult<FeatureTable> {
-        let targets = names(targets);
+        let targets = targets.unwrap_or_default();
         py.detach(|| {
             let features: Vec<&str> = features.iter().map(String::as_str).collect();
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
@@ -635,7 +527,7 @@ impl Lake {
         predicate: Option<Bound<'_, PyAny>>,
     ) -> PyResult<ArrowStream> {
         let dnf = import_dnf(predicate.as_ref())?;
-        let targets = names(targets);
+        let targets = targets.unwrap_or_default();
         py.detach(|| {
             let features: Vec<&str> = features.iter().map(String::as_str).collect();
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
@@ -653,7 +545,7 @@ impl Lake {
         features: Vec<String>,
         targets: Option<Vec<String>>,
     ) -> PyResult<ArrowSchema> {
-        let targets = names(targets);
+        let targets = targets.unwrap_or_default();
         py.detach(|| {
             let features: Vec<&str> = features.iter().map(String::as_str).collect();
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
@@ -861,7 +753,6 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Number of native streams not yet released, for leak tests.
 /// Features of a lake as a DataFusion table, for datafusion-python's
 /// `SessionContext.register_table`.
 #[pyclass(frozen, module = "gammalake.gammalake")]
@@ -873,7 +764,6 @@ struct FeatureTable {
 impl FeatureTable {
     #[getter]
     fn schema(&self) -> ArrowSchema {
-        use gamma_lake::datafusion::catalog::TableProvider;
         ArrowSchema {
             schema: self.inner.schema(),
         }
@@ -905,20 +795,18 @@ impl FeatureTable {
 
 /// The logical extension codec of a datafusion-python session.
 fn session_codec(session: &Bound<'_, PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
-    const NAME: &str = "datafusion_logical_extension_codec";
-    let capsule = session.call_method0("__datafusion_logical_extension_codec__")?;
-    let capsule = capsule.cast::<PyCapsule>()?;
-    let name = capsule.name()?;
+    const CODEC: &CStr = c"datafusion_logical_extension_codec";
+    let capsule = session
+        .call_method0("__datafusion_logical_extension_codec__")?
+        .cast_into::<PyCapsule>()?;
     // SAFETY: the name is read while the capsule is alive.
-    let name = name.map(|n| unsafe { n.as_cstr() }.to_string_lossy().into_owned());
-    if name.as_deref() != Some(NAME) {
+    let name = capsule.name()?.map(|n| unsafe { n.as_cstr() });
+    if name != Some(CODEC) {
         return Err(PyValueError::new_err(format!(
-            "expected a {NAME:?} capsule from the session, got {name:?}"
+            "expected a {CODEC:?} capsule from the session, got {name:?}"
         )));
     }
-    let data: NonNull<FFI_LogicalExtensionCodec> = capsule
-        .pointer_checked(Some(c"datafusion_logical_extension_codec"))?
-        .cast();
+    let data: NonNull<FFI_LogicalExtensionCodec> = capsule.pointer_checked(Some(CODEC))?.cast();
     // SAFETY: the capsule name guarantees the type, and the capsule outlives this borrow.
     let codec = unsafe { data.as_ref() };
     let (found, expected) = (unsafe { (codec.version)() }, datafusion_ffi::version());
@@ -931,6 +819,7 @@ fn session_codec(session: &Bound<'_, PyAny>) -> PyResult<FFI_LogicalExtensionCod
     Ok(codec.clone())
 }
 
+/// Number of native streams not yet released, for leak tests.
 #[pyfunction]
 fn _live_streams() -> usize {
     gamma_lake::live_streams()

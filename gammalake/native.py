@@ -377,7 +377,6 @@ class NativeLake:
         memory_limit: int | None = None,
         transaction_log_path: str = "transaction_log",
     ):
-        delta_options = delta_options or DeltaOptions()
         lake = _native.Lake(
             base_path,
             primary_sort_key=primary_sort_key,
@@ -387,9 +386,7 @@ class NativeLake:
             batch_size=batch_size,
             validate=validate,
             table_name_prefix=table_name_prefix,
-            compression=delta_options.compression,
-            target_file_size=delta_options.target_file_size,
-            storage_options=delta_options.storage_options or None,
+            delta_options=delta_options,
             lock=lock,
             memory_limit=memory_limit,
             transaction_log_path=transaction_log_path,
@@ -409,13 +406,7 @@ class NativeLake:
         """
         self = cls.__new__(cls)
         runtime_computed_features = options.pop("runtime_computed_features", False)
-        delta_options = options.pop("delta_options", None) or DeltaOptions()
-        options.update(
-            compression=delta_options.compression,
-            target_file_size=delta_options.target_file_size,
-            storage_options=delta_options.storage_options or None,
-        )
-        self._init(_native.Lake.create(base_path, index_schema, **options), runtime_computed_features)
+        self._init(_native.Lake(base_path, index_schema=index_schema, **options), runtime_computed_features)
         return self
 
     @property
