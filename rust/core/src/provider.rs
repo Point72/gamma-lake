@@ -5,9 +5,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::ArrayRef;
+use arrow::array::{new_empty_array, new_null_array, ArrayRef};
 use arrow::compute::SortOptions;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
@@ -57,13 +57,13 @@ const MAX_CONJUNCTIONS: usize = 64;
 /// again, so on an aligned lake the result is the same with or without pushdown. A write
 /// that fails with [`Error::Write`] can leave a table misaligned before the end of the
 /// index; then, as with [`Lake::read`], results depend on the filters, and validation only
-/// checks the rows a query reads. Batches come in sort-key
-/// order, ascending with nulls first, which DataFusion uses to skip sorts.
+/// checks the rows a query reads. Batches come in sort-key order, ascending with nulls first,
+/// which DataFusion uses to skip sorts.
 ///
 /// Queries run on the library's own runtime, so the table works inside any executor, but
-/// creating it blocks and must happen outside async code. The
-/// read decodes its inputs before the first batch, like [`Lake::read`]. Dropping a query's
-/// stream stops the read, though sorting or joining work already started finishes first.
+/// creating it blocks and must happen outside async code. The read decodes its inputs before
+/// the first batch, like [`Lake::read`]. Dropping a query's stream stops the read, though
+/// sorting or joining work already started finishes first.
 ///
 /// ```no_run
 /// use std::sync::Arc;
@@ -140,11 +140,9 @@ impl FeatureTable {
 
     /// The predicate `filter` pushes into the read, if it can be pushed.
     fn pushed(&self, filter: &Expr) -> Option<Vec<Vec<Term>>> {
-        let dnf = convert(filter, self.lake.sort_keys())?;
-        Dnf(dnf.clone())
-            .to_expr(&self.lake.index_schema, "index")
-            .ok()
-            .map(|_| dnf)
+        let dnf = Dnf(convert(filter, self.lake.sort_keys())?);
+        dnf.to_expr(&self.lake.index_schema, "index").ok()?;
+        Some(dnf.0)
     }
 }
 
@@ -184,14 +182,11 @@ impl TableProvider for FeatureTable {
             let Some(next) = self.pushed(filter) else {
                 continue;
             };
-            dnf = match dnf.take() {
+            dnf = match &dnf {
                 None => Some(next),
-                Some(prev) => match and(&prev, &next) {
+                Some(prev) => match and(prev, &next) {
                     Some(both) => Some(both),
-                    None => {
-                        dnf = Some(prev);
-                        continue;
-                    }
+                    None => continue,
                 },
             };
             pushed.push(filter.clone());
@@ -262,11 +257,11 @@ fn convert(filter: &Expr, keys: &[String]) -> Option<Vec<Vec<Term>>> {
                 term(column, op, value)
             }
         },
-        Expr::IsNull(expr) => term(key(expr)?, Op::IsNull, ScalarValue::Null.to_array().ok()?),
+        Expr::IsNull(expr) => term(key(expr)?, Op::IsNull, new_null_array(&DataType::Null, 1)),
         Expr::IsNotNull(expr) => term(
             key(expr)?,
             Op::IsNotNull,
-            ScalarValue::Null.to_array().ok()?,
+            new_null_array(&DataType::Null, 1),
         ),
         Expr::InList(InList {
             expr,
@@ -286,7 +281,7 @@ fn convert(filter: &Expr, keys: &[String]) -> Option<Vec<Vec<Term>>> {
                 })
                 .collect::<Option<Vec<_>>>()?;
             let values = if values.is_empty() {
-                ScalarValue::Null.to_array().ok()?.slice(0, 0)
+                new_empty_array(&DataType::Null)
             } else {
                 ScalarValue::iter_to_array(values).ok()?
             };
@@ -464,8 +459,7 @@ impl ExecutionPlan for FeatureTableExec {
         let (columns, out) = (self.columns.clone(), schema.clone());
         let (mut sender, receiver) = mpsc::channel(2);
         let task = runtime::handle().spawn(async move {
-            let stream = lake.read_selected_async(&features, &dnf, true).await;
-            let mut stream = match stream {
+            let mut stream = match lake.read_selected_async(&features, &dnf, true).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     let _ = sender.send(Err(e.into())).await;

@@ -23,10 +23,9 @@ use crate::error::{integrity, unsupported, Error, Result};
 use crate::predicate::{Dnf, Op, Term};
 
 /// Which table row `join_asof` picks for an index row.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Strategy {
     /// The last row at or before the key.
-    #[default]
     Backward,
     /// The first row at or after the key.
     Forward,
@@ -100,8 +99,8 @@ impl AsOfParams {
                     let units = match (n.as_i64(), n.as_u64()) {
                         (Some(i), _) => i as i128,
                         (None, Some(u)) => u as i128,
-                        // Saturates on overflow.
-                        _ => n.as_f64().unwrap_or(0.0).trunc() as i128,
+                        // Truncates, and saturates on overflow.
+                        _ => n.as_f64().unwrap_or(0.0) as i128,
                     };
                     params.tolerance = Some(Tolerance::Units(units))
                 }
@@ -334,13 +333,7 @@ fn rows(converter: &RowConverter, columns: &[ArrayRef], types: &[DataType]) -> R
     let columns = columns
         .iter()
         .zip(types)
-        .map(|(c, t)| {
-            if c.data_type() == t {
-                Ok(c.clone())
-            } else {
-                cast(c, t)
-            }
-        })
+        .map(|(c, t)| cast(c, t))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(converter.convert_columns(&columns)?)
 }
@@ -402,11 +395,7 @@ impl AsOfTable {
 
     /// For each index row, the table row it matches, or null.
     pub fn lookup(&self, by: &[ArrayRef], pk: &ArrayRef) -> Result<UInt32Array> {
-        let pk = if pk.data_type() == &self.pk_type {
-            pk.clone()
-        } else {
-            cast(pk, &self.pk_type)?
-        };
+        let pk = cast(pk, &self.pk_type)?;
         let values = keys(pk.as_ref())?;
         let by_rows = self
             .converter

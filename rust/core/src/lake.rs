@@ -21,9 +21,9 @@ use crate::error::{integrity, Error, Result};
 use crate::joined::{table_predicate, AsOfParams, AsOfTable, SparseTable};
 use crate::lock::{LockingStore, TableLock};
 use crate::predicate::{column, Dnf};
-use crate::runtime::block_on;
+use crate::runtime::{block_on, blocking};
 use crate::scan::{checked_scan, frame as scan_frame};
-use crate::sort::{blocking, sorted_streams, spilling_sorted_streams};
+use crate::sort::sorted_stream;
 use crate::store::{StoredTable, TableStore};
 use crate::stream::{AsyncBatchStream, BatchStream};
 use crate::transaction;
@@ -271,7 +271,7 @@ fn with_joined(
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
-/// The inputs of a read, sorted by [`sorted_streams`] and zipped by [`zip_aligned`].
+/// The inputs of a read, sorted by [`sorted_stream`] and zipped by [`zip_aligned`].
 struct ReadInputs {
     /// Resolved feature names in output order.
     names: Vec<String>,
@@ -572,13 +572,8 @@ impl Lake {
             let scans = 1 + plan.tables.iter().filter(|t| t.join.is_none()).count();
             (limit / scans).max(1)
         });
-        let sort = |frames: Vec<DataFrame>, keep_keys: bool| async move {
-            match budget {
-                None => sorted_streams(frames, keys, keep_keys).await,
-                Some(budget) => spilling_sorted_streams(frames, keys, keep_keys, budget).await,
-            }
-        };
-        let index = sort(vec![plan.index], true);
+        let sort = move |frame, keep_keys| sorted_stream(frame, keys, keep_keys, budget);
+        let index = sort(plan.index, true);
         let prepare = |mut input: TableInput| async move {
             if let Some(join) = input.join.take() {
                 let schema = input.frame.schema().inner().clone();
@@ -588,21 +583,18 @@ impl Lake {
                     blocking(move || JoinedTable::new(&join, &addr, &table, keys, pk)).await?;
                 return Ok::<_, Error>(Prepared::Joined(Box::new(table)));
             }
-            let keep_keys = input.keys > 0;
-            let mut streams = sort(vec![input.frame], keep_keys).await?;
             Ok(Prepared::Aligned(AlignInput {
+                stream: sort(input.frame, input.keys > 0).await?,
                 name: input.addr,
-                stream: streams.remove(0),
                 keys: input.keys,
             }))
         };
         // Sort one physical table at a time to bound Parquet buffers and intermediate data.
-        let mut index = index.await?;
-        let tables = futures::stream::iter(plan.tables.into_iter().map(prepare))
-            .buffered(1)
+        let index = index.await?;
+        let tables = futures::stream::iter(plan.tables)
+            .then(prepare)
             .try_collect::<Vec<_>>()
             .await?;
-        let index = index.remove(0);
         // The feature columns of joined tables are appended to the index, input 0. `moved`
         // maps each input of the layout to its new input and column offset.
         let (mut aligned, mut joined) = (vec![], vec![]);

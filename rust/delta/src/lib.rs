@@ -493,11 +493,7 @@ fn as_view_types(batch: RecordBatch) -> Result<RecordBatch> {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for (f, array) in schema.fields().iter().zip(batch.columns()) {
         let target = field(f);
-        columns.push(if target.data_type() == f.data_type() {
-            array.clone()
-        } else {
-            cast(array, target.data_type())?
-        });
+        columns.push(cast(array, target.data_type())?);
         fields.push(target);
     }
     let schema = Schema::new_with_metadata(fields, schema.metadata().clone());

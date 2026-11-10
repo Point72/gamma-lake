@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::sync::OnceLock;
 
+use datafusion::error::DataFusionError;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tokio::sync::Semaphore;
 
@@ -75,20 +76,31 @@ pub(crate) fn handle() -> Handle {
     runtime().handle().clone()
 }
 
-/// Fails when called from inside a tokio runtime, where blocking would panic.
-pub(crate) fn ensure_blocking_allowed() -> Result<()> {
+/// Runs `future` to completion on the shared runtime. Fails when called from inside a tokio
+/// runtime, where blocking would panic.
+pub(crate) fn block_on<F: Future>(future: F) -> Result<F::Output> {
     if Handle::try_current().is_ok() {
         return Err(Error::InvalidArgument(
             "the blocking gamma-lake API cannot be called from inside a tokio runtime".into(),
         ));
     }
-    Ok(())
+    Ok(runtime().block_on(future))
 }
 
-/// Runs `future` to completion on the shared runtime.
-pub(crate) fn block_on<F: Future>(future: F) -> Result<F::Output> {
-    ensure_blocking_allowed()?;
-    Ok(runtime().block_on(future))
+/// Runs the CPU-bound `f` on the blocking pool, holding one of the [`cpu_permits`].
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let permit = cpu_permits()
+        .acquire()
+        .await
+        .expect("the CPU permits are never closed");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| Error::DataFusion(DataFusionError::External(Box::new(e))))?
 }
 
 #[cfg(test)]

@@ -3,55 +3,34 @@
 use std::sync::Arc;
 
 use datafusion::dataframe::DataFrame;
-use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{execute_stream, ExecutionPlan, SendableRecordBatchStream};
+use datafusion::physical_plan::{execute_stream, SendableRecordBatchStream};
 use futures::StreamExt;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
-/// Executes each scan sequentially and returns it sorted by its first `keys` columns
-/// (ascending, nulls first). Key columns are dropped unless `keep_keys`.
-pub(crate) async fn sorted_streams(
-    frames: Vec<DataFrame>,
-    keys: usize,
-    keep_keys: bool,
-) -> Result<Vec<SendableRecordBatchStream>> {
-    sort_streams(frames, keys, keep_keys, None).await
-}
-
-/// As [`sorted_streams`], with each sort limited to `budget` bytes and spilling to disk.
-pub(crate) async fn spilling_sorted_streams(
-    frames: Vec<DataFrame>,
-    keys: usize,
-    keep_keys: bool,
-    budget: usize,
-) -> Result<Vec<SendableRecordBatchStream>> {
-    sort_streams(frames, keys, keep_keys, Some(budget)).await
-}
-
-async fn sort_streams(
-    frames: Vec<DataFrame>,
+/// `frame` sorted by its first `keys` columns (ascending, nulls first), without the key
+/// columns unless `keep_keys`. With a `budget`, the sort is limited to that many bytes and
+/// spills to disk.
+///
+/// DataFusion produces the first batch only after sorting the complete scan. It is polled
+/// before returning, so callers awaiting one sort at a time materialize one scan at a time.
+pub(crate) async fn sorted_stream(
+    frame: DataFrame,
     keys: usize,
     keep_keys: bool,
     budget: Option<usize>,
-) -> Result<Vec<SendableRecordBatchStream>> {
-    let mut streams = Vec::with_capacity(frames.len());
-    for frame in frames {
-        let mut stream = sort(frame, keys, keep_keys, budget).await?.1;
-        // DataFusion produces the first batch only after sorting the complete scan. Polling
-        // here ensures only one physical table scan is materialized at a time.
-        let first = stream.next().await.transpose()?;
-        let schema = stream.schema();
-        streams.push(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(first.map(Ok)).chain(stream),
-        )) as SendableRecordBatchStream);
-    }
-    Ok(streams)
+) -> Result<SendableRecordBatchStream> {
+    let mut stream = sort(frame, keys, keep_keys, budget).await?;
+    let first = stream.next().await.transpose()?;
+    let schema = stream.schema();
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(first.map(Ok)).chain(stream),
+    )))
 }
 
 async fn sort(
@@ -59,7 +38,7 @@ async fn sort(
     keys: usize,
     keep_keys: bool,
     budget: Option<usize>,
-) -> Result<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream)> {
+) -> Result<SendableRecordBatchStream> {
     let columns = frame.schema().columns();
     let mut frame = frame.sort(
         columns[..keys]
@@ -97,29 +76,11 @@ async fn sort(
             task.with_session_config(config).with_runtime(runtime)
         }
     };
-    let stream = execute_stream(plan.clone(), Arc::new(task))?;
-    Ok((plan, stream))
-}
-
-pub(crate) async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    let permit = crate::runtime::cpu_permits()
-        .acquire()
-        .await
-        .map_err(|e| Error::DataFusion(DataFusionError::External(Box::new(e))))?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        f()
-    })
-    .await
-    .map_err(|e| Error::DataFusion(DataFusionError::External(Box::new(e))))?
+    Ok(execute_stream(plan, Arc::new(task))?)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -154,10 +115,10 @@ mod tests {
     fn datafusion_sorts_and_projects() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let batches = runtime.block_on(async {
-            let mut streams = sorted_streams(vec![frame(vec![3, 1, 2])], 1, false)
+            let stream = sorted_stream(frame(vec![3, 1, 2]), 1, false, None)
                 .await
                 .unwrap();
-            streams.remove(0).try_collect::<Vec<_>>().await.unwrap()
+            stream.try_collect::<Vec<_>>().await.unwrap()
         });
         let values = batches
             .iter()
@@ -178,11 +139,9 @@ mod tests {
     fn spilling_sort_stays_ordered() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let batches = runtime.block_on(async {
-            let mut streams =
-                spilling_sorted_streams(vec![frame((0..10_000).rev().collect())], 1, true, 1 << 20)
-                    .await
-                    .unwrap();
-            streams.remove(0).try_collect::<Vec<_>>().await.unwrap()
+            let frame = frame((0..10_000).rev().collect());
+            let stream = sorted_stream(frame, 1, true, Some(1 << 20)).await.unwrap();
+            stream.try_collect::<Vec<_>>().await.unwrap()
         });
         let values = batches
             .iter()

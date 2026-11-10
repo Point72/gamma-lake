@@ -9,6 +9,7 @@ use arrow::compute::{
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::{Column, ScalarValue, TableReference};
+use datafusion::logical_expr::utils::{conjunction, disjunction};
 use datafusion::prelude::{lit, Expr};
 
 use crate::error::{Error, Result};
@@ -79,23 +80,15 @@ impl Dnf {
     /// Builds the filter expression against `schema`, qualifying columns with `relation`.
     #[doc(hidden)]
     pub fn to_expr(&self, schema: &Schema, relation: &str) -> Result<Option<Expr>> {
-        let mut disjunction: Option<Expr> = None;
-        for conjunction in &self.0 {
-            let mut all: Option<Expr> = None;
-            for term in conjunction {
-                let expr = term_expr(term, schema, relation)?;
-                all = Some(match all {
-                    Some(prev) => prev.and(expr),
-                    None => expr,
-                });
-            }
-            let all = all.unwrap_or_else(|| lit(true));
-            disjunction = Some(match disjunction {
-                Some(prev) => prev.or(all),
-                None => all,
-            });
-        }
-        Ok(disjunction)
+        let all = self
+            .0
+            .iter()
+            .map(|terms| {
+                let terms = terms.iter().map(|t| term_expr(t, schema, relation));
+                Ok(conjunction(terms.collect::<Result<Vec<_>>>()?).unwrap_or_else(|| lit(true)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(disjunction(all))
     }
 
     /// Applies this predicate to an Arrow batch.
@@ -131,47 +124,37 @@ fn term_mask(batch: &RecordBatch, term: &Term) -> Result<BooleanArray> {
     let values = batch
         .column_by_name(&term.column)
         .ok_or_else(|| Error::InvalidPredicate(format!("unknown column {:?}", term.column)))?;
+    // Empty sets need no literal type, as in `term_expr`.
     match term.op {
         Op::IsNull => return Ok(is_null(values.as_ref())?),
         Op::IsNotNull => return Ok(is_not_null(values.as_ref())?),
+        Op::In if term.values.is_empty() => {
+            return Ok(BooleanArray::from(vec![false; batch.num_rows()]))
+        }
+        Op::NotIn if term.values.is_empty() => return Ok(is_not_null(values.as_ref())?),
         _ => {}
     }
-    let literals = lossless_cast(&term.values, values.data_type()).map_err(|why| {
-        Error::InvalidPredicate(format!(
-            "literal of type {} cannot be compared with column {:?} of type {}: {why}",
-            term.values.data_type(),
-            term.column,
-            values.data_type()
-        ))
-    })?;
-    let compare = |op: Op, index: usize| {
+    let literals = cast_literal(&term.values, values.data_type(), &term.column)?;
+    let compare = |index: usize| {
         let literal = Scalar::new(literals.slice(index, 1));
-        Ok::<_, arrow::error::ArrowError>(match op {
-            Op::Eq | Op::In => eq(values, &literal)?,
-            Op::NotEq | Op::NotIn => neq(values, &literal)?,
-            Op::Lt => lt(values, &literal)?,
-            Op::LtEq => lt_eq(values, &literal)?,
-            Op::Gt => gt(values, &literal)?,
-            Op::GtEq => gt_eq(values, &literal)?,
+        match term.op {
+            Op::Eq | Op::In => eq(values, &literal),
+            Op::NotEq | Op::NotIn => neq(values, &literal),
+            Op::Lt => lt(values, &literal),
+            Op::LtEq => lt_eq(values, &literal),
+            Op::Gt => gt(values, &literal),
+            Op::GtEq => gt_eq(values, &literal),
             Op::IsNull | Op::IsNotNull => unreachable!(),
-        })
+        }
     };
     match term.op {
-        Op::In if literals.is_empty() => Ok(BooleanArray::from(vec![false; batch.num_rows()])),
-        Op::NotIn if literals.is_empty() => Ok(is_not_null(values.as_ref())?),
         Op::In => {
-            let mut mask = compare(Op::In, 0)?;
-            for index in 1..literals.len() {
-                mask = or_kleene(&mask, &compare(Op::In, index)?)?;
-            }
-            Ok(mask)
+            Ok((1..literals.len())
+                .try_fold(compare(0)?, |mask, i| or_kleene(&mask, &compare(i)?))?)
         }
         Op::NotIn => {
-            let mut mask = compare(Op::NotIn, 0)?;
-            for index in 1..literals.len() {
-                mask = and_kleene(&mask, &compare(Op::NotIn, index)?)?;
-            }
-            Ok(mask)
+            Ok((1..literals.len())
+                .try_fold(compare(0)?, |mask, i| and_kleene(&mask, &compare(i)?))?)
         }
         op => {
             if literals.len() != 1 {
@@ -181,7 +164,7 @@ fn term_mask(batch: &RecordBatch, term: &Term) -> Result<BooleanArray> {
                     literals.len()
                 )));
             }
-            Ok(compare(op, 0)?)
+            Ok(compare(0)?)
         }
     }
 }
@@ -195,13 +178,10 @@ fn term_expr(term: &Term, schema: &Schema, relation: &str) -> Result<Expr> {
         .field_with_name(&term.column)
         .map_err(|_| Error::InvalidPredicate(format!("unknown column {:?}", term.column)))?;
     let col = column(relation, &term.column);
+    // Empty sets need no literal type, so any (even Null-typed) empty array is accepted.
     match term.op {
         Op::IsNull => return Ok(col.is_null()),
         Op::IsNotNull => return Ok(col.is_not_null()),
-        _ => {}
-    }
-    // Empty sets need no literal type, so any (even Null-typed) empty array is accepted.
-    match term.op {
         Op::In if term.values.is_empty() => return Ok(lit(false)),
         Op::NotIn if term.values.is_empty() => return Ok(col.is_not_null()),
         _ => {}
@@ -242,7 +222,7 @@ fn term_expr(term: &Term, schema: &Schema, relation: &str) -> Result<Expr> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum Family {
+enum Family {
     Numeric,
     String,
     Binary,
@@ -257,7 +237,7 @@ pub(crate) enum Family {
     Other(DataType),
 }
 
-pub(crate) fn family(data_type: &DataType) -> Family {
+fn family(data_type: &DataType) -> Family {
     use DataType::*;
     match data_type {
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float16 | Float32

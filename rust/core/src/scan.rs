@@ -9,7 +9,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
@@ -104,16 +104,6 @@ impl TableProvider for ScanProvider {
         TableType::Base
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
-    }
-
     async fn scan(
         &self,
         _state: &dyn Session,
@@ -121,14 +111,14 @@ impl TableProvider for ScanProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let schema = self.table.schema();
         let columns = projection.map(|positions| {
             positions
                 .iter()
-                .map(|&i| self.table.schema().field(i).name().clone())
+                .map(|&i| schema.field(i).name().clone())
                 .collect::<Vec<_>>()
         });
-        let schema =
-            projected(self.table.schema(), columns.as_deref()).map_err(DataFusionError::from)?;
+        let schema = projected(schema, columns.as_deref()).map_err(DataFusionError::from)?;
         let partition = Arc::new(BackendPartition {
             schema: schema.clone(),
             table: self.table.clone(),
