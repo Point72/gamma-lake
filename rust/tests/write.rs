@@ -1,33 +1,32 @@
 //! Native writes: every scenario ends by checking the alignment invariant of every dense
 //! table, historical ones included, and reading the written values back with validation.
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use common::{
+    add, collect, create_delta, delta_store, frame, index_schema, keys, open_delta, tick,
+};
 use futures::TryStreamExt;
 use gamma_lake::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
+    Array, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array, StringArray, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use gamma_lake::arrow::compute::{cast, concat_batches, take};
 use gamma_lake::arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, SchemaRef};
 use gamma_lake::arrow::record_batch::RecordBatch;
 use gamma_lake::store::{CreateOptions, TableScan};
 use gamma_lake::{
-    AddOptions, Annotation, BatchStream, DeltaOptions, DeltaStore, Dnf, Error, Expression, Lake,
-    LakeOptions, MemoryStore, OverlapMode, SignalType, StoredTable, TableStore,
+    AddOptions, Annotation, DeltaStore, Dnf, Error, Expression, Lake, LakeOptions, MemoryStore,
+    OverlapMode, SignalType, StoredTable, TableStore,
 };
 use tempfile::TempDir;
 
 type Key = (i64, String);
-
-fn index_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Int64, true),
-        Field::new("sym", DataType::Utf8, true),
-    ]))
-}
 
 fn options() -> LakeOptions {
     LakeOptions {
@@ -39,66 +38,8 @@ fn options() -> LakeOptions {
 
 fn create() -> (TempDir, Lake) {
     let dir = TempDir::new().unwrap();
-    let lake = create_delta(
-        dir.path().to_str().unwrap(),
-        index_schema(),
-        options(),
-        Default::default(),
-    )
-    .unwrap();
+    let lake = create_delta(dir.path().to_str().unwrap(), index_schema(), options()).unwrap();
     (dir, lake)
-}
-
-fn open_delta(base: &str, options: LakeOptions, delta: DeltaOptions) -> gamma_lake::Result<Lake> {
-    gamma_lake::open(DeltaStore::new(base, delta)?, options)
-}
-
-fn create_delta(
-    base: &str,
-    schema: SchemaRef,
-    options: LakeOptions,
-    delta: DeltaOptions,
-) -> gamma_lake::Result<Lake> {
-    gamma_lake::create(DeltaStore::new(base, delta)?, schema, options)
-}
-
-/// A frame with the keys `rows` and, per feature, the value `ts * scale + offset`.
-fn frame(rows: &[(i64, &str)], features: &[(&str, f64)]) -> RecordBatch {
-    let mut fields = vec![
-        Field::new("ts", DataType::Int64, true),
-        Field::new("sym", DataType::Utf8, true),
-    ];
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
-        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
-    ];
-    for (name, scale) in features {
-        fields.push(Field::new(*name, DataType::Float64, true));
-        columns.push(Arc::new(Float64Array::from_iter_values(
-            rows.iter().map(|r| r.0 as f64 * scale),
-        )));
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-}
-
-fn keys(ts: impl IntoIterator<Item = i64>, syms: &[&'static str]) -> Vec<(i64, &'static str)> {
-    ts.into_iter()
-        .flat_map(|t| syms.iter().map(move |s| (t, *s)))
-        .collect()
-}
-
-fn add(lake: &Lake, batch: RecordBatch, mode: OverlapMode) {
-    let options = AddOptions {
-        overlap_mode: mode,
-        ..Default::default()
-    };
-    lake.add(vec![batch], &options).unwrap();
-}
-
-fn collect(stream: BatchStream) -> RecordBatch {
-    let schema = gamma_lake::arrow::record_batch::RecordBatchReader::schema(&stream);
-    let batches = stream.collect::<Result<Vec<_>, _>>().unwrap();
-    concat_batches(&schema, &batches).unwrap()
 }
 
 /// `feature` per key, read with validation.
@@ -110,20 +51,11 @@ fn read(lake: &Lake, feature: &str) -> BTreeMap<Key, Option<f64>> {
 }
 
 fn values(batch: &RecordBatch, feature: &str) -> BTreeMap<Key, Option<f64>> {
-    let ts = batch
-        .column_by_name("ts")
+    let values = batch
+        .column_by_name(feature)
         .unwrap()
-        .as_primitive::<Int64Type>();
-    let sym = cast(batch.column_by_name("sym").unwrap(), &DataType::Utf8).unwrap();
-    let sym = sym.as_string::<i32>();
-    let values = batch.column_by_name(feature).unwrap();
-    let values = values.as_primitive::<Float64Type>();
-    (0..batch.num_rows())
-        .map(|i| {
-            let key = (ts.value(i), sym.value(i).to_string());
-            (key, values.is_valid(i).then(|| values.value(i)))
-        })
-        .collect()
+        .as_primitive::<Float64Type>();
+    key_list(batch).into_iter().zip(values).collect()
 }
 
 fn expect(
@@ -136,7 +68,7 @@ fn expect(
 }
 
 fn delta(dir: &Path) -> DeltaStore {
-    DeltaStore::new(dir.to_str().unwrap(), DeltaOptions::default()).unwrap()
+    delta_store(dir.to_str().unwrap()).unwrap()
 }
 
 fn scan(dir: &Path, name: &str, columns: &[&str]) -> RecordBatch {
@@ -188,11 +120,11 @@ fn check_invariant(dir: &Path) {
 /// Every dense table holds exactly the index keys up to its coverage, each once.
 fn check_store_invariant(store: &dyn TableStore) {
     let fm = scan_store(store, "feature_metadata", &["table_addr", "signal_type"]);
-    let joined: BTreeSet<Option<String>> = strings(&fm, "table_addr")
+    let joined: BTreeSet<String> = strings(&fm, "table_addr")
         .into_iter()
         .zip(strings(&fm, "signal_type"))
         .filter(|(_, t)| !matches!(t.as_deref(), Some("feature" | "target")))
-        .map(|(a, _)| a)
+        .map(|(a, _)| a.unwrap())
         .collect();
     let index = key_list(&scan_store(store, "index", &["ts", "sym"]));
     let unique: BTreeSet<Key> = index.iter().cloned().collect();
@@ -225,7 +157,7 @@ fn check_store_invariant(store: &dyn TableStore) {
     }
     assert!(!coverage.is_empty());
     for (addr, (_, l)) in coverage {
-        if joined.contains(&Some(addr.clone())) {
+        if joined.contains(&addr) {
             continue;
         }
         let mut table = key_list(&scan_store(store, &addr, &["ts", "sym"]));
@@ -289,7 +221,6 @@ fn memory_limit_reads_batches_that_fit_its_share() {
             memory_limit: Some(256 << 10),
             ..options()
         },
-        Default::default(),
     )
     .unwrap();
     assert_eq!(read(&bounded, "f2"), read(&lake, "f2"));
@@ -298,34 +229,26 @@ fn memory_limit_reads_batches_that_fit_its_share() {
 #[test]
 fn create_is_idempotent_and_matches_the_python_schemas() {
     let (dir, _) = create();
-    let again = create_delta(
-        dir.path().to_str().unwrap(),
-        index_schema(),
-        options(),
-        Default::default(),
-    )
-    .unwrap();
+    let again = create_delta(dir.path().to_str().unwrap(), index_schema(), options()).unwrap();
     assert_eq!(again.sort_keys(), ["ts", "sym"]);
-    let fm = scan(dir.path(), "feature_metadata", &["feature_name"]);
-    assert_eq!(fm.num_rows(), 0);
+    let names = |batch: &RecordBatch| {
+        let schema = batch.schema();
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    };
     let tm = collect(again.table_metadata(&Dnf::default()).unwrap());
-    let names: Vec<_> = tm
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
-    assert_eq!(names, ["table_addr", "last_updated", "update_timestamp"]);
+    assert_eq!(
+        names(&tm),
+        ["table_addr", "last_updated", "update_timestamp"]
+    );
     assert_eq!(tm.schema().field(1).data_type(), &DataType::Int64);
     let fm = collect(again.feature_metadata(&Dnf::default()).unwrap());
-    let names: Vec<_> = fm
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    assert_eq!(fm.num_rows(), 0);
     assert_eq!(
-        names,
+        names(&fm),
         [
             "feature_name",
             "version",
@@ -339,7 +262,6 @@ fn create_is_idempotent_and_matches_the_python_schemas() {
         dir.path().join("other").to_str().unwrap(),
         index_schema(),
         LakeOptions::default(),
-        Default::default(),
     )
     .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
@@ -407,7 +329,7 @@ fn all_new_keys_inside_coverage_are_appended_and_padded() {
         frame(&keys(1..=3, &["a"]), &[("g", 2.0)]),
         OverlapMode::Copy,
     );
-    // New secondary key at the coverage boundary (pk == L), the fourth Python divergence.
+    // New keys inside the coverage of f, the last at its end (pk == L).
     add(
         &lake,
         frame(&[(2, "b"), (3, "b")], &[("f", 1.0)]),
@@ -642,48 +564,18 @@ fn unsupported_input_writes_nothing() {
     );
     let before = commits(dir.path());
     // Unsigned columns are stored as the signed type of the same width, so u64::MAX does not fit.
-    let mut batch = frame(&keys(3..=3, &["a"]), &[]);
-    let schema = Schema::new(vec![
-        batch.schema().field(0).clone(),
-        batch.schema().field(1).clone(),
-        Field::new("u", DataType::UInt64, true),
-    ]);
-    let mut columns = batch.columns().to_vec();
-    columns.push(Arc::new(gamma_lake::arrow::array::UInt64Array::from(vec![
-        u64::MAX,
-    ])));
-    batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
-    let err = lake.add(vec![batch], &AddOptions::default()).unwrap_err();
-    assert!(matches!(err, Error::UnsupportedInput(_)), "{err}");
-    // A string written into f's float column.
-    let strings = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Int64, true),
-            Field::new("sym", DataType::Utf8, true),
-            Field::new("f", DataType::Utf8, true),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(vec![3])),
-            Arc::new(StringArray::from(vec!["a"])),
-            Arc::new(StringArray::from(vec!["x"])),
-        ],
-    )
-    .unwrap();
-    let err = lake.add(vec![strings], &AddOptions::default()).unwrap_err();
-    assert!(matches!(err, Error::UnsupportedInput(_)), "{err}");
+    let row = keys(3..=3, &["a"]);
+    for batch in [
+        with_feature(&row, "u", Arc::new(UInt64Array::from(vec![u64::MAX]))),
+        // A string written into f's float column.
+        with_feature(&row, "f", Arc::new(StringArray::from(vec!["x"]))),
+    ] {
+        let err = lake.add(vec![batch], &AddOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedInput(_)), "{err}");
+    }
     assert_eq!(commits(dir.path()), before);
 
-    let batch = frame(&keys(3..=3, &["a"]), &[]);
-    let schema = Schema::new(vec![
-        batch.schema().field(0).clone(),
-        batch.schema().field(1).clone(),
-        Field::new("u", DataType::UInt16, true),
-    ]);
-    let mut columns = batch.columns().to_vec();
-    columns.push(Arc::new(gamma_lake::arrow::array::UInt16Array::from(vec![
-        255,
-    ])));
-    let batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
+    let batch = with_feature(&row, "u", Arc::new(UInt16Array::from(vec![255])));
     lake.add(vec![batch], &AddOptions::default()).unwrap();
     let u = collect(lake.read(&["u"], &[], &Dnf::default()).unwrap());
     assert_eq!(
@@ -728,6 +620,7 @@ fn targets_and_metadata_options_are_recorded() {
     assert!(owners.contains(&Some("missing_owner".into())));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_commit_is_rolled_back() {
     use std::os::unix::fs::PermissionsExt;
@@ -792,19 +685,27 @@ fn scenario(lake: &Lake) -> (RecordBatch, Vec<(String, i64, String)>) {
 
 #[test]
 fn memory_and_delta_stores_hold_the_same_lake() {
-    let (dir, delta) = create();
-    let memory = MemoryStore::new();
-    let in_memory =
-        Lake::create_with_store(Arc::new(memory.clone()), index_schema(), options()).unwrap();
-    assert!(in_memory.location().starts_with("memory://"));
-    let (delta_batch, delta_metadata) = scenario(&delta);
-    let (memory_batch, memory_metadata) = scenario(&in_memory);
-    check_invariant(dir.path());
-    check_store_invariant(&memory);
-    assert_eq!(delta_batch.schema(), memory_batch.schema());
-    assert_eq!(delta_batch, memory_batch);
-    assert_eq!(delta_metadata, memory_metadata);
-    assert!(delta_batch.num_rows() > 10);
+    let stores = lakes();
+    assert!(stores[1].1.location().starts_with("memory://"));
+    let held: Vec<_> = stores
+        .iter()
+        .map(|(_, lake, store)| {
+            let held = scenario(lake);
+            check_store_invariant(store.as_ref());
+            held
+        })
+        .collect();
+    assert_eq!(held[0], held[1]);
+    assert!(held[0].0.num_rows() > 10);
+    let joined: Vec<_> = lakes()
+        .iter()
+        .map(|(_, lake, store)| {
+            joined_scenario(lake);
+            check_store_invariant(store.as_ref());
+            collect(lake.read(&["f", "x", "s"], &[], &Dnf::default()).unwrap())
+        })
+        .collect();
+    assert_eq!(joined[0], joined[1]);
 }
 
 /// A [`MemoryStore`] whose scans return rows in reverse order.
@@ -1026,12 +927,11 @@ fn as_of_and_sparse_features_are_written_and_joined_to_the_index() {
     );
 
     // A filtered read matches the filtered full read: x at 7 still comes from 6.
-    let ts_term = |op, t: i64| gamma_lake::Term {
+    let dnf = Dnf(vec![vec![gamma_lake::Term {
         column: "ts".into(),
-        op,
-        values: Arc::new(Int64Array::from(vec![t])),
-    };
-    let dnf = Dnf(vec![vec![ts_term(gamma_lake::Op::Eq, 7)]]);
+        op: gamma_lake::Op::Eq,
+        values: Arc::new(Int64Array::from(vec![7])),
+    }]]);
     let batch = collect(lake.read(&["x", "s"], &[], &dnf).unwrap());
     assert_eq!(
         values(&batch, "x"),
@@ -1108,19 +1008,6 @@ fn reads_pin_versions_and_selected_rows() {
         &Dnf::default(),
     ));
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
-}
-
-#[test]
-fn memory_and_delta_stores_join_the_same_way() {
-    let (_dir, delta) = create();
-    let memory = MemoryStore::new();
-    let in_memory =
-        Lake::create_with_store(Arc::new(memory.clone()), index_schema(), options()).unwrap();
-    joined_scenario(&delta);
-    joined_scenario(&in_memory);
-    check_store_invariant(&memory);
-    let read = |lake: &Lake| collect(lake.read(&["f", "x", "s"], &[], &Dnf::default()).unwrap());
-    assert_eq!(read(&delta), read(&in_memory));
 }
 
 #[test]
@@ -1253,7 +1140,7 @@ fn annotations_belong_to_feature_versions() {
             n(Some("g"), &["x", "y"])
         ]
     );
-    // Every feature, in feature metadata order.
+    // An empty selection describes every feature.
     let all = lake.describe(&[]).unwrap();
     assert_eq!(strings(&all, "feature_name").len(), 3);
     check_invariant(dir.path());
@@ -1314,19 +1201,9 @@ fn bad_annotations_store_nothing() {
     assert_eq!(described(&lake, &["f"]), [n(None, &[])]);
 }
 
-fn micros_now() -> i64 {
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64;
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    now
-}
-
 #[test]
 fn restore_undoes_later_writes_and_leaves_untouched_tables() {
-    for (dir, lake, store) in lakes() {
+    for (_dir, lake, store) in lakes() {
         add(
             &lake,
             frame(&keys(1..=3, &["a"]), &[("f", 1.0)]),
@@ -1339,7 +1216,7 @@ fn restore_undoes_later_writes_and_leaves_untouched_tables() {
         );
         lake.annotate(&[note("f", None, Some("before"), None)])
             .unwrap();
-        let cutoff = micros_now();
+        let cutoff = tick();
         let metadata = feature_metadata(&lake);
         // A bad merge into f's table, an annotation, a new index row and a new feature;
         // g's table is padded.
@@ -1378,7 +1255,6 @@ fn restore_undoes_later_writes_and_leaves_untouched_tables() {
             OverlapMode::Copy,
         );
         check_store_invariant(store.as_ref());
-        drop(dir);
     }
 }
 
@@ -1397,7 +1273,7 @@ fn lakes() -> Vec<(Option<TempDir>, Lake, Arc<dyn TableStore>)> {
 
 #[test]
 fn consolidation_moves_features_into_one_table_and_keeps_reads() {
-    for (dir, lake, store) in lakes() {
+    for (_dir, lake, store) in lakes() {
         let (before, _) = scenario(&lake);
         add_joined(
             &lake,
@@ -1449,7 +1325,6 @@ fn consolidation_moves_features_into_one_table_and_keeps_reads() {
         check_store_invariant(store.as_ref());
         assert_eq!(read(&lake, "g")[&key(2, "a")], Some(2.0));
         assert_eq!(read(&lake, "f")[&key(8, "a")], None);
-        drop(dir);
     }
 }
 
@@ -1512,12 +1387,12 @@ fn runtime_computed_features_are_registered_and_not_read() {
     }
 }
 
-fn memory_lake(schema: Arc<Schema>, primary_sort_key: &str) -> Lake {
+fn memory_lake(primary_sort_key: &str) -> Lake {
     let options = LakeOptions {
         primary_sort_key: primary_sort_key.into(),
         ..options()
     };
-    Lake::create_with_store(Arc::new(MemoryStore::new()), schema, options).unwrap()
+    Lake::create_with_store(Arc::new(MemoryStore::new()), index_schema(), options).unwrap()
 }
 
 /// A frame with the keys `rows` and one feature column.
@@ -1597,7 +1472,7 @@ fn copy_mode_promotes_numbers_as_polars_does() {
         (Utf8, Int64, None),
     ];
     for (stored, incoming, want) in cases {
-        let lake = memory_lake(index_schema(), "ts");
+        let lake = memory_lake("ts");
         // 2^24 + 1 is the smallest integer a Float32 cannot hold.
         let first_values: ArrayRef = Arc::new(Int64Array::from(vec![16_777_217, 2]));
         let first = cast(&first_values, &stored).unwrap();
@@ -1639,27 +1514,15 @@ fn copy_mode_promotes_numbers_as_polars_does() {
 
 #[test]
 fn floating_point_sort_keys_are_rejected() {
-    for key in ["ts", "x"] {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Int64, true),
-            Field::new("x", DataType::Float64, true),
-        ]));
+    let ts = Field::new("ts", DataType::Int64, true);
+    let x = Field::new("x", DataType::Float64, true);
+    // A floating point primary sort key, then a floating point secondary one.
+    for (fields, primary_sort_key) in [([ts.clone(), x.clone()], "x"), ([x, ts], "ts")] {
         let options = LakeOptions {
-            primary_sort_key: key.into(),
+            primary_sort_key: primary_sort_key.into(),
             ..options()
         };
-        let schema = if key == "ts" {
-            schema
-        } else {
-            Arc::new(Schema::new(vec![
-                schema.field(1).clone(),
-                schema.field(0).clone(),
-            ]))
-        };
-        let options = LakeOptions {
-            primary_sort_key: if key == "ts" { "x".into() } else { "ts".into() },
-            ..options
-        };
+        let schema = Arc::new(Schema::new(fields.to_vec()));
         let err = error(Lake::create_with_store(
             Arc::new(MemoryStore::new()),
             schema,
@@ -1671,7 +1534,7 @@ fn floating_point_sort_keys_are_rejected() {
 
 #[test]
 fn as_of_parameters_are_checked_before_writing() {
-    let lake = memory_lake(index_schema(), "ts");
+    let lake = memory_lake("ts");
     let batch = || frame(&keys(1..=2, &["a"]), &[("a", 1.0)]);
     for (params, invalid) in [
         (r#"{"tolerance": "1h"}"#, true),
@@ -1699,7 +1562,7 @@ fn as_of_parameters_are_checked_before_writing() {
     );
 
     // A string primary key cannot be matched as of, whatever the parameters.
-    let lake = memory_lake(index_schema(), "sym");
+    let lake = memory_lake("sym");
     let err = error(lake.add(
         vec![batch()],
         &AddOptions {
