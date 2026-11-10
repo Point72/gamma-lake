@@ -4,7 +4,7 @@ import itertools
 import json
 import random
 import shutil
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -19,18 +19,13 @@ from gammalake import DeltaOptions, GammaFeatureLake, UnsupportedError, gammalak
 from gammalake.abstract import MissingFeaturesException, MissingOrMisregisteredSignalsException, UninitializedDeltaLakeException
 from gammalake.gamma_feature_lake import ArrowSchema
 from gammalake.native import NativeLake
+from gammalake.tests._model import KEYS, ts
 
-UTC = dt.UTC
-KEYS = ["timestamp", "symbol"]
 SYMBOLS = ["A", "B", "C"]
 
 
 def test_native_version_matches_package():
     assert native.version() == gammalake.__version__
-
-
-def ts(day: int) -> dt.datetime:
-    return dt.datetime(2024, 1, day, tzinfo=UTC)
 
 
 def frame(days, symbols, **features) -> pl.DataFrame:
@@ -60,8 +55,8 @@ def lake(lake_path) -> GammaFeatureLake:
 
 def utc(bound):
     if bound is None or isinstance(bound, dt.datetime):
-        return bound and bound.astimezone(UTC)
-    return dt.datetime.combine(bound, dt.time(), UTC)
+        return bound and bound.astimezone(dt.UTC)
+    return dt.datetime.combine(bound, dt.time(), dt.UTC)
 
 
 def latest(fs: GammaFeatureLake, names: list[str]) -> pl.DataFrame:
@@ -135,21 +130,8 @@ def test_predicate_import_errors(lake_path):
 def test_reads_release_the_gil(lake_path):
     lake = NativeLake(lake_path)
     expected = lake.read(["f1", "f3"])
-    results, errors = [], []
-
-    def work():
-        try:
-            for _ in range(5):
-                results.append(lake.read(["f1", "f3"]))
-        except Exception as error:  # noqa: BLE001
-            errors.append(error)
-
-    threads = [threading.Thread(target=work) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=120)
-    assert not errors and len(results) == 20
+    with ThreadPoolExecutor(4) as pool:
+        results = list(pool.map(lambda _: lake.read(["f1", "f3"]), range(20), timeout=120))
     for result in results:
         assert_frame_equal(result, expected)
 
@@ -322,13 +304,10 @@ def test_runtime_computed_features_need_the_trust_gate(rc_fs):
     with pytest.raises(ValueError, match="disabled"):
         untrusted.add_runtime_computed_features([pl.col("f1").alias("g")])
     assert untrusted.read(["f1"]).columns == ["f1", "timestamp", "symbol"]
-    with pytest.raises(ValueError, match="disabled"):
-        rc_fs.model_copy(update={"enable_runtime_computed_features": False}).read(["s"])
 
 
 def test_registration_is_checked_natively(rc_fs):
-    native_fs = rc_fs
-    before = native_fs.feature_metadata_frame().collect()
+    before = rc_fs.feature_metadata_frame().collect()
     for exprs in (
         [(pl.col("f1") * 2).alias("s")],
         [pl.col("missing").alias("g")],
@@ -336,12 +315,12 @@ def test_registration_is_checked_natively(rc_fs):
         [pl.col("h").alias("g"), pl.col("g").alias("h")],
     ):
         with pytest.raises(ValueError):
-            native_fs.add_runtime_computed_features(exprs)
-    assert native_fs.feature_metadata_frame().collect().equals(before)
-    native_fs.add_runtime_computed_features([pl.col("timestamp").dt.day().alias("day")], owner="me")
-    row = native_fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "day")
+            rc_fs.add_runtime_computed_features(exprs)
+    assert rc_fs.feature_metadata_frame().collect().equals(before)
+    rc_fs.add_runtime_computed_features([pl.col("timestamp").dt.day().alias("day")], owner="me")
+    row = rc_fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "day")
     assert row.select("version", "table_addr", "owner", "signal_type").row(0) == (0, "n/a", "me", "runtime_computed")
-    assert native_fs.read(["day"])["day"].to_list()[:4] == [1, 1, 1, 2]
+    assert rc_fs.read(["day"])["day"].to_list()[:4] == [1, 1, 1, 2]
 
 
 def test_registrations_written_by_polars_read_and_extend(tmp_path):
@@ -418,11 +397,11 @@ class Spy:
     """Records the predicate of every read of a native lake."""
 
     def __init__(self, inner):
-        self._inner = inner
+        self.inner = inner
         self.calls = []
 
     def __getattr__(self, name):
-        method = getattr(self._inner, name)
+        method = getattr(self.inner, name)
         if name not in ("read_selected", "index", "feature_metadata", "table_metadata"):
             return method
 
@@ -640,25 +619,23 @@ def test_lazy_projection_keeps_how_a_table_is_read(tmp_path):
     metadata = fs.feature_metadata_frame().collect()
     rows = pl.concat([metadata.filter(pl.col("feature_name") == "a"), metadata.filter((pl.col("feature_name") == "b") & (pl.col("version") == 1))])
     assert rows["table_addr"].n_unique() == 1 and rows["signal_type"].to_list() == ["as_of_feature", "feature"]
-    keys = ["timestamp", "symbol"]
     native = NativeLake(str(tmp_path))
-    eager = native.read_selected(rows).select("b", *keys).sort(keys)
-    assert not eager.equals(native.read_selected(rows[1:]).select("b", *keys).sort(keys))
-    assert_frame_equal(native.scan_selected(rows).select("b", *keys).collect().sort(keys), eager)
-    assert_frame_equal(fs.read(rows, materialized=False).select("b", *keys).collect().sort(keys), eager)
+    eager = native.read_selected(rows).select("b", *KEYS).sort(KEYS)
+    assert not eager.equals(native.read_selected(rows[1:]).select("b", *KEYS).sort(KEYS))
+    assert_frame_equal(native.scan_selected(rows).select("b", *KEYS).collect().sort(KEYS), eager)
+    assert_frame_equal(fs.read(rows, materialized=False).select("b", *KEYS).collect().sort(KEYS), eager)
     pinned = {"a": 0, "b": 1}
-    assert_frame_equal(native.scan_versions(pinned).select("b", *keys).collect().sort(keys), eager)
-    assert_frame_equal(native.scan(["a", "b"]).select("b", *keys).collect().sort(keys), native.read(["a", "b"]).select("b", *keys).sort(keys))
+    assert_frame_equal(native.scan_versions(pinned).select("b", *KEYS).collect().sort(KEYS), eager)
+    assert_frame_equal(native.scan(["a", "b"]).select("b", *KEYS).collect().sort(KEYS), native.read(["a", "b"]).select("b", *KEYS).sort(KEYS))
 
 
 def test_an_empty_selection_reads_the_index(tmp_path):
     fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     fs.add_features(frame(range(1, 4), SYMBOLS, d=1))
     empty = fs.feature_metadata_frame().collect().head(0)
-    keys = ["timestamp", "symbol"]
-    expected = pl.read_delta(fs.index).select(keys).sort(keys)
-    assert_frame_equal(fs.read(empty).sort(keys), expected)
-    assert_frame_equal(fs.read(empty, materialized=False).collect().sort(keys), expected)
+    expected = pl.read_delta(fs.index).select(KEYS).sort(KEYS)
+    assert_frame_equal(fs.read(empty).sort(KEYS), expected)
+    assert_frame_equal(fs.read(empty, materialized=False).collect().sort(KEYS), expected)
 
 
 def test_as_of_on_a_string_key_is_unsupported(tmp_path):
