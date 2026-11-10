@@ -24,5 +24,5 @@ datafusion-ffi = "=55.2.0"
 [profile.release]
 lto = "thin"
 # Drops the symbol table (about 45 MB); exported symbols stay. Panic backtraces lose function
-# names. Fat LTO with one codegen unit gives 107 MB instead of 172 MB but builds for 16 minutes.
+# names.
 strip = "symbols"

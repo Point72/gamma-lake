@@ -36,6 +36,8 @@ lint-py:  ## run python linter with ruff
 
 lint-rs:  ## run rust linter
 	make -C rust lint
+	cargo clippy --all-features
+	cargo fmt -- --check
 
 lint-docs:  ## lint docs with mdformat and codespell
 	python -m mdformat --check README.md $(wildcard docs/src) docs/wiki/
@@ -52,6 +54,7 @@ fix-py:  ## fix python formatting with ruff
 
 fix-rs:  ## fix rust formatting
 	make -C rust fix
+	cargo fmt
 
 fix-docs:  ## autoformat docs with mdformat and codespell
 	python -m mdformat README.md $(wildcard docs/src) docs/wiki/
@@ -88,24 +91,30 @@ test-rs: fixtures  ## run rust tests
 
 tests-rs: test-rs
 
-coverage-rs:  ## run rust tests and collect test coverage
+coverage-rs: fixtures  ## run rust tests and collect test coverage
 	make -C rust coverage
 
+# The pure-Python engine of COMPAT_REF, extracted into OLD_SRC. CI checkouts are shallow, without tags.
 COMPAT_REF ?= v0.2.0
+OLD_SRC := $(CURDIR)/build/old-engine
+define extract-old-engine
+	git rev-parse -q --verify "$(COMPAT_REF)^{commit}" >/dev/null || git fetch --no-tags origin tag $(COMPAT_REF)
+	rm -rf $(OLD_SRC) && mkdir -p $(OLD_SRC)
+	git archive $(COMPAT_REF) gammalake | tar -x -C $(OLD_SRC)
+endef
+
 .PHONY: test-compat
 test-compat:  ## compare reads and written files with the pure-Python engine of COMPAT_REF (default v0.2.0)
-	rm -rf build/compat && mkdir -p build/compat
-	git archive $(COMPAT_REF) gammalake | tar -x -C build/compat
-	GAMMA_LAKE_OLD_SRC=$(CURDIR)/build/compat python -m pytest -v gammalake/tests/test_compat.py
+	$(extract-old-engine)
+	GAMMA_LAKE_OLD_SRC=$(OLD_SRC) python -m pytest -v gammalake/tests/test_compat.py
 
 FIXTURES := rust/tests/fixtures/queries.json
 .PHONY: fixtures
 fixtures: $(FIXTURES)  ## generate the Rust parity fixtures with the pure-Python engine of COMPAT_REF
 
 $(FIXTURES): rust/tests/fixtures/make_fixtures.py
-	rm -rf build/fixtures && mkdir -p build/fixtures
-	git archive $(COMPAT_REF) gammalake | tar -x -C build/fixtures
-	PYTHONPATH=$(CURDIR)/build/fixtures python rust/tests/fixtures/make_fixtures.py
+	$(extract-old-engine)
+	PYTHONPATH=$(OLD_SRC) python rust/tests/fixtures/make_fixtures.py
 
 .PHONY: test coverage tests
 test: test-py test-rs  ## run all tests
