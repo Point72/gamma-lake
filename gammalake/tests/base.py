@@ -14,12 +14,12 @@ from decimal import Decimal
 
 import numpy as np
 import polars as pl
-import polars_io_tools as piot
 import pyarrow as pa
 import pytest
 from ccflow import ArrowSchema
 from packaging import version
 from polars.testing import assert_frame_equal
+from polars_io_tools import scan_delta
 
 from gammalake import (
     GammaFeatureLake,
@@ -74,11 +74,6 @@ def generate_test_data(
     null_symbol = df.sample(fraction=0.20, with_replacement=True).with_columns(symbol=pl.lit(None))
     null_timestamp = df.sample(fraction=0.20, with_replacement=True).with_columns(timestamp=pl.lit(None))
     return pl.concat([df, duplicates, null_symbol, null_timestamp], how="vertical")
-
-
-def scan_delta(path: str) -> pl.LazyFrame:
-    """The latest version of the Delta table at ``path``, read without the lake."""
-    return piot.scan_delta(path)
 
 
 def clean(df: pl.DataFrame, sort_keys: list) -> pl.DataFrame:

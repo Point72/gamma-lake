@@ -3,13 +3,13 @@
 import json
 import os
 
-import polars as pl
 import pyarrow as pa
 import pytest
 from polars.testing import assert_frame_equal
 
 from gammalake import DeltaOptions, GammaFeatureLake
 from gammalake.native import NativeLake
+from gammalake.tests._model import frame, keys
 
 moto_server = pytest.importorskip("moto.server")
 moto_auth = pytest.importorskip("moto.core.authorization")
@@ -18,6 +18,7 @@ boto3 = pytest.importorskip("boto3")
 BUCKET = "lake-bucket"
 SCHEMA = pa.schema([("timestamp", pa.timestamp("us", "UTC")), ("symbol", pa.string())])
 POLICY = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+ROWS = frame(keys(range(1, 4), "a"), f=1)
 
 
 @pytest.fixture(scope="module")
@@ -51,31 +52,19 @@ def s3(server, tmp_path, monkeypatch):
     return server
 
 
-def options(endpoint, key_id=None, secret=None, **extra):
-    keys = {} if key_id is None else {"AWS_ACCESS_KEY_ID": key_id, "AWS_SECRET_ACCESS_KEY": secret}
-    return {"AWS_ENDPOINT_URL": endpoint, "AWS_ALLOW_HTTP": "true", "AWS_REGION": "us-east-1", **keys, **extra}
-
-
-def frame():
-    return pl.DataFrame(
-        {
-            "timestamp": [dt for dt in pl.datetime_range(pl.datetime(2024, 1, 1), pl.datetime(2024, 1, 3), "1d", eager=True)],
-            "symbol": ["a", "a", "a"],
-            "f": [1.0, 2.0, 3.0],
-        }
-    ).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
+def options(endpoint, key_id=None, secret=None, **extra) -> DeltaOptions:
+    credentials = {} if key_id is None else {"AWS_ACCESS_KEY_ID": key_id, "AWS_SECRET_ACCESS_KEY": secret}
+    return DeltaOptions(storage_options={"AWS_ENDPOINT_URL": endpoint, "AWS_ALLOW_HTTP": "true", "AWS_REGION": "us-east-1", **credentials, **extra})
 
 
 def test_a_lake_on_s3_is_created_written_and_reopened(s3):
-    endpoint, key_id, secret = s3
-    storage_options = options(endpoint, key_id, secret)
-    base_path = f"s3://{BUCKET}/lakes/one"
-    delta_options = DeltaOptions(storage_options=storage_options)
+    _, _, secret = s3
+    base_path, delta_options = f"s3://{BUCKET}/lakes/one", options(*s3)
     uninitialized = GammaFeatureLake(base_path=base_path, delta_options=delta_options)
     assert not uninitialized._is_initialized
 
     lake = uninitialized.initialize()
-    lake.add_features(frame(), owner="me")
+    lake.add_features(ROWS, owner="me")
     expected = lake.read(["f"])
 
     reopened = GammaFeatureLake(base_path=base_path, delta_options=delta_options)
@@ -88,13 +77,13 @@ def test_a_lake_on_s3_is_created_written_and_reopened(s3):
 def test_credentials_come_from_the_environment_when_options_omit_them(s3, tmp_path, monkeypatch):
     endpoint, key_id, secret = s3
     # With a custom endpoint, the AWS credential chain runs only when forced.
-    storage_options = options(endpoint, AWS_FORCE_CREDENTIAL_LOAD="true")
+    delta_options = options(endpoint, AWS_FORCE_CREDENTIAL_LOAD="true")
     with pytest.raises(RuntimeError, match="credential"):
-        NativeLake.create(f"s3://{BUCKET}/lakes/profile", SCHEMA, delta_options=DeltaOptions(storage_options=storage_options))
+        NativeLake.create(f"s3://{BUCKET}/lakes/profile", SCHEMA, delta_options=delta_options)
     (tmp_path / "credentials").write_text(f"[lake]\naws_access_key_id = {key_id}\naws_secret_access_key = {secret}\n")
     monkeypatch.setenv("AWS_PROFILE", "lake")
-    lake = NativeLake.create(f"s3://{BUCKET}/lakes/profile", SCHEMA, delta_options=DeltaOptions(storage_options=storage_options))
-    lake.add_features(frame())
+    lake = NativeLake.create(f"s3://{BUCKET}/lakes/profile", SCHEMA, delta_options=delta_options)
+    lake.add_features(ROWS)
     assert lake.read(["f"])["f"].to_list() == [1.0, 2.0, 3.0]
 
 
@@ -106,19 +95,16 @@ def test_a_wrong_key_is_refused_without_revealing_it(s3):
         NativeLake.create(
             f"s3://{BUCKET}/lakes/bogus",
             SCHEMA,
-            delta_options=DeltaOptions(storage_options=options(endpoint, key_id, bogus)),
+            delta_options=options(endpoint, key_id, bogus),
         )
     assert bogus not in str(error.value)
 
 
 def test_writers_holding_stale_handles_keep_each_others_commits(s3):
-    endpoint, key_id, secret = s3
-    storage_options = options(endpoint, key_id, secret)
-    base_path = f"s3://{BUCKET}/lakes/shared"
-    delta_options = DeltaOptions(storage_options=storage_options)
+    base_path, delta_options = f"s3://{BUCKET}/lakes/shared", options(*s3)
     first = NativeLake.create(base_path, SCHEMA, delta_options=delta_options)
     second = NativeLake(base_path, delta_options=delta_options)
-    first.add_features(frame())
-    second.add_features(frame().rename({"f": "g"}))
+    first.add_features(ROWS)
+    second.add_features(ROWS.rename({"f": "g"}))
     result = NativeLake(base_path, delta_options=delta_options).read(["f", "g"])
     assert result["f"].to_list() == result["g"].to_list() == [1.0, 2.0, 3.0]
