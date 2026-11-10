@@ -6,9 +6,9 @@ use std::sync::Arc;
 use datafusion::datasource::MemTable;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
-use gamma_lake_core::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+use gamma_lake_core::arrow::array::{ArrayRef, AsArray, Float64Array, Int64Array, StringArray};
 use gamma_lake_core::arrow::compute::concat_batches;
-use gamma_lake_core::arrow::datatypes::{DataType, Field, Schema};
+use gamma_lake_core::arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use gamma_lake_core::arrow::record_batch::RecordBatch;
 use gamma_lake_core::{
     AddOptions, BatchStream, Dnf, Error, FeatureTable, Lake, LakeOptions, MemoryStore, OverlapMode,
@@ -17,22 +17,6 @@ use gamma_lake_core::{
 use tokio::runtime::Runtime;
 
 const FEATURES: [&str; 5] = ["f", "g", "h", "x", "s"];
-
-fn index_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Int64, true),
-        Field::new("sym", DataType::Utf8, true),
-    ]))
-}
-
-fn options(validate: bool) -> LakeOptions {
-    LakeOptions {
-        primary_sort_key: "ts".into(),
-        validate,
-        batch_size: 3,
-        ..Default::default()
-    }
-}
 
 fn frame(rows: &[(i64, &str)], features: &[(&str, f64)]) -> RecordBatch {
     let mut fields = vec![
@@ -70,12 +54,18 @@ fn add(lake: &Lake, batch: RecordBatch, signal_type: SignalType, params: Option<
 /// Dense `f` and `g` in one table over ts 1..=6, dense `h` over 1..=4 (shorter than the
 /// index), backward as-of `x` and sparse `s`.
 fn lake(validate: bool) -> Lake {
-    let lake = Lake::create_with_store(
-        Arc::new(MemoryStore::new()),
-        index_schema(),
-        options(validate),
-    )
-    .unwrap();
+    let index = Schema::new(vec![
+        Field::new("ts", DataType::Int64, true),
+        Field::new("sym", DataType::Utf8, true),
+    ]);
+    let options = LakeOptions {
+        primary_sort_key: "ts".into(),
+        validate,
+        batch_size: 3,
+        ..Default::default()
+    };
+    let lake =
+        Lake::create_with_store(Arc::new(MemoryStore::new()), Arc::new(index), options).unwrap();
     let dense = SignalType::Feature;
     add(
         &lake,
@@ -124,11 +114,10 @@ fn runtime() -> Runtime {
         .unwrap()
 }
 
-async fn sql(ctx: &SessionContext, query: &str) -> Result<RecordBatch, String> {
-    let df = ctx.sql(query).await.map_err(|e| e.to_string())?;
+async fn sql(ctx: &SessionContext, query: &str) -> RecordBatch {
+    let df = ctx.sql(query).await.unwrap();
     let schema = df.schema().inner().clone();
-    let batches = df.collect().await.map_err(|e| e.to_string())?;
-    Ok(concat_batches(&schema, &batches).unwrap())
+    concat_batches(&schema, &df.collect().await.unwrap()).unwrap()
 }
 
 async fn plan(ctx: &SessionContext, query: &str) -> String {
@@ -148,8 +137,8 @@ fn select_star_equals_the_read() {
     let lake = lake(true);
     let ctx = session(&lake, &FEATURES);
     runtime().block_on(async {
-        let ours = sql(&ctx, "SELECT * FROM t").await.unwrap();
-        let read = sql(&ctx, "SELECT * FROM m").await.unwrap();
+        let ours = sql(&ctx, "SELECT * FROM t").await;
+        let read = sql(&ctx, "SELECT * FROM m").await;
         assert_eq!(ours.num_rows(), 12);
         assert_eq!(ours, read);
     });
@@ -182,8 +171,8 @@ fn pushed_filters_give_the_rows_of_the_unfiltered_read() {
             {
                 let query =
                     |table| format!("SELECT * FROM {table} WHERE {filter} ORDER BY ts, sym");
-                let ours = sql(&ctx, &query("t")).await.unwrap();
-                let read = sql(&ctx, &query("m")).await.unwrap();
+                let ours = sql(&ctx, &query("t")).await;
+                let read = sql(&ctx, &query("m")).await;
                 assert_eq!(ours, read, "{filter}");
                 let text = plan(&ctx, &query("t")).await;
                 assert_eq!(text.contains("pushed=["), expect_pushed, "{filter}\n{text}");
@@ -205,8 +194,8 @@ fn projection_reads_only_the_projected_features_and_keeps_every_row() {
         ] {
             let query = |table: &str| template.replace("{}", table);
             assert_eq!(
-                sql(&ctx, &query("t")).await.unwrap(),
-                sql(&ctx, &query("m")).await.unwrap(),
+                sql(&ctx, &query("t")).await,
+                sql(&ctx, &query("m")).await,
                 "{template}"
             );
         }
@@ -246,18 +235,10 @@ fn the_table_reads_its_versions_with_their_current_contents() {
     let rt = runtime();
     let query = "SELECT sum(f) AS f, count(*) AS n FROM t";
     let totals = |ctx: &SessionContext| {
-        let batch = rt.block_on(sql(ctx, query)).unwrap();
-        let f = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        let n = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        (f.value(0), n.value(0))
+        let batch = rt.block_on(sql(ctx, query));
+        let f = batch.column(0).as_primitive::<Float64Type>().value(0);
+        let n = batch.column(1).as_primitive::<Int64Type>().value(0);
+        (f, n)
     };
     assert_eq!(totals(&ctx), (42.0, 12));
 
@@ -322,7 +303,7 @@ fn a_dropped_query_stops_and_others_still_run() {
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first.num_rows(), 3);
         drop(stream);
-        let ours = sql(&ctx, "SELECT * FROM t").await.unwrap();
+        let ours = sql(&ctx, "SELECT * FROM t").await;
         assert_eq!(ours.num_rows(), 12);
     });
 }
