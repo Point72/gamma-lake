@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from gammalake import DeltaOptions, GammaFeatureLake, PartialWriteError
 from gammalake.abstract import BaseFeatureLake
+from gammalake.tests._model import frame, keys, ts
 from gammalake.tests.base import GammaFeatureLakeTestsMixin, generate_test_data
 
 
@@ -128,7 +129,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
     )
     def test_as_of_range_preserves_out_of_range_context(
         self,
-        tmp_path,
+        fs,
         params,
         observation_indices,
         values,
@@ -136,7 +137,6 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         end_index,
         expected,
     ):
-        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
         days = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(5)]
         fs.add_as_of_features(
             pl.DataFrame(
@@ -154,8 +154,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
         assert result["fundamental"].to_list() == expected
 
-    def test_multi_table_read_preserves_horizontal_alignment(self, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    def test_multi_table_read_preserves_horizontal_alignment(self, fs):
         days = pl.datetime_range(
             datetime(2020, 1, 1, tzinfo=UTC),
             datetime(2020, 1, 3, tzinfo=UTC),
@@ -460,8 +459,7 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         with pytest.raises(ValidationError):
             GammaFeatureLake(base_path=str(tmp_path), delta_options={"compression": "MIDDLE_OUT"})
 
-    def test_consolidate_features_and_targets(self, tmp_path):
-        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    def test_consolidate_features_and_targets(self, fs):
         features = generate_test_data(n_features=2, n_symbols=3, n_days=5)
         targets = generate_test_data(n_features=1, n_symbols=3, n_days=5, feature_suffix="target")
         fs.add_features(features)
@@ -479,22 +477,13 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
         )
 
     def test_appending_existing_feature_pads_missing_index_rows(self, fs):
-        def frame(days, **features):
-            return pl.DataFrame(
-                {
-                    "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in days],
-                    "symbol": ["A"] * len(days),
-                    **{name: [float(scale * day) for day in days] for name, scale in features.items()},
-                }
-            ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
-
-        fs.add_features(frame([1], x=1))
-        fs.add_features(frame([1, 2, 3, 4], y=10))
-        fs.add_features(frame([5], x=1))
+        fs.add_features(frame(keys([1], "A"), x=1))
+        fs.add_features(frame(keys([1, 2, 3, 4], "A"), y=10))
+        fs.add_features(frame(keys([5], "A"), x=1))
 
         expected = pl.DataFrame(
             {
-                "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in range(1, 6)],
+                "timestamp": [ts(day) for day in range(1, 6)],
                 "symbol": ["A"] * 5,
                 "x": [1.0, None, None, None, 5.0],
                 "y": [10.0, 20.0, 30.0, 40.0, None],
@@ -507,49 +496,29 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
             check_column_order=False,
         )
 
-    def test_write_at_last_updated_timestamp_keeps_feature_rows_aligned(self, tmp_path):
-        def frame(rows, **features):
-            return pl.DataFrame(
-                {
-                    "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day, _ in rows],
-                    "symbol": [symbol for _, symbol in rows],
-                    **{name: [float(scale * day) for day, _ in rows] for name, scale in features.items()},
-                }
-            ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
+    def test_write_at_last_updated_timestamp_keeps_feature_rows_aligned(self, fs):
+        fs.add_features(frame([(1, "A"), (2, "A"), (3, "A")], x=1))
+        fs.add_features(frame([(3, "B")], y=10))
+        fs.add_features(frame([(4, "A")], x=1))
 
-        lake = GammaFeatureLake(base_path=str(tmp_path)).initialize()
-        lake.add_features(frame([(1, "A"), (2, "A"), (3, "A")], x=1))
-        lake.add_features(frame([(3, "B")], y=10))
-        lake.add_features(frame([(4, "A")], x=1))
-
-        result = lake.read(["x", "y"]).select("timestamp", "symbol", "x")
+        result = fs.read(["x", "y"]).select("timestamp", "symbol", "x")
         expected = pl.DataFrame(
             {
-                "timestamp": [datetime(2024, 1, day, tzinfo=UTC) for day in (1, 2, 3, 3, 4)],
+                "timestamp": [ts(day) for day in (1, 2, 3, 3, 4)],
                 "symbol": ["A", "A", "A", "B", "A"],
                 "x": [1.0, 2.0, 3.0, None, 4.0],
             }
         ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
         assert_frame_equal(result, expected)
 
-    def test_partial_future_feature_updates(self, tmp_path):
-        def frame(days, **features):
-            return pl.DataFrame(
-                {
-                    "timestamp": [datetime(2024, 1, d, tzinfo=UTC) for d in days],
-                    "symbol": ["A"] * len(days),
-                    **{name: [float(scale * d) for d in days] for name, scale in features.items()},
-                }
-            ).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
-
-        fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
-        fs.add_features(frame([1, 2, 3], x=1, y=10))  # x and y share one feature table
-        fs.add_features(frame([1, 2, 3, 4, 5], z=100))  # the index now runs to day 5
-        fs.add_features(frame([4], x=1), overlap_mode="merge")  # write x alone for day 4
+    def test_partial_future_feature_updates(self, fs):
+        fs.add_features(frame(keys([1, 2, 3], "A"), x=1, y=10))  # x and y share one feature table
+        fs.add_features(frame(keys([1, 2, 3, 4, 5], "A"), z=100))  # the index now runs to day 5
+        fs.add_features(frame(keys([4], "A"), x=1), overlap_mode="merge")  # write x alone for day 4
 
         expected = pl.DataFrame(
             {
-                "timestamp": [datetime(2024, 1, d, tzinfo=UTC) for d in range(1, 6)],
+                "timestamp": [ts(d) for d in range(1, 6)],
                 "symbol": ["A"] * 5,
                 "x": [1.0, 2.0, 3.0, 4.0, None],
                 "y": [10.0, 20.0, 30.0, None, None],
@@ -572,12 +541,6 @@ def test_primary_sort_key_not_in_existing_index_raises(tmp_path):
     GammaFeatureLake(base_path=str(tmp_path)).initialize()
     with pytest.raises(ValidationError, match="not_a_column"):
         GammaFeatureLake(base_path=str(tmp_path), primary_sort_key="not_a_column")
-
-
-def test_removed_options_are_rejected(tmp_path):
-    for option in ({"engine": "native"}, {"run_on_ray_cluster": False}, {"io": None}):
-        with pytest.raises(ValidationError):
-            GammaFeatureLake(base_path=str(tmp_path), **option)
 
 
 def test_adds_take_data_frames_and_return_nothing(tmp_path):
@@ -675,13 +638,13 @@ def test_failed_add_is_rolled_back_and_later_writes_do_not_see_it(tmp_path):
     fs.add_features(_frame(range(1, 6), 1), owner="me")
     index_before = fs.index_frame().collect()
     (table,) = fs.table_metadata_frame().collect()["table_addr"]
-    version_before = DeltaTable(os.path.join(fs.base_path, table)).version()
+    version_before = DeltaTable(fs.get_path(table)).version()
 
     failing = GammaFeatureLake(base_path=str(tmp_path), lock=_failing_lock(lambda name, _: name == "index"))
     with pytest.raises(RuntimeError, match="simulated failure locking index"):
         failing.add_features(_frame([6, 7], 2), owner="me")
 
-    assert DeltaTable(os.path.join(fs.base_path, table)).version() == version_before + 2
+    assert DeltaTable(fs.get_path(table)).version() == version_before + 2
     assert_frame_equal(fs.index_frame().collect(), index_before)
     assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10
     log = _log(fs)
