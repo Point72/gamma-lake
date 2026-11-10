@@ -1,8 +1,11 @@
 //! The table stores behind a lake: addressing, snapshots and merges, on every store.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use common::{delta_store, tick};
 use futures::TryStreamExt;
 use gamma_lake::arrow::array::{Array, AsArray, Float64Array, Int64Array, RecordBatch};
 use gamma_lake::arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
@@ -31,27 +34,19 @@ fn batch(k: &[i64], f: &[f64], g: &[f64]) -> RecordBatch {
     .unwrap()
 }
 
+/// `batch` without `g`.
+fn narrow(k: &[i64], f: &[f64]) -> RecordBatch {
+    batch(k, f, f).project(&[0, 1]).unwrap()
+}
+
 /// Every store under test, each with its own empty location.
 fn stores() -> Vec<(TempDir, Arc<dyn TableStore>)> {
     let local = TempDir::new().unwrap();
-    let delta = delta_store(local.path().to_str().unwrap(), HashMap::new()).unwrap();
+    let delta = delta_store(local.path().to_str().unwrap()).unwrap();
     vec![
         (local, Arc::new(delta)),
         (TempDir::new().unwrap(), Arc::new(MemoryStore::new())),
     ]
-}
-
-fn delta_store(
-    base: &str,
-    storage_options: HashMap<String, String>,
-) -> gamma_lake::Result<DeltaStore> {
-    DeltaStore::new(
-        base,
-        DeltaOptions {
-            storage_options,
-            ..Default::default()
-        },
-    )
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -133,23 +128,12 @@ fn an_opened_table_keeps_its_version() {
             assert_eq!(rows(before.as_ref()).await.num_rows(), 2);
             let after = store.open("t").await.unwrap().unwrap();
             assert_eq!(rows(after.as_ref()).await.num_rows(), 3);
-            let source = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("k", DataType::Int64, true),
-                    Field::new("f", DataType::Float64, true),
-                ])),
-                vec![
-                    Arc::new(Int64Array::from(vec![4])),
-                    Arc::new(Float64Array::from(vec![4.0])),
-                ],
-            )
-            .unwrap();
             store
                 .open("t")
                 .await
                 .unwrap()
                 .unwrap()
-                .merge(source, &["k".into()], &["f".into()])
+                .merge(narrow(&[4], &[4.0]), &["k".into()], &["f".into()])
                 .await
                 .unwrap();
             assert_eq!(rows(after.as_ref()).await.num_rows(), 3);
@@ -160,7 +144,6 @@ fn an_opened_table_keeps_its_version() {
 
 #[test]
 fn merge_updates_matched_columns_and_inserts_the_rest() {
-    let mut results = vec![];
     for (_dir, store) in stores() {
         let result = runtime().block_on(async {
             store
@@ -173,20 +156,9 @@ fn merge_updates_matched_columns_and_inserts_the_rest() {
                 )
                 .await
                 .unwrap();
-            let source = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("k", DataType::Int64, true),
-                    Field::new("f", DataType::Float64, true),
-                ])),
-                vec![
-                    Arc::new(Int64Array::from(vec![3, 2])),
-                    Arc::new(Float64Array::from(vec![33.0, 99.0])),
-                ],
-            )
-            .unwrap();
             let table = store.open("t").await.unwrap().unwrap();
             table
-                .merge(source, &["k".into()], &["f".into()])
+                .merge(narrow(&[3, 2], &[33.0, 99.0]), &["k".into()], &["f".into()])
                 .await
                 .unwrap();
             let table = store.open("t").await.unwrap().unwrap();
@@ -202,9 +174,7 @@ fn merge_updates_matched_columns_and_inserts_the_rest() {
             ],
             "{store:?}"
         );
-        results.push(result);
     }
-    assert_eq!(results[0], results[1]);
 }
 
 #[test]
@@ -215,9 +185,11 @@ fn appends_must_match_the_table_schema() {
                 .create("t", batch(&[1], &[1.0], &[1.0]), &CreateOptions::default())
                 .await
                 .unwrap();
-            let narrow = batch(&[2], &[2.0], &[2.0]).project(&[0, 1]).unwrap();
             let table = store.open("t").await.unwrap().unwrap();
-            assert!(table.append(narrow).await.is_err(), "{store:?}");
+            assert!(
+                table.append(narrow(&[2], &[2.0])).await.is_err(),
+                "{store:?}"
+            );
         });
     }
 }
@@ -226,7 +198,6 @@ fn appends_must_match_the_table_schema() {
 fn merging_appends_add_nullable_columns() {
     for (_dir, store) in stores() {
         runtime().block_on(async {
-            let narrow = |k: &[i64], f: &[f64]| batch(k, f, f).project(&[0, 1]).unwrap();
             store
                 .create("t", narrow(&[1], &[1.0]), &CreateOptions::default())
                 .await
@@ -249,19 +220,6 @@ fn merging_appends_add_nullable_columns() {
 
 #[test]
 fn a_commit_through_a_stale_handle_conflicts_and_writes_nothing() {
-    let source = || {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("k", DataType::Int64, true),
-                Field::new("f", DataType::Float64, true),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Float64Array::from(vec![20.0])),
-            ],
-        )
-        .unwrap()
-    };
     let wider = || {
         let mut fields = schema().fields().to_vec();
         fields.push(Arc::new(Field::new("h", DataType::Float64, true)));
@@ -292,7 +250,7 @@ fn a_commit_through_a_stale_handle_conflicts_and_writes_nothing() {
                     "append" => stale.append(batch(&[3], &[3.0], &[3.0])).await.err(),
                     "append_merging" => stale.append_merging(wider()).await.err(),
                     "merge" => stale
-                        .merge(source(), &["k".into()], &["f".into()])
+                        .merge(narrow(&[1], &[20.0]), &["k".into()], &["f".into()])
                         .await
                         .err(),
                     _ => stale
@@ -321,48 +279,58 @@ fn every_path_to_a_new_lake_has_one_location() {
     std::fs::create_dir(&real).unwrap();
     let alias = dir.path().join("alias");
     std::os::unix::fs::symlink(&real, &alias).unwrap();
-    let created = delta_store(alias.join("lake").to_str().unwrap(), HashMap::new()).unwrap();
-    std::fs::create_dir(real.join("lake")).unwrap();
-    let reopened = delta_store(real.join("lake").to_str().unwrap(), HashMap::new()).unwrap();
-    assert_eq!(
-        created.location(),
-        format!("{}/", real.join("lake").display())
-    );
-    assert_eq!(created.location(), reopened.location());
-    assert!(delta_store(alias.join("x/../lake").to_str().unwrap(), HashMap::new()).is_err());
+    let created = delta_store(alias.join("lake").to_str().unwrap()).unwrap();
+    let lake = real.join("lake");
+    std::fs::create_dir(&lake).unwrap();
+    assert_eq!(created.location(), format!("{}/", lake.display()));
+    let table = format!("{}/features/f1", lake.display());
+    assert_eq!(created.table_location("features/f1").unwrap(), table);
+    for base in [
+        lake.display().to_string(),
+        format!("{}/", lake.display()),
+        format!("{}/./lake", alias.display()),
+        format!("file://{}/lake", alias.display()),
+    ] {
+        let reopened = delta_store(&base).unwrap();
+        assert_eq!(reopened.location(), created.location(), "{base}");
+        assert_eq!(
+            reopened.table_location("features/f1").unwrap(),
+            table,
+            "{base}"
+        );
+    }
+    assert!(delta_store(alias.join("x/../lake").to_str().unwrap()).is_err());
 }
 
 #[test]
 fn delta_store_locations_and_secrets() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().canonicalize().unwrap();
-    let store = delta_store(path.to_str().unwrap(), HashMap::new()).unwrap();
+    let store = delta_store(path.to_str().unwrap()).unwrap();
     assert_eq!(store.location(), format!("{}/", path.display()));
     let url = url::Url::from_directory_path(&path).unwrap();
-    let store = delta_store(url.as_str(), HashMap::new()).unwrap();
+    let store = delta_store(url.as_str()).unwrap();
     assert_eq!(store.location(), format!("{}/", path.display()));
+    let err = delta_store(path.join("lake%41").to_str().unwrap()).unwrap_err();
+    assert!(
+        matches!(err, gamma_lake::Error::InvalidArgument(_)),
+        "{err}"
+    );
 
-    let secret = HashMap::from([("AWS_SECRET_ACCESS_KEY".into(), "hunter2".into())]);
-    let store = delta_store("s3://bucket/lake", secret).unwrap();
+    let secret = DeltaOptions {
+        storage_options: HashMap::from([("AWS_SECRET_ACCESS_KEY".into(), "hunter2".into())]),
+        ..Default::default()
+    };
+    let store = DeltaStore::new("s3://bucket/lake", secret).unwrap();
     assert_eq!(store.location(), "s3://bucket/lake/");
     assert!(!format!("{store:?}").contains("hunter2"));
-    assert!(delta_store("s3://bucket/50%25", HashMap::new()).is_err());
-    assert!(delta_store("s3://bucket/lake#x", HashMap::new()).is_err());
-}
-
-fn now_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
-}
-
-/// Waits long enough for commits on either side to have distinct times.
-fn tick() -> i64 {
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    let now = now_micros();
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    now
+    let store = delta_store("s3://bucket/lake/").unwrap();
+    assert_eq!(
+        store.table_location("index").unwrap(),
+        "s3://bucket/lake/index"
+    );
+    assert!(delta_store("s3://bucket/50%25").is_err());
+    assert!(delta_store("s3://bucket/lake#x").is_err());
 }
 
 #[test]

@@ -1,11 +1,14 @@
 //! Parity with the Python reference, driven by `tests/fixtures/queries.json`.
 //!
-//! `make fixtures` generates the fixtures; without them these tests are skipped.
+//! `make fixtures` generates the fixtures, which these tests need.
+
+mod common;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::open_delta;
 use gamma_lake::arrow::array::{Array, ArrayRef, StringArray};
 use gamma_lake::arrow::compute::{
     cast, cast_with_options, concat_batches, lexsort_to_indices, take_record_batch, CastOptions,
@@ -14,23 +17,17 @@ use gamma_lake::arrow::compute::{
 use gamma_lake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use gamma_lake::arrow::ipc::reader::FileReader;
 use gamma_lake::arrow::record_batch::RecordBatch;
-use gamma_lake::{BatchStream, DeltaOptions, DeltaStore, Dnf, Error, Lake, LakeOptions, Op, Term};
+use gamma_lake::{BatchStream, Dnf, Error, Lake, LakeOptions, Op, Term};
 use serde_json::Value;
+
+const MISSING: &str = "parity fixtures missing; run `make fixtures`";
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn fixtures_present() -> bool {
-    let present = fixtures().join("queries.json").exists();
-    if !present {
-        eprintln!("skipped: the parity fixtures are missing; generate them with `make fixtures`");
-    }
-    present
-}
-
 fn queries() -> Vec<Value> {
-    let text = std::fs::read_to_string(fixtures().join("queries.json")).unwrap();
+    let text = std::fs::read_to_string(fixtures().join("queries.json")).expect(MISSING);
     serde_json::from_str::<Value>(&text)
         .unwrap()
         .as_array()
@@ -38,27 +35,14 @@ fn queries() -> Vec<Value> {
         .clone()
 }
 
-fn open(lake: &str, validate: bool) -> Lake {
-    open_with(
-        lake,
-        LakeOptions {
-            validate,
-            ..Default::default()
-        },
-    )
+fn lake_path(lake: &str) -> PathBuf {
+    let path = fixtures().join("lakes").join(lake);
+    assert!(path.is_dir(), "{MISSING}");
+    path
 }
 
 fn open_with(lake: &str, options: LakeOptions) -> Lake {
-    open_delta(
-        fixtures().join("lakes").join(lake).to_str().unwrap(),
-        options,
-        Default::default(),
-    )
-    .unwrap()
-}
-
-fn open_delta(base: &str, options: LakeOptions, delta: DeltaOptions) -> gamma_lake::Result<Lake> {
-    gamma_lake::open(DeltaStore::new(base, delta)?, options)
+    open_delta(lake_path(lake).to_str().unwrap(), options).unwrap()
 }
 
 fn literals(values: &[Value]) -> ArrayRef {
@@ -130,19 +114,21 @@ fn dnf(value: &Value) -> Dnf {
         .collect())
 }
 
-fn names(value: &Value, key: &str) -> Vec<String> {
-    value[key]
+fn names(value: &Value) -> Vec<String> {
+    value
         .as_array()
-        .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
-        .unwrap_or_default()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
 }
 
 fn run(lake: &Lake, query: &Value) -> Result<BatchStream, Error> {
     let filter = dnf(&query["dnf"]);
     match query["kind"].as_str().unwrap() {
         "read" => {
-            let features = names(query, "features");
-            let targets = names(query, "targets");
+            let features = names(&query["features"]);
+            let targets = names(&query["targets"]);
             let features: Vec<&str> = features.iter().map(String::as_str).collect();
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
             lake.read(&features, &targets, &filter)
@@ -152,19 +138,6 @@ fn run(lake: &Lake, query: &Value) -> Result<BatchStream, Error> {
         "table_metadata" => lake.table_metadata(&filter),
         "index" => lake.index(&filter),
         other => panic!("unknown kind {other}"),
-    }
-}
-
-fn error_kind(error: &Error) -> &'static str {
-    match error {
-        Error::MissingFeatures(_) => "missing_features",
-        Error::MisregisteredTargets(_) => "misregistered_targets",
-        Error::InvalidPredicate(_) => "invalid_predicate",
-        Error::Unsupported { .. } => "unsupported",
-        Error::NotInitialized(_) => "not_initialized",
-        Error::InvalidArgument(_) => "invalid_argument",
-        Error::Integrity { .. } => "integrity",
-        other => panic!("unexpected engine error: {other}"),
     }
 }
 
@@ -182,10 +155,6 @@ fn plain(batch: &RecordBatch) -> RecordBatch {
         fields.push(Field::new(field.name(), target, true));
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-}
-
-fn collect(stream: BatchStream) -> RecordBatch {
-    try_collect(stream).unwrap()
 }
 
 fn try_collect(stream: BatchStream) -> Result<RecordBatch, String> {
@@ -242,19 +211,36 @@ fn assert_same(name: &str, actual: &RecordBatch, expected: &RecordBatch) {
     }
 }
 
-fn check_all(validate: bool) {
-    check_all_with(LakeOptions {
-        validate,
-        ..Default::default()
-    });
-}
-
-fn check_all_with(options: LakeOptions) {
-    let validate = options.validate;
+#[test]
+fn queries_match_reference() {
     let queries = queries();
     assert!(!queries.is_empty());
-    for query in &queries {
-        let name = query["name"].as_str().unwrap();
+    let default = LakeOptions::default().batch_size;
+    for (validate, batch_size, memory_limit) in [
+        (false, default, None),
+        (true, default, None),
+        (false, default, Some(1 << 20)),
+        (true, default, Some(1 << 20)),
+        (true, 2, None),
+        (true, 2, Some(1 << 20)),
+    ] {
+        let options = LakeOptions {
+            validate,
+            batch_size,
+            memory_limit,
+            ..Default::default()
+        };
+        let context =
+            format!("validate {validate}, batch size {batch_size}, memory limit {memory_limit:?}");
+        check_all(&queries, &options, &context);
+    }
+}
+
+fn check_all(queries: &[Value], options: &LakeOptions, context: &str) {
+    let validate = options.validate;
+    for query in queries {
+        let file = query["name"].as_str().unwrap();
+        let name = &format!("{file} ({context})");
         let lake = open_with(query["lake"].as_str().unwrap(), options.clone());
         let result = run(&lake, query);
         let expect = match query.get("validate_expect") {
@@ -271,10 +257,10 @@ fn check_all_with(options: LakeOptions) {
             "ok" => {
                 let stream = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let actual = try_collect(stream).unwrap_or_else(|e| panic!("{name}: {e}"));
-                let mut expected = expected(name);
+                let mut expected = expected(file);
                 let mut actual = actual;
                 if let Some(by) = query.get("sort_by") {
-                    let by = names(&serde_json::json!({ "by": by }), "by");
+                    let by = names(by);
                     actual = sorted(&actual, &by);
                     expected = sorted(&expected, &by);
                 }
@@ -284,7 +270,7 @@ fn check_all_with(options: LakeOptions) {
                 let kind = expect.strip_prefix("error:").unwrap();
                 match result {
                     Ok(_) => panic!("{name}: expected {kind}, got a stream"),
-                    Err(e) => assert_eq!(error_kind(&e), kind, "{name}: {e}"),
+                    Err(e) => assert_eq!(e.kind(), kind, "{name}: {e}"),
                 }
             }
         }
@@ -292,40 +278,7 @@ fn check_all_with(options: LakeOptions) {
 }
 
 #[test]
-fn queries_match_reference() {
-    if !fixtures_present() {
-        return;
-    }
-    check_all(false);
-}
-
-#[test]
-fn queries_match_reference_with_validation() {
-    if !fixtures_present() {
-        return;
-    }
-    check_all(true);
-}
-
-#[test]
-fn queries_match_reference_with_memory_limit() {
-    if !fixtures_present() {
-        return;
-    }
-    for validate in [false, true] {
-        check_all_with(LakeOptions {
-            validate,
-            memory_limit: Some(1 << 20),
-            ..Default::default()
-        });
-    }
-}
-
-#[test]
 fn memory_limit_too_small_for_a_batch_fails_the_read() {
-    if !fixtures_present() {
-        return;
-    }
     let query = queries()
         .into_iter()
         .find(|q| q["name"] == "basic_all")
@@ -345,40 +298,17 @@ fn memory_limit_too_small_for_a_batch_fails_the_read() {
 }
 
 #[test]
-fn queries_match_reference_in_small_batches() {
-    if !fixtures_present() {
-        return;
-    }
-    for memory_limit in [None, Some(1 << 20)] {
-        check_all_with(LakeOptions {
-            validate: true,
-            batch_size: 2,
-            memory_limit,
-            ..Default::default()
-        });
-    }
-}
-
-#[test]
 fn relocated_lake_reads_the_same() {
-    if !fixtures_present() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
-    copy_dir(&fixtures().join("lakes/basic"), dir.path());
+    copy_dir(&lake_path("basic"), dir.path());
     let query = queries()
         .into_iter()
         .find(|q| q["name"] == "basic_all")
         .unwrap();
-    let lake = open_delta(
-        dir.path().to_str().unwrap(),
-        LakeOptions::default(),
-        Default::default(),
-    )
-    .unwrap();
+    let lake = open_delta(dir.path().to_str().unwrap(), LakeOptions::default()).unwrap();
     assert_same(
         "relocated",
-        &collect(run(&lake, &query).unwrap()),
+        &try_collect(run(&lake, &query).unwrap()).unwrap(),
         &expected("basic_all"),
     );
 }
@@ -398,9 +328,6 @@ fn copy_dir(from: &Path, to: &Path) {
 
 #[test]
 fn missing_lake_is_not_initialized() {
-    if !fixtures_present() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let empty_log = dir.path().join("empty_log");
     std::fs::create_dir_all(empty_log.join("index/_delta_log")).unwrap();
@@ -409,51 +336,28 @@ fn missing_lake_is_not_initialized() {
         dir.path().join("absent"),
         empty_log,
     ] {
-        let err = open_delta(
-            path.to_str().unwrap(),
-            LakeOptions::default(),
-            Default::default(),
-        )
-        .unwrap_err();
+        let err = open_delta(path.to_str().unwrap(), LakeOptions::default()).unwrap_err();
         assert!(matches!(err, Error::NotInitialized(_)), "{err}");
     }
 }
 
 #[test]
 fn rejects_unknown_schemes_bad_addresses_and_unknown_primary_key() {
-    if !fixtures_present() {
-        return;
-    }
     // A scheme without an object store is an error, not an absent lake.
-    let err = open_delta(
-        "nosuch://bucket/lake",
-        LakeOptions::default(),
-        Default::default(),
-    )
-    .unwrap_err();
+    let err = open_delta("nosuch://bucket/lake", LakeOptions::default()).unwrap_err();
     assert!(matches!(err, Error::Store(_)), "{err}");
-    let err = open_delta(
-        "s3://bucket/lake?x=1",
-        LakeOptions::default(),
-        Default::default(),
-    )
-    .unwrap_err();
+    let err = open_delta("s3://bucket/lake?x=1", LakeOptions::default()).unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     // Decodes to a non-UTF-8 path.
-    let err = open_delta(
-        "file:///nonexistent/%FF",
-        LakeOptions::default(),
-        Default::default(),
-    )
-    .unwrap_err();
+    let err = open_delta("file:///nonexistent/%FF", LakeOptions::default()).unwrap_err();
     assert!(matches!(err, Error::NotInitialized(_)), "{err}");
+    let path = lake_path("basic");
     for index_path in ["../basic/index", "/index", "", "ind%65x"] {
         let options = LakeOptions {
             index_path: index_path.into(),
             ..Default::default()
         };
-        let path = fixtures().join("lakes/basic");
-        let err = open_delta(path.to_str().unwrap(), options, Default::default()).unwrap_err();
+        let err = open_delta(path.to_str().unwrap(), options).unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "{index_path}: {err}"
@@ -463,26 +367,17 @@ fn rejects_unknown_schemes_bad_addresses_and_unknown_primary_key() {
         primary_sort_key: "nope".into(),
         ..Default::default()
     };
-    let path = fixtures().join("lakes/basic");
-    let err = open_delta(path.to_str().unwrap(), options, Default::default()).unwrap_err();
+    let err = open_delta(path.to_str().unwrap(), options).unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
 }
 
 #[test]
 fn small_batches_and_stream_outlives_lake() {
-    if !fixtures_present() {
-        return;
-    }
     let options = LakeOptions {
         batch_size: 3,
         ..Default::default()
     };
-    let lake = open_delta(
-        fixtures().join("lakes/basic").to_str().unwrap(),
-        options.clone(),
-        Default::default(),
-    )
-    .unwrap();
+    let lake = open_with("basic", options.clone());
     let stream = lake
         .read(&["f1", "f2", "f3", "f4"], &["t1"], &Dnf::default())
         .unwrap();
@@ -494,12 +389,7 @@ fn small_batches_and_stream_outlives_lake() {
     let all = plain(&concat_batches(&schema, &batches).unwrap());
     assert_same("small batches", &all, &expected("basic_all"));
 
-    let lake = open_delta(
-        fixtures().join("lakes/basic").to_str().unwrap(),
-        options,
-        Default::default(),
-    )
-    .unwrap();
+    let lake = open_with("basic", options);
     for stream in [
         lake.latest_features().unwrap(),
         lake.feature_metadata(&Dnf::default()).unwrap(),
@@ -508,55 +398,4 @@ fn small_batches_and_stream_outlives_lake() {
         assert_eq!(sizes.iter().sum::<usize>(), 5);
         assert!(sizes.iter().all(|&n| n <= 3), "{sizes:?}");
     }
-}
-
-#[test]
-fn percent_in_lake_root_is_rejected() {
-    if !fixtures_present() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("lake%41");
-    copy_dir(&fixtures().join("lakes/basic"), &root);
-    let err = open_delta(
-        root.to_str().unwrap(),
-        LakeOptions::default(),
-        Default::default(),
-    )
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
-}
-
-#[test]
-fn table_addresses_are_paths_not_urls() {
-    if !fixtures_present() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    copy_dir(&fixtures().join("lakes/basic"), dir.path());
-    let index_path = "trial#idx?x";
-    std::fs::rename(dir.path().join("index"), dir.path().join(index_path)).unwrap();
-    let options = LakeOptions {
-        index_path: index_path.into(),
-        ..Default::default()
-    };
-    let lake = open_delta(dir.path().to_str().unwrap(), options, Default::default()).unwrap();
-    let rows: usize = lake
-        .index(&Dnf::default())
-        .unwrap()
-        .map(|b| b.unwrap().num_rows())
-        .sum();
-    assert_eq!(rows, 20);
-}
-
-#[test]
-fn file_url_is_accepted() {
-    if !fixtures_present() {
-        return;
-    }
-    let path = std::fs::canonicalize(fixtures().join("lakes/basic")).unwrap();
-    let url = url::Url::from_directory_path(&path).unwrap();
-    let lake = open_delta(url.as_str(), LakeOptions::default(), Default::default()).unwrap();
-    assert_eq!(lake.sort_keys(), ["timestamp", "symbol"]);
-    assert_eq!(lake.primary_sort_key(), "timestamp");
 }

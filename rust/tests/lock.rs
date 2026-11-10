@@ -1,16 +1,17 @@
 //! Table locks: every commit holds the lock on its table, reads take none, and lock failures
 //! fail the operation.
 
+mod common;
+
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
-use gamma_lake::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
-use gamma_lake::arrow::datatypes::{DataType, Field, Schema};
+use common::{add, delta_store, frame, index_schema, keys, tick};
 use gamma_lake::arrow::record_batch::RecordBatch;
 use gamma_lake::{
-    AddOptions, Annotation, DeltaStore, Dnf, Error, Lake, LakeOptions, LockError, LockGuard,
-    MemoryStore, OverlapMode, TableLock, TableStore,
+    AddOptions, Annotation, Dnf, Error, Lake, LakeOptions, LockError, LockGuard, MemoryStore,
+    OverlapMode, TableLock, TableStore,
 };
 use tempfile::TempDir;
 
@@ -73,25 +74,9 @@ impl LockGuard for Guard {
     }
 }
 
-fn index_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Int64, true),
-        Field::new("sym", DataType::Utf8, true),
-    ]))
-}
-
-fn frame(ts: &[i64], feature: &str) -> RecordBatch {
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(ts.to_vec())),
-        Arc::new(StringArray::from_iter_values(ts.iter().map(|_| "a"))),
-        Arc::new(Float64Array::from_iter_values(ts.iter().map(|&t| t as f64))),
-    ];
-    let schema = Schema::new(vec![
-        Field::new("ts", DataType::Int64, true),
-        Field::new("sym", DataType::Utf8, true),
-        Field::new(feature, DataType::Float64, true),
-    ]);
-    RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+/// Rows of symbol `a` at `ts`, with the feature `f`.
+fn rows(ts: impl IntoIterator<Item = i64>) -> RecordBatch {
+    frame(&keys(ts, &["a"]), &[("f", 1.0)])
 }
 
 fn options(lock: &Arc<RecordingLock>) -> LakeOptions {
@@ -102,10 +87,6 @@ fn options(lock: &Arc<RecordingLock>) -> LakeOptions {
     }
 }
 
-fn delta_store(path: &str) -> DeltaStore {
-    DeltaStore::new(path, Default::default()).unwrap()
-}
-
 /// A Delta lake (`delta`) or an in-memory lake, with its store.
 fn lake(
     lock: &Arc<RecordingLock>,
@@ -114,7 +95,7 @@ fn lake(
     let dir = TempDir::new().unwrap();
     if delta {
         let path = dir.path().to_str().unwrap().to_string();
-        let store = delta_store(&path);
+        let store = delta_store(&path).unwrap();
         let lake = gamma_lake::create(store.clone(), index_schema(), options(lock));
         (dir, lake, Arc::new(store))
     } else {
@@ -129,21 +110,6 @@ fn acquired(lock: &RecordingLock) -> Vec<String> {
     assert!(state.held.is_empty());
     assert_eq!(state.released, state.acquired.len());
     state.acquired.clone()
-}
-
-fn add(lake: &Lake, batch: RecordBatch, overlap_mode: OverlapMode) {
-    let options = AddOptions {
-        overlap_mode,
-        ..Default::default()
-    };
-    lake.add(vec![batch], &options).unwrap();
-}
-
-fn micros_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
 }
 
 #[test]
@@ -161,9 +127,7 @@ fn every_commit_holds_the_lock_on_its_table_and_reads_take_none() {
         ]);
         assert_eq!(BTreeSet::from_iter(acquired(&lock)), metadata);
 
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let created = micros_now();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let created = tick();
         let mut seen = acquired(&lock).len();
         let mut step = |what: &str, run: &dyn Fn()| {
             run();
@@ -172,19 +136,14 @@ fn every_commit_holds_the_lock_on_its_table_and_reads_take_none() {
             seen = all.len();
         };
         step("a new table", &|| {
-            add(&lake, frame(&[1, 2], "f"), OverlapMode::Copy)
+            add(&lake, rows([1, 2]), OverlapMode::Copy)
         });
-        step("an append", &|| {
-            add(&lake, frame(&[3], "f"), OverlapMode::Copy)
-        });
-        step("a copy", &|| {
-            add(&lake, frame(&[2, 3], "f"), OverlapMode::Copy)
-        });
-        step("a merge", &|| {
-            add(&lake, frame(&[3, 4], "f"), OverlapMode::Merge)
-        });
+        step("an append", &|| add(&lake, rows([3]), OverlapMode::Copy));
+        step("a copy", &|| add(&lake, rows([2, 3]), OverlapMode::Copy));
+        step("a merge", &|| add(&lake, rows([3, 4]), OverlapMode::Merge));
         step("padding", &|| {
-            lake.add_index_rows(vec![frame(&[9], "ignored")]).unwrap()
+            lake.add_index_rows(vec![frame(&keys([9], &["a"]), &[])])
+                .unwrap()
         });
         step("annotations", &|| {
             let note = |name: &str, comment: &str| Annotation {
@@ -229,49 +188,15 @@ fn lock_failures_fail_the_operation() {
     });
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let err = gamma_lake::create(delta_store(path), index_schema(), options(&lock)).unwrap_err();
+    let err =
+        gamma_lake::create(delta_store(path).unwrap(), index_schema(), options(&lock)).unwrap_err();
     assert!(err.to_string().contains("cannot unlock"), "{err}");
     acquired(&lock);
     assert!(dir.path().join("feature_metadata").exists());
     assert!(matches!(
-        gamma_lake::open(delta_store(path), options(&Arc::default())),
+        gamma_lake::open(delta_store(path).unwrap(), options(&Arc::default())),
         Err(Error::NotInitialized(_))
     ));
-}
-
-#[test]
-fn a_table_has_one_lock_target_however_its_lake_is_named() {
-    let dir = TempDir::new().unwrap();
-    let real = dir.path().join("real");
-    std::fs::create_dir(&real).unwrap();
-    let link = dir.path().join("link");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    let targets: BTreeSet<String> = [
-        real.display().to_string(),
-        format!("{}/", real.display()),
-        format!("{}/./", link.display()),
-        format!("file://{}", link.display()),
-    ]
-    .iter()
-    .map(|base| {
-        DeltaStore::new(base, Default::default())
-            .unwrap()
-            .table_location("features/f1")
-            .unwrap()
-    })
-    .collect();
-    assert_eq!(
-        targets,
-        BTreeSet::from([format!(
-            "{}/features/f1",
-            std::fs::canonicalize(&real).unwrap().display()
-        )])
-    );
-    let s3 = DeltaStore::new("s3://bucket/lake/", Default::default()).unwrap();
-    assert_eq!(
-        s3.table_location("index").unwrap(),
-        "s3://bucket/lake/index"
-    );
 }
 
 #[test]
@@ -281,16 +206,20 @@ fn a_failed_release_after_a_commit_counts_the_table_as_committed() {
     for (fails, expected) in [("delta_", 1), ("/index", 2)] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap();
-        let lake = gamma_lake::create(delta_store(path), index_schema(), options(&Arc::default()))
-            .unwrap();
-        add(&lake, frame(&[1, 2], "f"), OverlapMode::Copy);
+        let lake = gamma_lake::create(
+            delta_store(path).unwrap(),
+            index_schema(),
+            options(&Arc::default()),
+        )
+        .unwrap();
+        add(&lake, rows([1, 2]), OverlapMode::Copy);
         let lock = Arc::new(RecordingLock {
             fail_release: Some(fails),
             ..Default::default()
         });
-        let lake = gamma_lake::open(delta_store(path), options(&lock)).unwrap();
+        let lake = gamma_lake::open(delta_store(path).unwrap(), options(&lock)).unwrap();
         let err = lake
-            .add(vec![frame(&[3], "f")], &AddOptions::default())
+            .add(vec![rows([3])], &AddOptions::default())
             .unwrap_err();
         let Error::Write {
             committed, source, ..
