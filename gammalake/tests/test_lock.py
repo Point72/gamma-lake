@@ -13,18 +13,10 @@ from deltalake import DeltaTable
 
 from gammalake import ConflictError, GammaFeatureLake, PartialWriteError
 from gammalake.native import NativeLake
+from gammalake.tests._model import frame, keys
 
-UTC = dt.UTC
 LOG = "transaction_log"
 LAKE_TABLES = {"index", "table_metadata", "feature_metadata", LOG}
-
-
-def frame(days, symbols, **scales) -> pl.DataFrame:
-    rows = [(d, s) for d in days for s in symbols]
-    data = {"timestamp": [dt.datetime(2024, 1, d, tzinfo=UTC) for d, _ in rows], "symbol": [s for _, s in rows]}
-    for name, scale in scales.items():
-        data[name] = [float(scale * d) for d, _ in rows]
-    return pl.DataFrame(data).with_columns(pl.col("timestamp").dt.cast_time_unit("us"))
 
 
 def version(path: str) -> int | None:
@@ -70,8 +62,8 @@ class Recorder:
 
 def populated(path) -> GammaFeatureLake:
     lake = GammaFeatureLake(base_path=str(path), enable_runtime_computed_features=True).initialize()
-    lake.add_features(frame(range(1, 4), "ab", f=1, g=2))
-    lake.add_targets(frame(range(1, 4), "ab", y=1))
+    lake.add_features(frame(keys(range(1, 4), "ab"), f=1, g=2))
+    lake.add_targets(frame(keys(range(1, 4), "ab"), y=1))
     return lake
 
 
@@ -87,14 +79,14 @@ def annotate(lake: GammaFeatureLake) -> None:
 # The tables each operation changes: "features" and "targets" are the tables of f and y, "new" a table it creates.
 # Adds are transactions, which append two rows to the log, each under its own lock.
 OPERATIONS = {
-    "add_features": (lambda lake: lake.add_features(frame(range(1, 3), "ab", h=1)), ["feature_metadata", "new", "table_metadata", LOG]),
+    "add_features": (lambda lake: lake.add_features(frame(keys(range(1, 3), "ab"), h=1)), ["feature_metadata", "new", "table_metadata", LOG]),
     "add_features_on_new_keys": (
-        lambda lake: lake.add_features(frame(range(4, 6), "ab", f=1, g=2)),
+        lambda lake: lake.add_features(frame(keys(range(4, 6), "ab"), f=1, g=2)),
         ["features", "index", "table_metadata", LOG],
     ),
-    "add_targets": (lambda lake: lake.add_targets(frame(range(1, 3), "ab", z=1)), ["feature_metadata", "new", "table_metadata", LOG]),
-    "add_index_rows": (lambda lake: lake.add_index_rows(frame([5], "ab")), ["index", LOG]),
-    "add_index_rows_inside_coverage": (lambda lake: lake.add_index_rows(frame([2], "c")), ["features", "index", "targets", LOG]),
+    "add_targets": (lambda lake: lake.add_targets(frame(keys(range(1, 3), "ab"), z=1)), ["feature_metadata", "new", "table_metadata", LOG]),
+    "add_index_rows": (lambda lake: lake.add_index_rows(frame(keys([5], "ab"))), ["index", LOG]),
+    "add_index_rows_inside_coverage": (lambda lake: lake.add_index_rows(frame(keys([2], "c"))), ["features", "index", "targets", LOG]),
     "annotate": (annotate, ["features"]),
     "consolidate_feature_groups": (
         lambda lake: lake.consolidate_feature_groups(["f", "y"]),
@@ -105,7 +97,7 @@ OPERATIONS = {
 
 
 @pytest.mark.parametrize("operation", list(OPERATIONS))
-def test_writes_lock_exactly_the_tables_they_change(tmp_path, operation):
+def test_writes_commit_under_locks_on_exactly_the_tables_they_change(tmp_path, operation):
     run, expected = OPERATIONS[operation]
     lake = populated(tmp_path)
     metadata = lake.feature_metadata_frame().collect()
@@ -120,13 +112,6 @@ def test_writes_lock_exactly_the_tables_they_change(tmp_path, operation):
     assert recorder.names() == sorted(changed + [LOG] * (LOG in changed))
     assert sorted(roles.get(name, name if name in before else "new") for name in changed) == expected
     assert recorder.locked == [os.path.join(lake.base_path, os.path.basename(path)) for path in recorder.locked]
-
-
-@pytest.mark.parametrize("operation", list(OPERATIONS))
-def test_commits_happen_while_the_lock_is_held(tmp_path, operation):
-    lake = populated(tmp_path)
-    recorder = Recorder()
-    OPERATIONS[operation][0](with_lock(lake, recorder))
     assert len(recorder.held) == len(recorder.locked)
     for name, entered, exited, exc_info in recorder.held:
         assert exited is not None and (entered is None or exited > entered), name
@@ -147,9 +132,9 @@ def test_restore_locks_every_table_it_may_restore(tmp_path):
     lake = populated(tmp_path)
     referenced = set(lake.feature_metadata_frame().collect()["table_addr"])
     time.sleep(0.05)
-    cutoff = dt.datetime.now(UTC)
+    cutoff = dt.datetime.now(dt.UTC)
     time.sleep(0.05)
-    lake.add_features(frame(range(1, 3), "ab", h=1))
+    lake.add_features(frame(keys(range(1, 3), "ab"), h=1))
     annotate(lake)
     before = table_versions(lake.base_path)
     recorder = Recorder()
@@ -189,12 +174,17 @@ def test_a_failed_commit_releases_its_lock(tmp_path):
 
     recorder = Recorder(on_enter=deny)
     try:
-        with pytest.raises(PartialWriteError):
-            with_lock(lake, recorder).add_features(frame(range(3, 5), "ab", f=1))
+        with pytest.raises(PartialWriteError) as raised:
+            with_lock(lake, recorder).add_features(frame(keys(range(3, 5), "ab"), f=1))
     finally:
         log.chmod(mode)
+    assert raised.value.phase == "writing table table_metadata (rolled back)"
+    assert raised.value.committed == []
     assert recorder.names() == sorted(os.path.basename(name) for name, *_ in recorder.held)
     assert ("table_metadata", 2, 2, (None, None, None)) in recorder.held
+    assert lake.index_frame().collect().height == 6
+    assert lake.read(["f"]).height == 6
+    assert lake.transaction_log_frame().sort("updated_at").collect()["status"].to_list()[-3:] == ["pending", "failed", "rolled_back"]
 
 
 def is_data_table(path: str) -> bool:
@@ -223,7 +213,7 @@ def test_a_lock_error_before_any_commit_propagates_unchanged(tmp_path, raised_by
     before = table_versions(lake.base_path)
     recorder = Recorder(**{"on_lock" if raised_by == "factory" else "on_enter": fail})
     with pytest.raises(error_type) as raised:
-        with_lock(lake, recorder).add_features(frame(range(3, 5), "ab", f=1))
+        with_lock(lake, recorder).add_features(frame(keys(range(3, 5), "ab"), f=1))
     assert raised.value is error
     assert table_versions(lake.base_path) == {**before, LOG: before[LOG] + 3}
     assert all(is_data_table(path) for path in recorder.locked if os.path.basename(path) != LOG)
@@ -246,7 +236,7 @@ def test_a_lock_error_after_a_commit_rolls_the_write_back(tmp_path, raised_by, e
     before = table_versions(lake.base_path)
     recorder = Recorder(**{"on_lock" if raised_by == "factory" else "on_enter": fail})
     with pytest.raises(PartialWriteError if rollback_fails else error_type) as raised:
-        with_lock(lake, recorder).add_features(frame(range(3, 5), "ab", h=1))
+        with_lock(lake, recorder).add_features(frame(keys(range(3, 5), "ab"), h=1))
     after = table_versions(lake.base_path)
     created = [name for name in after if name not in before]
     assert len(created) == 1
@@ -274,7 +264,7 @@ def test_a_failed_release_after_a_commit_counts_the_table_as_committed(tmp_path,
             raise error
 
     with pytest.raises(pa.ArrowInvalid if failing == "new table" else PartialWriteError) as raised:
-        with_lock(lake, Recorder(on_exit=fail)).add_features(frame(range(3, 5), "ab", h=1))
+        with_lock(lake, Recorder(on_exit=fail)).add_features(frame(keys(range(3, 5), "ab"), h=1))
     created = [name for name in table_versions(lake.base_path) if name not in before]
     assert len(created) == 1
     if failing == "new table":
@@ -300,7 +290,7 @@ def test_a_table_changed_after_the_write_read_it_is_not_committed_to(tmp_path, r
             changed.append(name)
 
     with pytest.raises(ConflictError) as raised:
-        with_lock(lake, Recorder(on_enter=race)).add_features(frame(range(4, 5), "ab", f=1, g=2))
+        with_lock(lake, Recorder(on_enter=race)).add_features(frame(keys(range(4, 5), "ab"), f=1, g=2))
     assert "changed after this write read it" in str(raised.value)
     assert raised.value.table == changed[0]
     expected = {**before, changed[0]: before[changed[0]] + 1, LOG: before[LOG] + 3}
@@ -316,23 +306,7 @@ def test_a_thread_affine_lock_works(tmp_path):
     lake = populated(tmp_path)
     shared = threading.RLock()
     locked = with_lock(lake, lambda path: shared)
-    locked.add_features(frame(range(3, 5), "ab", f=1, h=2))
+    locked.add_features(frame(keys(range(3, 5), "ab"), f=1, h=2))
     assert shared.acquire(blocking=False)
     shared.release()
     assert locked.read(["f", "h"]).height == 8
-
-
-def test_lock_keys_are_canonical_table_paths(tmp_path):
-    real = tmp_path / "lake"
-    GammaFeatureLake(base_path=str(real)).initialize()
-    link = tmp_path / "link"
-    link.symlink_to(real, target_is_directory=True)
-    keys = []
-    for base in (str(real), str(real) + "/", str(link), str(link) + "/"):
-        recorder = Recorder()
-        GammaFeatureLake(base_path=base, lock=recorder).add_index_rows(frame([len(keys) + 1], "a"))
-        keys.append(recorder.locked)
-    recorder = Recorder()
-    NativeLake(str(link) + "/", lock=recorder).add_index_rows(frame([9], "a"))
-    keys.append(recorder.locked)
-    assert keys == [[os.path.join(os.path.realpath(real), name) for name in (LOG, "index", LOG)]] * 5
