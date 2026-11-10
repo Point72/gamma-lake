@@ -629,13 +629,6 @@ impl StoredTable for MemoryStored {
         // A commit that keeps a batch keeps its first column.
         let id = |b: &RecordBatch| Arc::as_ptr(b.column(0)) as *const () as usize;
         let ids = |v: &MemoryVersion| v.batches.iter().map(id).collect::<HashSet<_>>();
-        let same_columns = |a: &Schema, b: &Schema| {
-            a.fields().len() == b.fields().len()
-                && a.fields()
-                    .iter()
-                    .zip(b.fields())
-                    .all(|(a, b)| a.name() == b.name())
-        };
         // The batches the marked commits added and removed, and whether they changed the
         // schema and its columns.
         let mut added = HashSet::new();
@@ -660,7 +653,12 @@ impl StoredTable for MemoryStored {
                     }
                 }
                 reschemed |= v.schema != previous.schema;
-                recolumned |= !same_columns(&v.schema, &previous.schema);
+                recolumned |= v
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name())
+                    .ne(previous.schema.fields().iter().map(|field| field.name()));
             } else if added.iter().any(|k| !after.contains(k))
                 // Its rows may fill columns the marked commits added.
                 || (recolumned && after.iter().any(|k| !before.contains(k)))

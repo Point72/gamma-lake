@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from datetime import datetime
@@ -157,6 +158,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     def get_path(self, addr) -> str:
         """Convenience method to join a feature store's base path to a provided table address"""
         return os.path.join(self.base_path, addr)
+
+    def gen_table_addr(self) -> str:
+        """Generate a feature-table address."""
+        return f"{self.table_name_prefix}delta_{uuid.uuid4().hex[:8]}"
 
     @ensure_deltalake_is_initialized
     def annotate(self, annotations: pl.DataFrame) -> None:
@@ -355,12 +360,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             splitting the same period across calls. For backfills, write blocks of complete periods
             sized to fit memory. See the ``Best-Practices`` wiki page.
 
-        Transactions:
-            The write is recorded in the transaction log as ``pending``, then ``success``. If it fails
-            after committing part of itself, its commits, marked with its transaction id, are undone on
-            each table it committed to, keeping other writers' commits, and the write fails as one that
-            committed nothing does. It is not rolled back when an undo fails, as when another writer
-            rewrote rows it committed; see :class:`gammalake.native.NativeLake`.
         """
         annotated = [*(comments or {}), *(tags or {})]
         if unknown := sorted({name for name in annotated if name not in df.columns or name in self.sort_keys}):

@@ -35,6 +35,14 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
     # --- special cases ---
 
+    def test_gen_table_addr_uses_prefix(self, tmp_path):
+        lake = GammaFeatureLake(base_path=str(tmp_path), table_name_prefix="tables/")
+        first = lake.gen_table_addr()
+        second = lake.gen_table_addr()
+        assert first.startswith("tables/delta_")
+        assert len(first.removeprefix("tables/delta_")) == 8
+        assert first != second
+
     def test_feature_tables_limit_stats_to_sort_keys(self, fs):
         fs.add_features(generate_test_data(n_features=4, n_symbols=3, n_days=5))
         addr = fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "feature_0")["table_addr"][0]

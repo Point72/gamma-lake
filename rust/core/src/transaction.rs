@@ -361,13 +361,11 @@ mod tests {
         values.iter().map(|v| v.map(str::to_string)).collect()
     }
 
-    /// The status of each row of the log, in the order they were logged.
     fn statuses(lake: &Lake) -> Vec<String> {
         let log = collect(lake.transaction_log(&Dnf::default()).unwrap());
         strings(&log, "status").into_iter().flatten().collect()
     }
 
-    /// Values of `f`, in index order.
     fn values(lake: &Lake) -> Vec<f64> {
         let read = collect(lake.read(&["f"], &[], &Dnf::default()).unwrap());
         let f = read.column_by_name("f").unwrap();
@@ -476,7 +474,6 @@ mod tests {
         assert_eq!(statuses(&lake)[2..], ["pending", "failed"]);
     }
 
-    /// Sort key values of the index, in order.
     fn index_ts(lake: &Lake) -> Vec<i64> {
         let index = collect(lake.index(&Dnf::default()).unwrap());
         let ts = index.column_by_name("ts").unwrap();
@@ -491,12 +488,10 @@ mod tests {
         ts
     }
 
-    /// A row of the index with sort key `ts`.
     fn row(ts: i64) -> RecordBatch {
         frame(&[ts], 0.0).project(&[0, 1]).unwrap()
     }
 
-    /// Another writer's commit of a row to the index.
     #[derive(Clone, Copy)]
     enum Other {
         Append(i64),
@@ -513,8 +508,6 @@ mod tests {
         }
     }
 
-    /// Runs a transaction that appends 8 to the index and then fails, with another writer
-    /// committing `before` and `after` that append.
     fn fail_appending(lake: &Lake, before: Option<Other>, after: Option<Other>) -> Error {
         let path = &lake.options.index_path;
         let commits = Commits::default();

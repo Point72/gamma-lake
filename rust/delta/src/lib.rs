@@ -755,8 +755,12 @@ impl StoredTable for DeltaStored {
                 Ok::<_, Error>(table)
             }
         };
-        let base_table = load(base).await?;
-        let base_metadata = base_table.snapshot().map_err(delta_err)?.metadata().clone();
+        let base_metadata = load(base)
+            .await?
+            .snapshot()
+            .map_err(delta_err)?
+            .metadata()
+            .clone();
         // Log paths are already percent-decoded; key them as `object_store_path` does.
         let path = |p: &str| StorePath::parse(p).unwrap_or_else(|_| StorePath::from(p));
         // The files the marked commits added and removed, with the version that removed each,
