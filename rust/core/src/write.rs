@@ -14,19 +14,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, RecordBatch, StringArray, TimestampMicrosecondArray,
-    UInt32Array,
+    new_null_array, Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::compute::{cast, concat, concat_batches, take, take_record_batch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, Rows, SortField};
 use futures::future::join_all;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::admin::Annotation;
 use crate::error::{integrity, unsupported, Error, Result};
 use crate::joined::AsOfParams;
-use crate::lake::{feature_rows, latest, string_column, Lake, LakeOptions};
+use crate::lake::{feature_rows, latest, string_column, FeatureRow, Lake, LakeOptions};
 use crate::lock::write_lock;
 use crate::predicate::{lossless_cast, Dnf, Op, Term};
 use crate::runtime::block_on;
@@ -218,13 +218,6 @@ fn promote(stored: &DataType, incoming: &DataType) -> Option<DataType> {
             _ => Float64,
         },
     })
-}
-
-/// Whether `data_type` can be a sort key: a stored scalar that is not floating-point.
-fn key_type_ok(data_type: &DataType) -> bool {
-    !data_type.is_nested()
-        && !is_float(data_type)
-        && storage_type(data_type).as_ref() == Some(data_type)
 }
 
 fn is_float(data_type: &DataType) -> bool {
@@ -420,11 +413,6 @@ struct Index {
     missing: Vec<u32>,
 }
 
-/// Coverage of a dense table: the newest table metadata row.
-struct Coverage {
-    bound: Bound,
-}
-
 struct Planner<'a> {
     lake: &'a Lake,
     pk_converter: RowConverter,
@@ -433,14 +421,6 @@ struct Planner<'a> {
 }
 
 impl Planner<'_> {
-    fn sort_keys(&self) -> &[String] {
-        &self.lake.sort_keys
-    }
-
-    fn pk_name(&self) -> &str {
-        &self.lake.options.primary_sort_key
-    }
-
     /// Rows of `schema` from the input rows `input` (with the values of `features`) and the
     /// index rows `index` (keys only); every other column is null. Sorted by the keys.
     fn frame(
@@ -454,27 +434,41 @@ impl Planner<'_> {
         let input_rows = UInt32Array::from(input.to_vec());
         let index_rows = UInt32Array::from(index.to_vec());
         let len = input.len() + index.len();
+        let keys: HashSet<&str> = self.lake.sort_keys.iter().map(String::as_str).collect();
+        let features: HashSet<&str> = features.iter().map(String::as_str).collect();
         let mut columns: HashMap<&str, ArrayRef> = HashMap::new();
         for field in schema.fields() {
             let name = field.name().as_str();
-            let from_input = self
-                .sort_keys()
-                .iter()
-                .any(|k| k == name)
-                .then_some(true)
-                .or_else(|| features.iter().any(|f| f == name).then_some(false));
-            let Some(is_key) = from_input else { continue };
+            let is_key = keys.contains(name);
+            if !is_key && !features.contains(name) {
+                continue;
+            }
             let values = self.input.batch.column_by_name(name).expect("input column");
-            let head = cast_into(&take(values, &input_rows, None)?, field, table)?;
+            // Input rows are distinct and ascending, so all of them are in order.
+            let values = if input.len() == values.len() {
+                values.clone()
+            } else {
+                take(values, &input_rows, None)?
+            };
+            let head = cast_into(&values, field, table)?;
+            if index.is_empty() {
+                columns.insert(name, head);
+                continue;
+            }
             let tail = if is_key {
                 let keys = self.index.batch.column_by_name(name).expect("index key");
                 cast_into(&take(keys, &index_rows, None)?, field, table)?
             } else {
                 new_null_array(field.data_type(), index.len())
             };
-            columns.insert(name, concat(&[head.as_ref(), tail.as_ref()])?);
+            let column = if input.is_empty() {
+                tail
+            } else {
+                concat(&[head.as_ref(), tail.as_ref()])?
+            };
+            columns.insert(name, column);
         }
-        sort_by_keys(assemble(schema, columns, len, table)?, self.sort_keys())
+        sort_by_keys(assemble(schema, columns, len, table)?, &self.lake.sort_keys)
     }
 
     /// `rows` whose primary key satisfies `keep`.
@@ -485,22 +479,6 @@ impl Planner<'_> {
             .collect()
     }
 
-    fn bound(&self, value: ArrayRef, what: &str) -> Result<Bound> {
-        let pk_type = self
-            .lake
-            .index_schema
-            .field_with_name(self.pk_name())?
-            .data_type();
-        let value = lossless_cast(&value, pk_type).map_err(|why| integrity(what, why))?;
-        let row = self
-            .pk_converter
-            .convert_columns(std::slice::from_ref(&value))?;
-        Ok(Bound {
-            row: row.row(0).as_ref().to_vec(),
-            value,
-        })
-    }
-
     /// Rows of `table`, table `addr`, outside the primary key range `[min, max]`, in `schema`.
     async fn outside(
         &self,
@@ -508,9 +486,8 @@ impl Planner<'_> {
         addr: &str,
         schema: &SchemaRef,
     ) -> Result<RecordBatch> {
-        let pk = self.pk_name().to_string();
         let term = |op, bound: &Bound| Term {
-            column: pk.clone(),
+            column: self.lake.options.primary_sort_key.clone(),
             op,
             values: bound.value.clone(),
         };
@@ -584,7 +561,9 @@ impl Lake {
                     field.name()
                 )));
             }
-            if !key_type_ok(field.data_type()) {
+            if field.data_type().is_nested()
+                || storage_type(field.data_type()).as_ref() != Some(field.data_type())
+            {
                 return Err(unsupported(format!(
                     "index column {:?} has type {}, which the Rust core cannot store",
                     field.name(),
@@ -697,7 +676,7 @@ impl Lake {
                 }
             }
         }
-        self.write(input, Some(options))
+        self.write(input, options)
     }
 
     /// Adds keys to the index without features, as `GammaFeatureLake.add_index_rows` does.
@@ -718,41 +697,48 @@ impl Lake {
                 Ok(batch.project(&indices)?)
             })
             .collect::<Result<Vec<_>>>()?;
-        self.write(input, None)
+        self.write(input, &AddOptions::default())
     }
 
-    fn write(&self, input: Vec<RecordBatch>, options: Option<&AddOptions>) -> Result<()> {
+    fn write(&self, input: Vec<RecordBatch>, options: &AddOptions) -> Result<()> {
         let lock = write_lock(self.store.location());
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         // Plan (read and build every batch), commit, then annotate the committed versions, all as
-        // one logged transaction that undoes its commits if it fails. The trailing `?` unwraps
-        // block_on's own Result, returning the block's Result.
+        // one logged transaction that undoes its commits if it fails.
         block_on(async {
             let (actions, index, metadata) = self.plan(input, options).await?;
-            let defaults = AddOptions::default();
-            let logged = options.unwrap_or(&defaults);
             let commits = Commits::default();
             let body = async {
                 let committed = commit(self, actions, Some(index), metadata, &commits).await?;
-                // `Some(options) if ...` is a pattern with a guard; `_` covers None and empty
-                // annotations.
-                match options {
-                    Some(options) if !options.annotations.is_empty() => {
-                        let annotations = &options.annotations;
-                        self.annotate_locked(annotations, committed.clone(), &commits)
-                            .await?
-                    }
-                    _ => {}
+                if !options.annotations.is_empty() {
+                    self.annotate_locked(&options.annotations, committed.clone(), &commits)
+                        .await?
                 }
                 Ok(committed)
             };
-            let signal_type = logged.signal_type.as_str();
-            self.transaction(&logged.owner, signal_type, &commits, body)
+            self.transaction(&options.owner, options.signal_type.as_str(), &commits, body)
                 .await
         })?
     }
 
-    fn prepare(&self, input: Vec<RecordBatch>, pk_converter: &RowConverter) -> Result<Input> {
+    /// Table `name` and its rows that satisfy `dnf`, read through the handle later commits use.
+    async fn read_table(
+        &self,
+        name: &str,
+        dnf: &Dnf,
+    ) -> Result<(Box<dyn StoredTable>, RecordBatch)> {
+        let table = self.table(name).await?;
+        let scan = checked_scan(table.as_ref(), None, dnf, self.options.batch_size).await?;
+        let batch = concat_batches(&scan.schema, &scan.stream.try_collect::<Vec<_>>().await?)?;
+        Ok((table, batch))
+    }
+
+    fn prepare(
+        &self,
+        input: Vec<RecordBatch>,
+        key_converter: &RowConverter,
+        pk_converter: &RowConverter,
+    ) -> Result<Input> {
         let Some(first) = input.first() else {
             return Err(Error::InvalidArgument("the input has no rows".into()));
         };
@@ -798,13 +784,6 @@ impl Lake {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
 
         let nkeys = self.sort_keys.len();
-        let key_converter = RowConverter::new(
-            self.index_schema
-                .fields()
-                .iter()
-                .map(|f| SortField::new(f.data_type().clone()))
-                .collect(),
-        )?;
         let keys = key_converter.convert_columns(&batch.columns()[..nkeys])?;
         let mut kept = HashSet::new();
         let rows: Vec<u32> = (0..batch.num_rows())
@@ -851,16 +830,19 @@ impl Lake {
     async fn plan(
         &self,
         input: Vec<RecordBatch>,
-        options: Option<&AddOptions>,
+        options: &AddOptions,
     ) -> Result<(Vec<Action>, Action, Vec<Action>)> {
-        let pk_name = self.options.primary_sort_key.clone();
-        let pk_type = self
-            .index_schema
-            .field_with_name(&pk_name)?
-            .data_type()
-            .clone();
-        let pk_converter = RowConverter::new(vec![SortField::new(pk_type)])?;
-        let input = self.prepare(input, &pk_converter)?;
+        let pk_name = &self.options.primary_sort_key;
+        let pk_type = self.index_schema.field_with_name(pk_name)?.data_type();
+        let pk_converter = RowConverter::new(vec![SortField::new(pk_type.clone())])?;
+        let key_converter = RowConverter::new(
+            self.index_schema
+                .fields()
+                .iter()
+                .map(|f| SortField::new(f.data_type().clone()))
+                .collect(),
+        )?;
+        let input = self.prepare(input, &key_converter, &pk_converter)?;
         // Index rows up to the input maximum, and how they relate to the input keys.
         let dnf = Dnf(vec![vec![Term {
             column: pk_name.clone(),
@@ -869,16 +851,11 @@ impl Lake {
         }]]);
         // Each table is read and committed to through one handle, so a commit fails if another
         // writer committed to the table after this write read it.
-        let index_table = self.table(&self.options.index_path).await?;
-        let scan = checked_scan(index_table.as_ref(), None, &dnf, self.options.batch_size).await?;
-        let index_batch =
-            concat_batches(&scan.schema, &scan.stream.try_collect::<Vec<_>>().await?)?;
-        let key_converter = RowConverter::new(
-            self.index_schema
-                .fields()
-                .iter()
-                .map(|f| SortField::new(f.data_type().clone()))
-                .collect(),
+        let all = Dnf::default();
+        let ((index_table, index_batch), fm, tm) = futures::try_join!(
+            self.read_table(&self.options.index_path, &dnf),
+            self.read_table(&self.options.feature_metadata_path, &all),
+            self.read_table(&self.options.table_metadata_path, &all),
         )?;
         let index_keys = key_converter.convert_columns(index_batch.columns())?;
         let in_index: HashSet<_> = index_keys.iter().collect();
@@ -897,7 +874,7 @@ impl Lake {
             .filter(|&r| !in_input.contains(&index_keys.row(r)))
             .map(|r| r as u32)
             .collect();
-        let pk_index = self.index_schema.index_of(&pk_name)?;
+        let pk_index = self.index_schema.index_of(pk_name)?;
         let index_pk = pk_converter.convert_columns(&[index_batch.column(pk_index).clone()])?;
         let planner = Planner {
             lake: self,
@@ -910,21 +887,21 @@ impl Lake {
                 missing,
             },
         };
-        planner.plan(options, index_table).await
+        planner.plan(options, index_table, fm, tm).await
     }
 }
 
 impl Planner<'_> {
+    /// The actions of the write, given the index, feature metadata and table metadata tables
+    /// and their rows.
     async fn plan(
         self,
-        options: Option<&AddOptions>,
+        options: &AddOptions,
         index_table: Box<dyn StoredTable>,
+        (fm_table, fm): (Box<dyn StoredTable>, RecordBatch),
+        (tm_table, tm): (Box<dyn StoredTable>, RecordBatch),
     ) -> Result<(Vec<Action>, Action, Vec<Action>)> {
         let lake = self.lake;
-        let fm_table = lake.table(&lake.options.feature_metadata_path).await?;
-        let tm_table = lake.table(&lake.options.table_metadata_path).await?;
-        let fm = lake.read_all(fm_table.as_ref()).await?;
-        let tm = lake.read_all(tm_table.as_ref()).await?;
         let rows = feature_rows(&fm)?;
         let best = latest(&rows);
 
@@ -947,28 +924,30 @@ impl Planner<'_> {
             groups.entry(addr).or_default().push(name.clone());
         }
 
-        let signal_type = options.map(|o| o.signal_type).unwrap_or_default();
+        let signal_type = options.signal_type;
+        let pk_type = lake
+            .index_schema
+            .field_with_name(&lake.options.primary_sort_key)?
+            .data_type();
         if signal_type == SignalType::AsOf {
             // Reject parameters that every later read of these features would fail on.
-            let pk = lake
-                .index_schema
-                .field_with_name(&lake.options.primary_sort_key)?
-                .data_type();
             for name in &self.input.features {
-                let params = match options.and_then(|o| o.feature_params.as_deref()) {
-                    Some(p) => Some(p),
-                    None => best
-                        .get(name)
-                        .and_then(|&i| rows[i].feature_params.as_deref()),
-                };
-                AsOfParams::parse(params.unwrap_or("{}"))?.check(pk)?;
+                let params = options.feature_params.as_deref().or_else(|| {
+                    best.get(name)
+                        .and_then(|&i| rows[i].feature_params.as_deref())
+                });
+                AsOfParams::parse(params.unwrap_or("{}"))?.check(pk_type)?;
             }
         }
 
-        let mut coverage: BTreeMap<String, Coverage> = BTreeMap::new();
+        let mut coverage: BTreeMap<String, Bound> = BTreeMap::new();
         for (addr, last) in coverage_values(&tm)? {
-            let bound = self.bound(last, &addr)?;
-            coverage.insert(addr, Coverage { bound });
+            let value = lossless_cast(&last, pk_type).map_err(|why| integrity(&addr, why))?;
+            let row = self
+                .pk_converter
+                .convert_columns(std::slice::from_ref(&value))?;
+            let row = row.row(0).as_ref().to_vec();
+            coverage.insert(addr, Bound { value, row });
         }
 
         // Tables that ever held an as-of or sparse feature are never padded.
@@ -991,12 +970,19 @@ impl Planner<'_> {
         let mut actions = vec![];
         let mut tm_rows: Vec<(String, Bound)> = vec![];
         // (base feature metadata row, feature name, version, table address)
-        let mut fm_rows: Vec<(Option<usize>, String, i64, String)> = vec![];
-        let keys = self.sort_keys().to_vec();
+        let mut fm_rows: Vec<(Option<&FeatureRow>, String, i64, String)> = vec![];
+        let keys = &lake.sort_keys;
+        let index_schema = index_table.schema();
+        let opens: Vec<_> = groups.keys().flatten().map(|a| lake.table(a)).collect();
+        let mut opened = futures::stream::iter(opens)
+            .buffered(16)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter();
         for (addr, features) in &groups {
             let Some(addr) = addr else {
                 let addr = new_table_addr(&lake.options.table_name_prefix);
-                let schema = self.new_schema(features).await?;
+                let schema = self.new_schema(&index_schema, features)?;
                 // New as-of tables are padded with the missing index rows; sparse tables are not.
                 let missing = match signal_type {
                     SignalType::Sparse => &[][..],
@@ -1013,14 +999,17 @@ impl Planner<'_> {
                 }
                 continue;
             };
+            let table = opened.next().expect("a table per existing group");
             let covered = coverage
                 .get(addr)
                 .ok_or_else(|| integrity(addr, "the table has no table metadata row"))?;
-            let l = covered.bound.row.as_slice();
-            let table = lake.table(addr).await?;
+            let l = covered.row.as_slice();
             let schema = table.schema();
-            let newer = |a: &Bound, b: &Bound| if a.row >= b.row { a.clone() } else { b.clone() };
-            let coverage_after = newer(&covered.bound, max);
+            let coverage_after = if covered.row >= max.row {
+                covered.clone()
+            } else {
+                max.clone()
+            };
             if all_new || min.row.as_slice() > l {
                 // Padding keeps dense tables aligned; in an as-of table it would hide the
                 // carried-forward value, so all-new rows are appended alone.
@@ -1047,7 +1036,7 @@ impl Planner<'_> {
                 .max()
                 .unwrap_or(-1)
                 + 1;
-            let target = match options.map(|o| o.overlap_mode).unwrap_or_default() {
+            let target = match options.overlap_mode {
                 OverlapMode::Merge => {
                     let fields: Vec<Field> = keys
                         .iter()
@@ -1117,7 +1106,7 @@ impl Planner<'_> {
                         &[][..]
                     };
                     let fresh = self.frame(&copy_schema, features, &input_rows, window, addr)?;
-                    let batch = sort_by_keys(concat_batches(&copy_schema, [&old, &fresh])?, &keys)?;
+                    let batch = sort_by_keys(concat_batches(&copy_schema, [&old, &fresh])?, keys)?;
                     if frozen.num_rows() > 0 {
                         actions.push(Action::Append {
                             addr: addr.clone(),
@@ -1135,24 +1124,31 @@ impl Planner<'_> {
             };
             tm_rows.push((target.clone(), coverage_after));
             for f in features {
-                fm_rows.push((Some(rows[best[f]].row), f.clone(), version, target.clone()));
+                fm_rows.push((Some(&rows[best[f]]), f.clone(), version, target.clone()));
             }
         }
 
         // Pad other dense tables with the new keys they cover.
         let homes: HashSet<&str> = groups.keys().flatten().map(String::as_str).collect();
-        for (addr, covered) in &coverage {
-            if homes.contains(addr.as_str()) || unpadded.contains(addr.as_str()) {
-                continue;
-            }
-            let l = covered.bound.row.as_slice();
-            let pad = Self::select(&self.index.new, &self.input.pk, |pk| pk <= l);
-            if pad.is_empty() {
-                continue;
-            }
-            let table = lake.table(addr).await?;
-            let schema = table.schema();
-            let batch = self.frame(&schema, &[], &pad, &[], addr)?;
+        let pads: Vec<(&String, Vec<u32>)> = coverage
+            .iter()
+            .filter(|(addr, _)| !homes.contains(addr.as_str()) && !unpadded.contains(addr.as_str()))
+            .map(|(addr, covered)| {
+                let l = covered.row.as_slice();
+                (
+                    addr,
+                    Self::select(&self.index.new, &self.input.pk, |pk| pk <= l),
+                )
+            })
+            .filter(|(_, pad)| !pad.is_empty())
+            .collect();
+        let opens: Vec<_> = pads.iter().map(|(addr, _)| lake.table(addr)).collect();
+        let tables: Vec<_> = futures::stream::iter(opens)
+            .buffered(16)
+            .try_collect()
+            .await?;
+        for ((addr, pad), table) in pads.into_iter().zip(tables) {
+            let batch = self.frame(&table.schema(), &[], &pad, &[], addr)?;
             actions.push(Action::Append {
                 addr: addr.clone(),
                 table,
@@ -1160,7 +1156,6 @@ impl Planner<'_> {
             });
         }
 
-        let index_schema = index_table.schema();
         let index_batch = self.frame(
             &index_schema,
             &[],
@@ -1176,8 +1171,7 @@ impl Planner<'_> {
 
         let mut metadata = vec![];
         if !tm_rows.is_empty() {
-            let table = tm_table;
-            let schema = table.schema();
+            let schema = tm_table.schema();
             let n = tm_rows.len();
             let values: Vec<&dyn Array> = tm_rows.iter().map(|(_, b)| b.value.as_ref()).collect();
             let columns = HashMap::from([
@@ -1198,28 +1192,23 @@ impl Planner<'_> {
             let batch = assemble(&schema, columns, n, &lake.options.table_metadata_path)?;
             metadata.push(Action::Append {
                 addr: lake.options.table_metadata_path.clone(),
-                table,
+                table: tm_table,
                 batch,
             });
         }
         if !fm_rows.is_empty() {
-            let options = options.cloned().unwrap_or_default();
-            let table = fm_table;
-            let schema = table.schema();
+            let schema = fm_table.schema();
             let n = fm_rows.len();
-            let base = UInt32Array::from(
-                fm_rows
-                    .iter()
-                    .map(|(r, ..)| r.map(|r| r as u32))
-                    .collect::<Vec<_>>(),
-            );
-            let params = string_column(&fm, "feature_params").unwrap_or_default();
+            let base: UInt32Array = fm_rows
+                .iter()
+                .map(|(r, ..)| r.map(|r| r.row as u32))
+                .collect();
             let params = fm_rows
                 .iter()
                 .map(|(r, ..)| match (&options.feature_params, r) {
                     (Some(p), _) => Some(p.clone()),
                     (None, None) => Some("{}".to_string()),
-                    (None, Some(r)) => params.get(*r).cloned().flatten(),
+                    (None, Some(r)) => r.feature_params.clone(),
                 });
             let mut columns: HashMap<&str, ArrayRef> = HashMap::from([
                 (
@@ -1229,9 +1218,7 @@ impl Planner<'_> {
                 ),
                 (
                     "version",
-                    Arc::new(arrow::array::Int64Array::from_iter_values(
-                        fm_rows.iter().map(|r| r.2),
-                    )),
+                    Arc::new(Int64Array::from_iter_values(fm_rows.iter().map(|r| r.2))),
                 ),
                 (
                     "table_addr",
@@ -1263,19 +1250,18 @@ impl Planner<'_> {
             let batch = assemble(&schema, columns, n, &lake.options.feature_metadata_path)?;
             metadata.push(Action::Append {
                 addr: lake.options.feature_metadata_path.clone(),
-                table,
+                table: fm_table,
                 batch,
             });
         }
         Ok((actions, index, metadata))
     }
 
-    /// Schema of a new table: the index columns, then `features` as the input holds them.
-    async fn new_schema(&self, features: &[String]) -> Result<SchemaRef> {
-        let index = self.lake.table(&self.lake.options.index_path).await?;
-        let index = index.schema();
+    /// Schema of a new table: the `index` columns, then `features` as the input holds them.
+    fn new_schema(&self, index: &Schema, features: &[String]) -> Result<SchemaRef> {
         let mut fields: Vec<Field> = self
-            .sort_keys()
+            .lake
+            .sort_keys
             .iter()
             .map(|k| {
                 index
@@ -1360,7 +1346,7 @@ pub(crate) async fn commit(
     metadata: Vec<Action>,
     commits: &Commits,
 ) -> Result<Vec<String>> {
-    let run = |action: Action| async move {
+    let attempt = |action: Action| async move {
         let addr = action.addr().to_string();
         let result = run(action, lake.store.as_ref(), &lake.sort_keys, commits).await;
         (addr, result)
@@ -1368,7 +1354,7 @@ pub(crate) async fn commit(
     let mut committed = vec![];
     let mut failure = None;
     let mut only_conflicts = true;
-    for (addr, result) in join_all(actions.into_iter().map(run)).await {
+    for (addr, result) in join_all(actions.into_iter().map(attempt)).await {
         match result {
             Ok(()) => committed.push(addr),
             Err(e) => {
@@ -1388,7 +1374,7 @@ pub(crate) async fn commit(
         if failure.is_some() {
             break;
         }
-        let (addr, result) = run(action).await;
+        let (addr, result) = attempt(action).await;
         match result {
             Ok(()) => committed.push(addr),
             Err(e) => failure = Some((format!("writing table {addr}"), written(e, &mut committed))),
@@ -1448,7 +1434,10 @@ mod tests {
         lake.add(vec![frame(&[1, 2])], &AddOptions::default())
             .unwrap();
         block_on(async {
-            let (actions, index, metadata) = lake.plan(vec![frame(&[3])], None).await.unwrap();
+            let (actions, index, metadata) = lake
+                .plan(vec![frame(&[3])], &AddOptions::default())
+                .await
+                .unwrap();
             let raced = if feature {
                 actions[0].addr().to_string()
             } else {

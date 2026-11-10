@@ -12,7 +12,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{cast as cast_expr, Expr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{displayable, SendableRecordBatchStream};
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::{StreamExt, TryStreamExt};
 
@@ -283,16 +283,15 @@ struct ReadInputs {
 impl ReadInputs {
     /// Output columns as `(input, column)`; input 0 is the index.
     fn layout(&self) -> Vec<Source> {
-        let features = self.names.iter().map(|name| {
-            let (i, table) = self
-                .tables
-                .iter()
-                .enumerate()
-                .find(|(_, t)| t.names.contains(name))
-                .expect("every resolved name has a table");
-            let position = table.names.iter().position(|n| n == name).unwrap();
-            (i + 1, table.keys + position)
-        });
+        let mut sources: HashMap<&str, Source> = HashMap::new();
+        for (i, table) in self.tables.iter().enumerate() {
+            for (position, name) in table.names.iter().enumerate() {
+                sources
+                    .entry(name.as_str())
+                    .or_insert((i + 1, table.keys + position));
+            }
+        }
+        let features = self.names.iter().map(|name| sources[name.as_str()]);
         let keys = (0..self.index.schema().fields().len()).map(|k| (0, k));
         features.chain(keys).collect()
     }
@@ -338,40 +337,34 @@ impl Lake {
         if options.batch_size == 0 {
             return Err(Error::InvalidArgument("batch_size must be positive".into()));
         }
-        let mut lake = Self {
-            store,
-            options,
-            sort_keys: vec![],
-            index_schema: Arc::new(arrow::datatypes::Schema::empty()),
-        };
-        let index_schema = block_on(async {
-            let mut tables = Vec::with_capacity(3);
-            for name in [
-                &lake.options.index_path,
-                &lake.options.feature_metadata_path,
-                &lake.options.table_metadata_path,
-            ] {
-                let Some(table) = lake.store.open(name).await? else {
-                    return Err(Error::NotInitialized(lake.store.location().to_string()));
-                };
-                tables.push(table);
-            }
-            let index = &tables[0];
-            Ok::<_, Error>(index.schema())
+        let tables = block_on(async {
+            futures::try_join!(
+                store.open(&options.index_path),
+                store.open(&options.feature_metadata_path),
+                store.open(&options.table_metadata_path),
+            )
         })??;
-        lake.sort_keys = index_schema
+        let (Some(index), Some(_), Some(_)) = tables else {
+            return Err(Error::NotInitialized(store.location().to_string()));
+        };
+        let index_schema = index.schema();
+        let sort_keys: Vec<String> = index_schema
             .fields()
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        if !lake.sort_keys.contains(&lake.options.primary_sort_key) {
+        if !sort_keys.contains(&options.primary_sort_key) {
             return Err(Error::InvalidArgument(format!(
-                "primary sort key {:?} is not an index column {:?}",
-                lake.options.primary_sort_key, lake.sort_keys
+                "primary sort key {:?} is not an index column {sort_keys:?}",
+                options.primary_sort_key
             )));
         }
-        lake.index_schema = index_schema;
-        Ok(lake)
+        Ok(Self {
+            store,
+            options,
+            sort_keys,
+            index_schema,
+        })
     }
 
     /// Where the lake's tables are.
@@ -670,28 +663,6 @@ impl Lake {
         block_on(async { Ok::<_, Error>(self.table(name).await?.schema()) })?
     }
 
-    /// The physical plans of [`Lake::read`]'s inputs, for tests and diagnostics. Not a
-    /// stable format.
-    #[doc(hidden)]
-    pub fn read_plan(&self, features: &[&str], targets: &[&str], dnf: &Dnf) -> Result<String> {
-        block_on(async {
-            let plan = self
-                .read_inputs(Selection::Latest { features, targets }, dnf)
-                .await?;
-            let mut text = String::new();
-            let inputs = std::iter::once(("index".to_string(), plan.index))
-                .chain(plan.tables.into_iter().map(|t| (t.addr, t.frame)));
-            for (name, frame) in inputs {
-                let physical = frame.create_physical_plan().await?;
-                text.push_str(&format!(
-                    "-- {name}\n{}",
-                    displayable(physical.as_ref()).indent(true)
-                ));
-            }
-            Ok(text)
-        })?
-    }
-
     /// Errors unless as-of and sparse tables can be matched on the other sort keys. Floats
     /// are not: Polars treats `-0.0` and `0.0` as one key, and these lookups would not.
     fn check_join_keys(&self) -> Result<()> {
@@ -721,7 +692,10 @@ impl Lake {
             )));
         }
         let ctx = self.context()?;
-        let selected = self.select(&ctx, selection).await?;
+        let (selected, index_table) = futures::try_join!(
+            self.select(&ctx, selection),
+            self.table(&self.options.index_path)
+        )?;
 
         // Features at one address are read together, the way the first of them is read.
         let pk_type = self
@@ -753,20 +727,23 @@ impl Lake {
             .iter()
             .map(|k| column(INDEX, k))
             .collect::<Vec<_>>();
-        let index_table = Arc::<dyn StoredTable>::from(self.table(&self.options.index_path).await?);
-        let index = scan_frame(&ctx, index_table, dnf)?;
-        let index = index.alias(INDEX)?.select(keys)?;
-        let index = normalize(index)?;
+        let index = scan_frame(&ctx, Arc::from(index_table), dnf)?;
+        let index = normalize(index.alias(INDEX)?.select(keys)?)?;
 
+        let opens: Vec<_> = groups.iter().map(|(addr, _, _)| self.table(addr)).collect();
+        let opened: Vec<Box<dyn StoredTable>> = futures::stream::iter(opens)
+            .buffered(16)
+            .try_collect()
+            .await?;
         let mut tables = vec![];
         let key_names = self
             .sort_keys
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        for (addr, join, names) in groups {
+        for ((addr, join, names), table) in groups.into_iter().zip(opened) {
             let relation = "t";
-            let table = Arc::<dyn StoredTable>::from(self.table(addr).await?);
+            let table = Arc::<dyn StoredTable>::from(table);
             if let Some(missing) = names
                 .iter()
                 .chain(key_names.iter())
@@ -783,33 +760,26 @@ impl Lake {
                 let frame = scan_frame(&ctx, table.clone(), dnf)?.alias(relation)?;
                 normalize(frame.select(projection)?)
             };
-            if let Some(join) = join {
-                let dnf = match &join {
-                    Join::AsOf(params) => {
-                        table_predicate(dnf, self.primary_sort_key(), params.strategy)
-                    }
-                    Join::Sparse => dnf.clone(),
-                };
-                tables.push(TableInput {
-                    addr: addr.to_string(),
-                    frame: scan(&names, &dnf)?,
-                    keys: 0,
-                    names: names.iter().map(|n| n.to_string()).collect(),
-                    join: Some(join),
-                });
-                continue;
-            }
+            let frame = match &join {
+                Some(Join::AsOf(params)) => scan(
+                    &names,
+                    &table_predicate(dnf, self.primary_sort_key(), params.strategy),
+                )?,
+                _ => scan(&names, dnf)?,
+            };
+            // Joined tables carry no keys; without validation, aligned tables only need them
+            // for sorting.
+            let keys = if join.is_none() && self.options.validate {
+                self.sort_keys.len()
+            } else {
+                0
+            };
             tables.push(TableInput {
                 addr: addr.to_string(),
-                frame: scan(&names, dnf)?,
-                // Without validation the keys are only needed for sorting.
-                keys: if self.options.validate {
-                    self.sort_keys.len()
-                } else {
-                    0
-                },
+                frame,
+                keys,
                 names: names.iter().map(|n| n.to_string()).collect(),
-                join: None,
+                join,
             });
         }
         Ok(ReadInputs {
@@ -860,12 +830,13 @@ impl Lake {
                 if !misregistered.is_empty() {
                     return Err(Error::MisregisteredTargets(misregistered));
                 }
-                let mut requested: Vec<&str> = vec![];
-                for name in features.iter().chain(targets) {
-                    if !requested.contains(name) {
-                        requested.push(name);
-                    }
-                }
+                let mut seen = HashSet::new();
+                let requested: Vec<&str> = features
+                    .iter()
+                    .chain(targets)
+                    .copied()
+                    .filter(|n| seen.insert(*n))
+                    .collect();
                 let best = latest(&rows);
                 let resolved: Vec<&FeatureRow> = requested
                     .iter()
@@ -880,14 +851,17 @@ impl Lake {
             }
             Selection::Versions(pairs) => {
                 unique(pairs.iter().map(|(n, _)| *n).collect())?;
+                let mut versions: HashMap<(&str, i64), &FeatureRow> = HashMap::new();
+                for row in &rows {
+                    if let Some(version) = row.version {
+                        versions.entry((row.name.as_str(), version)).or_insert(row);
+                    }
+                }
                 let mut missing = vec![];
                 let mut resolved = vec![];
                 for &(name, version) in pairs {
-                    match rows
-                        .iter()
-                        .find(|r| r.name == name && r.version == Some(version))
-                    {
-                        Some(row) => resolved.push(row),
+                    match versions.get(&(name, version)) {
+                        Some(&row) => resolved.push(row),
                         None => missing.push(format!("{name} version {version}")),
                     }
                 }
