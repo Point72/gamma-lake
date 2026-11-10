@@ -20,7 +20,7 @@ use deltalake::datafusion::logical_expr::{cast as cast_expr, Expr};
 use deltalake::datafusion::prelude::{DataFrame, SessionContext};
 use deltalake::delta_datafusion::{DeltaColumn, DeltaSessionContext};
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties, TransactionError};
-use deltalake::kernel::{Action, Metadata, MetadataValue};
+use deltalake::kernel::{Action, Metadata, MetadataExt, MetadataValue, StructField, StructType};
 use deltalake::logstore::get_actions;
 use deltalake::logstore::object_store::ObjectStoreExt;
 use deltalake::parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
@@ -518,6 +518,46 @@ impl DeltaStored {
     fn committing(&self) -> CommitProperties {
         strict(self.tag.as_deref().map(|tag| (TAG, tag)))
     }
+
+    /// Upserts the metadata of each `(column, metadata)` of `updates` into its column's, in one
+    /// commit, as delta-rs's `update_field_metadata` does for one column.
+    async fn commit_metadata(&self, updates: Vec<(String, HashMap<String, String>)>) -> Result<()> {
+        let name = &self.name;
+        let snapshot = self.table.snapshot().map_err(delta_err)?;
+        let mut fields: Vec<StructField> = snapshot.schema().fields().cloned().collect();
+        for (column, metadata) in updates {
+            let field = fields
+                .iter_mut()
+                .find(|f| f.name == column)
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!("table {name} has no column {column:?}"))
+                })?;
+            for (key, value) in metadata {
+                if key.starts_with("delta.") {
+                    return Err(delta_err(DeltaTableError::Generic(
+                        "Not allowed to modify protected metadata e.g. `delta.columnMapping.id`"
+                            .into(),
+                    )));
+                }
+                field.metadata.insert(key, MetadataValue::String(value));
+            }
+        }
+        let schema = StructType::try_new(fields).map_err(|e| delta_err(e.into()))?;
+        let metadata = snapshot
+            .metadata()
+            .clone()
+            .with_schema(&schema)
+            .map_err(|e| delta_err(e.into()))?;
+        let operation = DeltaOperation::UpdateFieldMetadata {
+            fields: schema.fields().cloned().collect(),
+        };
+        CommitBuilder::from(self.committing())
+            .with_actions(vec![Action::Metadata(metadata)])
+            .build(Some(snapshot), self.table.log_store(), operation)
+            .await
+            .map_err(|e| commit_err(name, e.into()))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -652,13 +692,20 @@ impl StoredTable for DeltaStored {
             .snapshot()
             .arrow_schema();
         Ok(Box::new(DeltaStored {
-            name: self.name,
             table,
             schema,
-            properties: self.properties,
-            target_file_size: self.target_file_size,
-            tag: self.tag,
+            ..*self
         }))
+    }
+
+    async fn set_columns_metadata(
+        self: Box<Self>,
+        updates: Vec<(String, HashMap<String, String>)>,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.commit_metadata(updates).await
     }
 
     async fn restore(self: Box<Self>, at: i64) -> Result<bool> {
@@ -1010,14 +1057,24 @@ mod tests {
                 .merge(batch(&[0, 3], 1), &keys, &update)
                 .await
                 .unwrap();
+            // Annotating several columns is one commit.
             let annotating = tagged("b").await;
-            let metadata = HashMap::from([("unit".to_string(), "s".to_string())]);
-            annotating.set_column_metadata("v", metadata).await.unwrap();
+            let before = annotating.version();
+            let unit = |u: &str| HashMap::from([("unit".to_string(), u.to_string())]);
+            let updates = vec![("k".to_string(), unit("n")), ("v".to_string(), unit("s"))];
+            annotating.set_columns_metadata(updates).await.unwrap();
+            let annotated = open().await;
+            assert_eq!(annotated.version(), before.map(|v| v + 1));
+            assert_eq!(annotated.schema().field(1).metadata()["unit"], "s");
             open().await.append(batch(&[4], 0)).await.unwrap();
             assert!(open().await.revert("b", 2).await.unwrap());
             assert_eq!(rows().await, [(0, 0), (2, 0), (4, 0)]);
             let reverted = open().await;
-            assert!(reverted.schema().field(1).metadata().is_empty());
+            assert!(reverted
+                .schema()
+                .fields()
+                .iter()
+                .all(|f| f.metadata().is_empty()));
 
             // Another writer rewrote the write's rows, so it cannot be undone alone.
             let read = reverted.version().unwrap();

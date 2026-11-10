@@ -228,6 +228,16 @@ impl StoredTable for LockingTable {
         Ok(store.wrap(&name, table))
     }
 
+    async fn set_columns_metadata(
+        self: Box<Self>,
+        updates: Vec<(String, HashMap<String, String>)>,
+    ) -> Result<()> {
+        let Self { store, name, table } = *self;
+        store
+            .commit(&name, table.set_columns_metadata(updates))
+            .await
+    }
+
     async fn restore(self: Box<Self>, at: i64) -> Result<bool> {
         let Self { store, name, table } = *self;
         store.commit(&name, table.restore(at)).await

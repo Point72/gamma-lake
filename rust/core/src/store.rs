@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::array::{new_null_array, ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::{cast, concat_batches, interleave, take};
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::row::{RowConverter, SortField};
 use async_trait::async_trait;
 use futures::Stream;
@@ -115,6 +115,24 @@ pub trait StoredTable: Send + Sync {
         column: &str,
         metadata: HashMap<String, String>,
     ) -> Result<Box<dyn StoredTable>>;
+
+    /// Sets the `metadata` keys of each `(column, metadata)` of `updates` as
+    /// [`StoredTable::set_column_metadata`] does. Stores that can should do it in one commit;
+    /// this default commits once per column.
+    async fn set_columns_metadata(
+        self: Box<Self>,
+        updates: Vec<(String, HashMap<String, String>)>,
+    ) -> Result<()> {
+        let mut updates = updates.into_iter();
+        let Some((column, metadata)) = updates.next() else {
+            return Ok(());
+        };
+        let mut table = self.set_column_metadata(&column, metadata).await?;
+        for (column, metadata) in updates {
+            table = table.set_column_metadata(&column, metadata).await?;
+        }
+        Ok(())
+    }
 
     /// Makes the latest version a copy of the newest version committed at or before `at`,
     /// in microseconds since the Unix epoch. Does nothing and returns `false` when that is
@@ -416,6 +434,50 @@ struct MemoryStored {
     tag: Option<String>,
 }
 
+impl MemoryStored {
+    /// Merges the metadata of each `(column, metadata)` of `updates` into the column's, in one
+    /// commit.
+    fn commit_metadata(
+        &self,
+        updates: Vec<(String, HashMap<String, String>)>,
+    ) -> Result<Arc<MemoryVersion>> {
+        let name = &self.name;
+        self.store
+            .commit(name, &self.version, self.tag.as_deref(), |latest| {
+                if let Some((column, _)) = updates
+                    .iter()
+                    .find(|(c, _)| latest.schema.field_with_name(c).is_err())
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "table {name} has no column {column:?}"
+                    )));
+                }
+                let mut fields: Vec<Field> = latest
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                for (column, metadata) in updates {
+                    if let Some(f) = fields.iter_mut().find(|f| *f.name() == column) {
+                        f.metadata_mut().extend(metadata);
+                    }
+                }
+                // Keep the table-level metadata; rebuild every batch onto the new schema.
+                let schema = Arc::new(Schema::new_with_metadata(
+                    fields,
+                    latest.schema.metadata().clone(),
+                ));
+                let batches = latest
+                    .batches
+                    .iter()
+                    .map(|b| conform(&schema, b.clone(), name))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((schema, batches))
+            })
+    }
+}
+
 #[async_trait]
 impl StoredTable for MemoryStored {
     fn schema(&self) -> SchemaRef {
@@ -540,46 +602,18 @@ impl StoredTable for MemoryStored {
         column: &str,
         metadata: HashMap<String, String>,
     ) -> Result<Box<dyn StoredTable>> {
-        let name = self.name.clone();
-        let version = self
-            .store
-            .commit(&name, &self.version, self.tag.as_deref(), |latest| {
-                // Copy each field, merging `metadata` into the matching column's existing map.
-                let fields = latest
-                    .schema
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        let mut f = f.as_ref().clone();
-                        if f.name() == column {
-                            f.metadata_mut().extend(metadata.clone());
-                        }
-                        f
-                    })
-                    .collect::<Vec<_>>();
-                if latest.schema.field_with_name(column).is_err() {
-                    return Err(Error::InvalidArgument(format!(
-                        "table {name} has no column {column:?}"
-                    )));
-                }
-                // Keep the table-level metadata; rebuild every batch onto the new schema.
-                let schema = Arc::new(Schema::new_with_metadata(
-                    fields,
-                    latest.schema.metadata().clone(),
-                ));
-                let batches = latest
-                    .batches
-                    .iter()
-                    .map(|b| conform(&schema, b.clone(), &name))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((schema, batches))
-            })?;
-        Ok(Box::new(MemoryStored {
-            store: self.store,
-            name,
-            version,
-            tag: self.tag,
-        }))
+        let version = self.commit_metadata(vec![(column.to_string(), metadata)])?;
+        Ok(Box::new(MemoryStored { version, ..*self }))
+    }
+
+    async fn set_columns_metadata(
+        self: Box<Self>,
+        updates: Vec<(String, HashMap<String, String>)>,
+    ) -> Result<()> {
+        if !updates.is_empty() {
+            self.commit_metadata(updates)?;
+        }
+        Ok(())
     }
 
     async fn restore(self: Box<Self>, at: i64) -> Result<bool> {

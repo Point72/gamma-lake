@@ -11,6 +11,8 @@ use arrow::compute::{cast, take_record_batch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatchReader;
 use arrow::row::{RowConverter, SortField};
+use futures::future::join_all;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::error::{after, integrity, Error, Result};
 use crate::lake::{feature_rows, latest, FeatureRow, Lake, SelectedFeature};
@@ -22,9 +24,6 @@ use crate::write::{
     assemble, cast_into, commit, coverage_values, new_table_addr, Action, Commits, SignalType,
     RUNTIME_COMPUTED,
 };
-
-/// A column of a table and the metadata keys to set on it.
-type ColumnUpdate = (String, HashMap<String, String>);
 
 const COMMENT: &str = "comment";
 const TAGS: &str = "tags";
@@ -76,8 +75,8 @@ impl Lake {
     /// Sets comments and tags of feature versions, as `GammaFeatureLake.annotate` does.
     ///
     /// Annotations without a comment or tags are skipped. Every annotation is checked before
-    /// the first one is stored; a later failure is an [`Error::Write`]. Each annotated column
-    /// is one commit to its table, and annotations of one column are applied in order.
+    /// the first one is stored; a later failure is an [`Error::Write`]. Each annotated table
+    /// gets one commit, and annotations of one column are applied in order.
     pub fn annotate(&self, annotations: &[Annotation]) -> Result<()> {
         let lock = write_lock(self.store.location());
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -106,7 +105,7 @@ impl Lake {
             let best = latest(&rows);
             let mut missing = vec![];
             // Updates per table and column, in first-appearance order.
-            let mut tables: Vec<(String, Vec<ColumnUpdate>)> = vec![];
+            let mut tables: Vec<(String, Vec<(String, HashMap<String, String>)>)> = vec![];
             for a in &annotations {
                 let name = &a.feature_name;
                 let addr = match &a.table_addr {
@@ -158,9 +157,12 @@ impl Lake {
             if !missing.is_empty() {
                 return Err(Error::MissingFeatures(missing));
             }
-            let mut opened = vec![];
-            for (addr, columns) in tables {
-                let table = self.table(&addr).await?;
+            let opens: Vec<_> = tables.iter().map(|(addr, _)| self.table(addr)).collect();
+            let opened: Vec<_> = futures::stream::iter(opens)
+                .buffered(16)
+                .try_collect()
+                .await?;
+            for ((addr, columns), table) in tables.iter().zip(&opened) {
                 let schema = table.schema();
                 if let Some((column, _)) = columns
                     .iter()
@@ -170,33 +172,33 @@ impl Lake {
                         "table {addr} has no column {column:?}"
                     )));
                 }
-                opened.push((addr, table, columns));
             }
-            Ok(opened)
+            Ok(tables.into_iter().zip(opened))
         };
         let opened = plan
             .await
             .map_err(|e| after(phase.clone(), committed.clone(), e))?;
+        let annotate = |((addr, columns), table): ((String, _), Box<dyn StoredTable>)| async move {
+            let table = commits.tagged(table);
+            let read = table.version();
+            let result = table.set_columns_metadata(columns).await;
+            let result = commits.count(&addr, read, result);
+            (addr, result)
+        };
         let mut committed = committed;
-        // table version (`next`), which the following commit must build on. Every
-        // commit is tagged with the write's transaction id.
-        for (addr, table, columns) in opened {
-            let mut table = commits.tagged(table);
-            for (column, metadata) in columns {
-                let read = table.version();
-                let result = table.set_column_metadata(&column, metadata).await;
-                match commits.count(&addr, read, result) {
-                    Ok(next) => table = next,
-                    Err(e) => {
-                        return Err(after(format!("annotating table {addr}"), committed, e));
-                    }
-                }
-                if committed.last() != Some(&addr) {
-                    committed.push(addr.clone());
+        let mut failure = None;
+        for (addr, result) in join_all(opened.map(annotate)).await {
+            match result {
+                Ok(()) => committed.push(addr),
+                Err(e) => {
+                    failure.get_or_insert((addr, e));
                 }
             }
         }
-        Ok(())
+        match failure {
+            None => Ok(()),
+            Some((addr, e)) => Err(after(format!("annotating table {addr}"), committed, e)),
+        }
     }
 
     /// The comment and tags of each `(feature_name, table_addr)`, one row per pair in order,
