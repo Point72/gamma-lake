@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::lake::{feature_rows, Lake};
 use crate::lock::write_lock;
 use crate::runtime::block_on;
-use crate::write::assemble;
+use crate::write::{assemble, RUNTIME_COMPUTED};
 
 /// A feature computed at read time from other features.
 ///
@@ -61,7 +61,7 @@ impl Lake {
             ),
             ("table_addr", strings(vec!["n/a"; n])),
             ("owner", strings(vec![owner; n])),
-            ("signal_type", strings(vec!["runtime_computed"; n])),
+            ("signal_type", strings(vec![RUNTIME_COMPUTED; n])),
             (
                 "feature_params",
                 strings(expressions.iter().map(|e| e.expression.as_str()).collect()),

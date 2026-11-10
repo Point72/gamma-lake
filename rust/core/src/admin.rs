@@ -18,14 +18,16 @@ use crate::lock::write_lock;
 use crate::predicate::{Dnf, Op, Term};
 use crate::runtime::block_on;
 use crate::store::{now_micros, StoredTable};
-use crate::write::{assemble, cast_into, commit, coverage_values, new_table_addr, Action, Commits};
+use crate::write::{
+    assemble, cast_into, commit, coverage_values, new_table_addr, Action, Commits, SignalType,
+    RUNTIME_COMPUTED,
+};
 
 /// A column of a table and the metadata keys to set on it.
 type ColumnUpdate = (String, HashMap<String, String>);
 
 const COMMENT: &str = "comment";
 const TAGS: &str = "tags";
-const CONSOLIDATABLE_SIGNAL_TYPES: [&str; 2] = ["feature", "target"];
 
 /// A comment and tags for one version of a feature.
 ///
@@ -64,7 +66,7 @@ fn tags_field() -> Field {
 /// Whether `row` describes a feature stored in a table: not runtime-computed, with an address.
 fn stored(row: &FeatureRow) -> Option<&str> {
     match (&row.table_addr, row.signal_type.as_deref()) {
-        (_, Some("runtime_computed")) => None,
+        (_, Some(RUNTIME_COMPUTED)) => None,
         (Some(addr), _) if addr != "n/a" => Some(addr),
         _ => None,
     }
@@ -515,7 +517,7 @@ impl Lake {
         let bad: Vec<(String, String)> = chosen
             .iter()
             .map(|r| (r.name.clone(), r.signal_type.clone().unwrap_or_default()))
-            .filter(|(_, t)| !CONSOLIDATABLE_SIGNAL_TYPES.contains(&t.as_str()))
+            .filter(|(_, t)| !SignalType::parse(t).is_some_and(|t| t.dense()))
             .collect();
         if !bad.is_empty() {
             return Err(Error::InvalidArgument(format!(

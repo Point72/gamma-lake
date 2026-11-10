@@ -27,9 +27,8 @@ use crate::sort::{blocking, sorted_streams, spilling_sorted_streams};
 use crate::store::{StoredTable, TableStore};
 use crate::stream::{AsyncBatchStream, BatchStream};
 use crate::transaction;
+use crate::write::SignalType;
 
-pub(crate) const READABLE_SIGNAL_TYPES: [&str; 4] =
-    ["feature", "target", "as_of_feature", "sparse_feature"];
 const INDEX: &str = "idx";
 
 /// Options for [`Lake::open_with_store`]. The defaults match `GammaFeatureLake`.
@@ -155,9 +154,9 @@ enum Join {
 impl Join {
     /// How `feature`'s table is read: `None` for by position.
     fn of(feature: &SelectedFeature) -> Result<Option<Self>> {
-        Ok(match feature.signal_type.as_str() {
-            "feature" | "target" => None,
-            "as_of_feature" => match &feature.feature_params {
+        Ok(match SignalType::parse(&feature.signal_type) {
+            Some(SignalType::Feature | SignalType::Target) => None,
+            Some(SignalType::AsOf) => match &feature.feature_params {
                 Some(params) => Some(Join::AsOf(AsOfParams::parse(params)?)),
                 None => {
                     return Err(Error::InvalidArgument(format!(
@@ -166,11 +165,11 @@ impl Join {
                     )))
                 }
             },
-            "sparse_feature" => Some(Join::Sparse),
-            other => {
+            Some(SignalType::Sparse) => Some(Join::Sparse),
+            None => {
                 return Err(Error::Unsupported {
                     feature: feature.name.clone(),
-                    signal_type: other.to_string(),
+                    signal_type: feature.signal_type.clone(),
                 })
             }
         })
@@ -850,7 +849,7 @@ impl Lake {
             Selection::Latest { features, targets } => {
                 let registered: HashSet<&str> = rows
                     .iter()
-                    .filter(|r| r.signal_type.as_deref() == Some("target"))
+                    .filter(|r| r.signal_type.as_deref() == Some(SignalType::Target.as_str()))
                     .map(|r| r.name.as_str())
                     .collect();
                 let misregistered: Vec<String> = targets

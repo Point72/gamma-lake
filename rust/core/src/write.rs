@@ -33,9 +33,6 @@ use crate::runtime::block_on;
 use crate::scan::checked_scan;
 use crate::store::{now_micros, CreateOptions, StoredTable, TableStore};
 
-/// Signal types whose tables never receive padding rows.
-const UNPADDED_SIGNAL_TYPES: [&str; 2] = ["as_of_feature", "sparse_feature"];
-
 /// Signal type of written columns.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SignalType {
@@ -48,7 +45,17 @@ pub enum SignalType {
     Sparse,
 }
 
+/// The stored `signal_type` of runtime-computed features, which have no table.
+pub(crate) const RUNTIME_COMPUTED: &str = "runtime_computed";
+
 impl SignalType {
+    /// The signal type a stored `signal_type` names, or `None` for one the core cannot read.
+    pub(crate) fn parse(stored: &str) -> Option<Self> {
+        [Self::Feature, Self::Target, Self::AsOf, Self::Sparse]
+            .into_iter()
+            .find(|t| t.as_str() == stored)
+    }
+
     /// The `signal_type` stored in the feature metadata.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -60,7 +67,7 @@ impl SignalType {
     }
 
     /// Whether tables of this type are read by position and so are padded to the index.
-    fn dense(&self) -> bool {
+    pub(crate) fn dense(&self) -> bool {
         matches!(self, SignalType::Feature | SignalType::Target)
     }
 }
@@ -928,7 +935,7 @@ impl Planner<'_> {
                 None => None,
                 Some(row) => {
                     let signal_type = row.signal_type.as_deref().unwrap_or_default();
-                    if !crate::lake::READABLE_SIGNAL_TYPES.contains(&signal_type) {
+                    if SignalType::parse(signal_type).is_none() {
                         return Err(Error::Unsupported {
                             feature: name.clone(),
                             signal_type: signal_type.to_string(),
@@ -972,7 +979,8 @@ impl Planner<'_> {
             .zip(&fm_addrs)
             .filter(|(t, _)| {
                 t.as_deref()
-                    .is_some_and(|t| UNPADDED_SIGNAL_TYPES.contains(&t))
+                    .and_then(SignalType::parse)
+                    .is_some_and(|t| !t.dense())
             })
             .filter_map(|(_, a)| a.as_deref())
             .collect();
