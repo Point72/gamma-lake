@@ -33,8 +33,7 @@ from gammalake.abstract import MissingFeaturesException, MissingOrMisregisteredS
 
 __all__ = ("ConflictError", "DeltaOptions", "NativeLake", "PartialWriteError", "UnsupportedError")
 
-_OPS = {"=": 0, "==": 0, "!=": 1, "<": 2, "<=": 3, ">": 4, ">=": 5, "in": 6, "not in": 7}
-_IS_NULL, _IS_NOT_NULL, _IN = 8, 9, 6
+_OPS = {"=": "==", "==": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=", "in": "in", "not in": "not_in"}
 _COMPRESSIONS = ("uncompressed", "snappy", "gzip", "brotli", "lz4", "lz4_raw", "zstd")
 
 
@@ -130,7 +129,7 @@ def _encode(column: str, dtype: pl.DataType, values: Sequence[Any]) -> pa.Array:
     return series.to_arrow()
 
 
-Term = tuple[str, int, "pa.Array | None"]
+Term = tuple[str, str, pa.Array | None]
 
 
 def _terms(filters, schema: pl.Schema) -> list[list[Term]]:
@@ -146,9 +145,9 @@ def _terms(filters, schema: pl.Schema) -> list[list[Term]]:
                 raise ValueError(f"unknown filter column {column!r}; expected one of {list(schema)}")
             op = op.lower() if isinstance(op, str) else op
             if value is None and op in ("=", "==", "is"):
-                terms.append((column, _IS_NULL, None))
+                terms.append((column, "is_null", None))
             elif value is None and op in ("!=", "is not"):
-                terms.append((column, _IS_NOT_NULL, None))
+                terms.append((column, "is_not_null", None))
             elif op in ("in", "not in"):
                 terms.append((column, _OPS[op], _encode(column, schema[column], list(value))))
             elif op in _OPS:
@@ -187,7 +186,7 @@ def _pushdown(predicate: pl.Expr | None, schema: pl.Schema, columns: Iterable[st
 
 def _pushed_term(column: str, op: str, value: Any, dtype: pl.DataType) -> Term | None:
     if value is None and op in ("is", "is not"):
-        return (column, _IS_NULL if op == "is" else _IS_NOT_NULL, None)
+        return (column, "is_null" if op == "is" else "is_not_null", None)
     if op not in _PUSHED_OPS:
         return None
     try:

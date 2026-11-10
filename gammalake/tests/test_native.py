@@ -125,11 +125,11 @@ def test_dropped_streams_are_released(lake_path):
 def test_predicate_import_errors(lake_path):
     lake = native.Lake(lake_path)
     with pytest.raises(TypeError, match="__arrow_c_array__"):
-        lake.read(["f1"], None, [[("symbol", 0, ["A"])]])
+        lake.read(["f1"], None, [[("symbol", "==", ["A"])]])
     with pytest.raises(ValueError):
-        lake.read(["f1"], None, [[("symbol", 99, pa.array(["A"]))]])
+        lake.read(["f1"], None, [[("symbol", "~", pa.array(["A"]))]])
     with pytest.raises(ValueError):
-        lake.read(["f1"], None, [[("f1", 0, pa.array([1.0]))]])
+        lake.read(["f1"], None, [[("f1", "==", pa.array([1.0]))]])
 
 
 def test_reads_release_the_gil(lake_path):
@@ -438,13 +438,13 @@ def spied(lake: NativeLake) -> Spy:
     return lake._lake
 
 
-def pushed(spy: Spy) -> list[list[tuple[str, int]]]:
+def pushed(spy: Spy) -> list[list[tuple[str, str]]]:
     """The ``(column, op)`` terms of the only read's predicate, sorted within each clause."""
     ((_, args),) = spy.calls
     return [sorted((c, op) for c, op, _ in clause) for clause in args[-1]]
 
 
-EQ, NE, LT, LE, GT, GE, IN, NOT_IN, IS_NULL = range(9)
+EQ, NE, LT, LE, GT, GE, IN, NOT_IN, IS_NULL = "==", "!=", "<", "<=", ">", ">=", "in", "not_in", "is_null"
 PUSHDOWNS = [
     ((pl.col("symbol") == "B") & (pl.col("f3") > 6.0), [[("symbol", EQ)]]),
     (pl.col("timestamp").is_between(ts(3), ts(5)), [[("timestamp", GE), ("timestamp", LE)]]),

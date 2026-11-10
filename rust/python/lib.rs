@@ -173,8 +173,9 @@ fn import_dnf(predicate: Option<&Bound<'_, PyAny>>) -> PyResult<Dnf> {
         let mut terms = vec![];
         for term in conjunction?.try_iter()? {
             let term = term?;
-            let (column, op, values): (String, i32, Option<Bound<'_, PyAny>>) = term.extract()?;
-            let op = Op::try_from(op).map_err(to_py)?;
+            let (column, op, values): (String, String, Option<Bound<'_, PyAny>>) =
+                term.extract()?;
+            let op = op.parse::<Op>().map_err(to_py)?;
             let values = match values {
                 Some(values) => import_array(&values)?,
                 None => new_empty_array(&DataType::Null),

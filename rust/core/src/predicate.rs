@@ -15,39 +15,43 @@ use datafusion::prelude::{lit, Expr};
 use crate::error::{Error, Result};
 
 /// Comparison operator of a [`Term`].
-#[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Op {
-    Eq = 0,
-    NotEq = 1,
-    Lt = 2,
-    LtEq = 3,
-    Gt = 4,
-    GtEq = 5,
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
     /// True when the value is non-null and equals a member of `values`.
-    In = 6,
+    In,
     /// True when the value is non-null and equals no member of `values`.
-    NotIn = 7,
-    IsNull = 8,
-    IsNotNull = 9,
+    NotIn,
+    IsNull,
+    IsNotNull,
 }
 
-impl TryFrom<i32> for Op {
-    type Error = Error;
+impl std::str::FromStr for Op {
+    type Err = Error;
 
-    fn try_from(value: i32) -> Result<Self> {
-        Ok(match value {
-            0 => Op::Eq,
-            1 => Op::NotEq,
-            2 => Op::Lt,
-            3 => Op::LtEq,
-            4 => Op::Gt,
-            5 => Op::GtEq,
-            6 => Op::In,
-            7 => Op::NotIn,
-            8 => Op::IsNull,
-            9 => Op::IsNotNull,
-            other => return Err(Error::InvalidPredicate(format!("unknown operator {other}"))),
+    /// Parses `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not_in`, `is_null` or `is_not_null`.
+    fn from_str(op: &str) -> Result<Self> {
+        Ok(match op {
+            "==" => Op::Eq,
+            "!=" => Op::NotEq,
+            "<" => Op::Lt,
+            "<=" => Op::LtEq,
+            ">" => Op::Gt,
+            ">=" => Op::GtEq,
+            "in" => Op::In,
+            "not_in" => Op::NotIn,
+            "is_null" => Op::IsNull,
+            "is_not_null" => Op::IsNotNull,
+            other => {
+                return Err(Error::InvalidPredicate(format!(
+                    "unknown operator {other:?}"
+                )))
+            }
         })
     }
 }

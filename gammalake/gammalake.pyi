@@ -13,10 +13,10 @@ class _ArrowSchemaLike(Protocol):
     def __arrow_c_schema__(self) -> object: ...
 
 # A predicate in disjunctive normal form: OR-ed lists of AND-ed (column, op, values) terms.
-# `op` is 0 EQ, 1 NOT_EQ, 2 LT, 3 LT_EQ, 4 GT, 5 GT_EQ, 6 IN, 7 NOT_IN, 8 IS_NULL, 9 IS_NOT_NULL.
-# `values` is None for IS_NULL and IS_NOT_NULL, one element for comparisons and any number for IN and NOT_IN.
+# `op` is "==", "!=", "<", "<=", ">", ">=", "in", "not_in", "is_null" or "is_not_null".
+# `values` is None for "is_null" and "is_not_null", one element for comparisons and any number for "in" and "not_in".
 # An empty outer list matches every row.
-Predicate: TypeAlias = Sequence[Sequence[tuple[str, int, _ArrowArray | None]]]
+Predicate: TypeAlias = Sequence[Sequence[tuple[str, str, _ArrowArray | None]]]
 # (feature_name, table_addr, comment, tags); None keeps the stored value.
 _Annotation: TypeAlias = tuple[str, str | None, str | None, Sequence[str] | None]
 # (feature_name, table_addr, signal_type, feature_params) of a feature metadata row.
