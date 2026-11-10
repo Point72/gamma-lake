@@ -75,4 +75,45 @@ impl Error {
     }
 }
 
+impl From<Error> for DataFusionError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::DataFusion(error) => error,
+            other => DataFusionError::External(Box::new(other)),
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub(crate) fn integrity(table_addr: &str, kind: impl Into<String>) -> Error {
+    Error::Integrity {
+        table_addr: table_addr.into(),
+        kind: kind.into(),
+    }
+}
+
+pub(crate) fn unsupported(message: impl Into<String>) -> Error {
+    Error::UnsupportedInput(message.into())
+}
+
+/// `error` as a [`Error::Write`] when tables were already committed.
+pub(crate) fn after(phase: String, committed: Vec<String>, error: Error) -> Error {
+    match error {
+        Error::Write {
+            committed: more,
+            phase,
+            source,
+        } => Error::Write {
+            phase,
+            committed: committed.into_iter().chain(more).collect(),
+            source,
+        },
+        error if committed.is_empty() => error,
+        error => Error::Write {
+            phase,
+            committed,
+            source: Box::new(error),
+        },
+    }
+}

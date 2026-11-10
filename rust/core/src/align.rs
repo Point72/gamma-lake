@@ -14,13 +14,13 @@ use arrow::compute::{cast_with_options, concat, concat_batches, CastOptions};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
-use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::error::Result as DfResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::future::try_join_all;
 use futures::StreamExt;
 
-use crate::error::Error;
+use crate::error::integrity;
 
 /// A sorted input to [`zip_aligned`].
 pub(crate) struct AlignInput {
@@ -131,6 +131,7 @@ impl Validator {
                             column.data_type()
                         ),
                     )
+                    .into()
                 })
             })
             .collect::<DfResult<Vec<ArrayRef>>>()?;
@@ -148,7 +149,8 @@ impl Validator {
                 return Err(integrity(
                     "index",
                     format!("duplicate sort keys at row {}", offset + i),
-                ));
+                )
+                .into());
             }
         }
         if rows.num_rows() > 0 {
@@ -156,13 +158,6 @@ impl Validator {
         }
         Ok(())
     }
-}
-
-fn integrity(table_addr: &str, kind: String) -> DataFusionError {
-    DataFusionError::External(Box::new(Error::Integrity {
-        table_addr: table_addr.into(),
-        kind,
-    }))
 }
 
 /// Zips `tables` onto `index` by row position. `layout` lists the output columns. The
@@ -244,7 +239,8 @@ pub(crate) fn zip_aligned(
                         return Err(integrity(
                             &input.name,
                             format!("more rows than the index (from row {})", state.offset),
-                        ));
+                        )
+                        .into());
                     }
                 }
                 return Ok(None);
@@ -272,7 +268,8 @@ pub(crate) fn zip_aligned(
                                 "more rows than the index (from row {})",
                                 state.offset + taken[0].num_rows()
                             ),
-                        ));
+                        )
+                        .into());
                     }
                     let rows = validator.rows(&input.name, batch, input.keys, &index_schema)?;
                     if let Some(i) =
@@ -284,7 +281,8 @@ pub(crate) fn zip_aligned(
                                 "sort keys at row {} differ from the index",
                                 state.offset + i
                             ),
-                        ));
+                        )
+                        .into());
                     }
                 }
             }

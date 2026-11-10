@@ -12,15 +12,13 @@ use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatchReader;
 use arrow::row::{RowConverter, SortField};
 
-use crate::error::{Error, Result};
+use crate::error::{after, integrity, Error, Result};
 use crate::lake::{feature_rows, latest, FeatureRow, Lake, SelectedFeature};
+use crate::lock::write_lock;
 use crate::predicate::{Dnf, Op, Term};
 use crate::runtime::block_on;
-use crate::store::StoredTable;
-use crate::write::{
-    assemble, cast_into, commit, coverage_values, integrity, new_table_addr, now_micros,
-    write_lock, Action, Commits,
-};
+use crate::store::{now_micros, StoredTable};
+use crate::write::{assemble, cast_into, commit, coverage_values, new_table_addr, Action, Commits};
 
 /// A column of a table and the metadata keys to set on it.
 type ColumnUpdate = (String, HashMap<String, String>);
@@ -69,27 +67,6 @@ fn stored(row: &FeatureRow) -> Option<&str> {
         (_, Some("runtime_computed")) => None,
         (Some(addr), _) if addr != "n/a" => Some(addr),
         _ => None,
-    }
-}
-
-/// `error` as a [`Error::Write`] when tables were already committed.
-pub(crate) fn after(phase: String, committed: Vec<String>, error: Error) -> Error {
-    match error {
-        Error::Write {
-            committed: more,
-            phase,
-            source,
-        } => Error::Write {
-            phase,
-            committed: committed.into_iter().chain(more).collect(),
-            source,
-        },
-        error if committed.is_empty() => error,
-        error => Error::Write {
-            phase,
-            committed,
-            source: Box::new(error),
-        },
     }
 }
 

@@ -9,11 +9,10 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
-use crate::admin::after;
-use crate::error::{Error, Result};
+use crate::error::{after, Error, Result};
 use crate::lake::Lake;
-use crate::store::{CreateOptions, Entangled};
-use crate::write::{assemble, now_micros, Commits};
+use crate::store::{now_micros, CreateOptions, Entangled};
+use crate::write::{assemble, Commits};
 
 /// Characters of an error message the log keeps.
 const MAX_ERROR_CHARS: usize = 2000;

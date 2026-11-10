@@ -17,7 +17,7 @@ use datafusion::prelude::SessionContext;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::align::{zip_aligned, AlignInput, Source};
-use crate::error::{Error, Result};
+use crate::error::{integrity, Error, Result};
 use crate::joined::{table_predicate, AsOfParams, AsOfTable, SparseTable};
 use crate::lock::{LockingStore, TableLock};
 use crate::predicate::{column, Dnf};
@@ -773,10 +773,7 @@ impl Lake {
                 .chain(key_names.iter())
                 .find(|n| table.schema().field_with_name(n).is_err())
             {
-                return Err(Error::Integrity {
-                    table_addr: addr.to_string(),
-                    kind: format!("missing column {missing:?}"),
-                });
+                return Err(integrity(addr, format!("missing column {missing:?}")));
             }
             let scan = |names: &[&str], dnf: &Dnf| {
                 let projection = key_names
@@ -963,10 +960,7 @@ impl Lake {
         self.store
             .open(name)
             .await?
-            .ok_or_else(|| Error::Integrity {
-                table_addr: name.to_string(),
-                kind: "the table does not exist".into(),
-            })
+            .ok_or_else(|| integrity(name, "the table does not exist"))
     }
 }
 
@@ -994,10 +988,9 @@ pub(crate) fn string_column(
     batch: &arrow::record_batch::RecordBatch,
     name: &str,
 ) -> Result<Vec<Option<String>>> {
-    let array = batch.column_by_name(name).ok_or_else(|| Error::Integrity {
-        table_addr: "feature_metadata".into(),
-        kind: format!("missing column {name:?}"),
-    })?;
+    let array = batch
+        .column_by_name(name)
+        .ok_or_else(|| integrity("feature_metadata", format!("missing column {name:?}")))?;
     let array = cast(array, &DataType::Utf8)?;
     Ok(array
         .as_string::<i32>()
@@ -1016,10 +1009,7 @@ pub(crate) fn feature_rows(batch: &arrow::record_batch::RecordBatch) -> Result<V
     };
     let versions = batch
         .column_by_name("version")
-        .ok_or_else(|| Error::Integrity {
-            table_addr: "feature_metadata".into(),
-            kind: "missing column \"version\"".into(),
-        })?;
+        .ok_or_else(|| integrity("feature_metadata", "missing column \"version\""))?;
     let versions = cast(versions, &DataType::Int64)?;
     let versions = versions.as_primitive::<Int64Type>();
     Ok((0..batch.num_rows())

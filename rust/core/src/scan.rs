@@ -127,7 +127,8 @@ impl TableProvider for ScanProvider {
                 .map(|&i| self.table.schema().field(i).name().clone())
                 .collect::<Vec<_>>()
         });
-        let schema = projected(self.table.schema(), columns.as_deref()).map_err(external)?;
+        let schema =
+            projected(self.table.schema(), columns.as_deref()).map_err(DataFusionError::from)?;
         let partition = Arc::new(BackendPartition {
             schema: schema.clone(),
             table: self.table.clone(),
@@ -170,18 +171,14 @@ impl PartitionStream for BackendPartition {
         let stream = futures::stream::once(async move {
             let scan = checked_scan(table.as_ref(), columns.as_deref(), &dnf, batch_size)
                 .await
-                .map_err(external)?;
-            Ok::<_, DataFusionError>(scan.stream.map(|batch| batch.map_err(external)))
+                .map_err(DataFusionError::from)?;
+            Ok::<_, DataFusionError>(
+                scan.stream
+                    .map(|batch| batch.map_err(DataFusionError::from)),
+            )
         })
         .try_flatten();
         Box::pin(RecordBatchStreamAdapter::new(schema, stream))
-    }
-}
-
-fn external(error: Error) -> DataFusionError {
-    match error {
-        Error::DataFusion(error) => error,
-        other => DataFusionError::External(Box::new(other)),
     }
 }
 

@@ -7,8 +7,9 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 
 use crate::error::{Error, Result};
 use crate::lake::{feature_rows, Lake};
+use crate::lock::write_lock;
 use crate::runtime::block_on;
-use crate::write::{assemble, write_lock};
+use crate::write::assemble;
 
 /// A feature computed at read time from other features.
 ///

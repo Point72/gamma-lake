@@ -19,7 +19,7 @@ use arrow::datatypes::{
 use arrow::row::{RowConverter, Rows, SortField};
 use serde_json::Value;
 
-use crate::error::{Error, Result};
+use crate::error::{integrity, unsupported, Error, Result};
 use crate::predicate::{Dnf, Op, Term};
 
 /// Which table row `join_asof` picks for an index row.
@@ -60,10 +60,6 @@ impl Default for AsOfParams {
             allow_exact_matches: true,
         }
     }
-}
-
-fn unsupported(message: String) -> Error {
-    Error::UnsupportedInput(message)
 }
 
 fn invalid(message: String) -> Error {
@@ -450,10 +446,10 @@ impl SparseTable {
                 continue;
             }
             if rows.insert(Box::from(row.data()), i as u32).is_some() {
-                return Err(Error::Integrity {
-                    table_addr: table_addr.to_string(),
-                    kind: "a sparse feature table holds the same sort keys twice".into(),
-                });
+                return Err(integrity(
+                    table_addr,
+                    "a sparse feature table holds the same sort keys twice",
+                ));
             }
         }
         Ok(Self {

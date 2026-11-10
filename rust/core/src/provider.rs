@@ -33,7 +33,7 @@ use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
 use tokio::task::JoinHandle;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::lake::{Lake, SelectedFeature, Selection};
 use crate::predicate::{Dnf, Op, Term};
 use crate::runtime;
@@ -468,13 +468,13 @@ impl ExecutionPlan for FeatureTableExec {
             let mut stream = match stream {
                 Ok(stream) => stream,
                 Err(e) => {
-                    let _ = sender.send(Err(external(e))).await;
+                    let _ = sender.send(Err(e.into())).await;
                     return;
                 }
             };
             while let Some(batch) = stream.next().await {
                 let batch = batch
-                    .map_err(external)
+                    .map_err(DataFusionError::from)
                     .and_then(|b| project(&b, &columns, &out));
                 let failed = batch.is_err();
                 if sender.send(batch).await.is_err() || failed {
@@ -487,13 +487,6 @@ impl ExecutionPlan for FeatureTableExec {
             task: Some(task),
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-}
-
-fn external(error: Error) -> DataFusionError {
-    match error {
-        Error::DataFusion(e) => e,
-        other => DataFusionError::External(Box::new(other)),
     }
 }
 

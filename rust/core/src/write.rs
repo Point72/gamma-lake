@@ -11,8 +11,7 @@
 //! position, so every write keeps this true for every dense table it touches.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, RecordBatch, StringArray, TimestampMicrosecondArray,
@@ -25,13 +24,14 @@ use futures::future::join_all;
 use futures::TryStreamExt;
 
 use crate::admin::Annotation;
-use crate::error::{Error, Result};
+use crate::error::{integrity, unsupported, Error, Result};
 use crate::joined::AsOfParams;
 use crate::lake::{feature_rows, latest, string_column, Lake, LakeOptions};
+use crate::lock::write_lock;
 use crate::predicate::{lossless_cast, Dnf, Op, Term};
 use crate::runtime::block_on;
 use crate::scan::checked_scan;
-use crate::store::{CreateOptions, StoredTable, TableStore};
+use crate::store::{now_micros, CreateOptions, StoredTable, TableStore};
 
 /// Signal types whose tables never receive padding rows.
 const UNPADDED_SIGNAL_TYPES: [&str; 2] = ["as_of_feature", "sparse_feature"];
@@ -101,29 +101,6 @@ impl Default for AddOptions {
     }
 }
 
-/// Serializes writes to one lake within this process.
-pub(crate) fn write_lock(location: &str) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(location.to_string())
-        .or_default()
-        .clone()
-}
-
-fn unsupported(message: impl Into<String>) -> Error {
-    Error::UnsupportedInput(message.into())
-}
-
-pub(crate) fn integrity(table_addr: &str, kind: impl Into<String>) -> Error {
-    Error::Integrity {
-        table_addr: table_addr.into(),
-        kind: kind.into(),
-    }
-}
-
 /// The coverage of every table: the `last_updated` of its table metadata row with the
 /// newest `update_timestamp`, as a one-row array. Tables whose newest row has a null
 /// `last_updated` are left out.
@@ -154,14 +131,6 @@ pub(crate) fn coverage_values(tm: &RecordBatch) -> Result<BTreeMap<String, Array
         .filter(|&(_, r)| last.is_valid(r))
         .map(|(addr, r)| (addr, last.slice(r, 1)))
         .collect())
-}
-
-/// Microseconds since the Unix epoch.
-pub(crate) fn now_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or_default()
 }
 
 pub(crate) fn new_table_addr(prefix: &str) -> String {

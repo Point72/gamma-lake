@@ -230,7 +230,6 @@ pub fn segments(name: &str) -> Result<Vec<&str>> {
     Ok(parts)
 }
 
-/// A commit that conflicts with another commit made since the table was opened.
 /// Tables held in memory, for tests and short-lived lakes. Clones share the tables.
 #[derive(Clone)]
 pub struct MemoryStore {
@@ -299,7 +298,7 @@ impl MemoryStore {
 }
 
 /// Microseconds since the Unix epoch.
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)

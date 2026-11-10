@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -27,6 +27,18 @@ use crate::store::{CreateOptions, StoredTable, TableScan, TableStore};
 
 /// The error a lock callback reports.
 pub type LockError = Box<dyn StdError + Send + Sync>;
+
+/// Serializes writes to one lake within this process.
+pub(crate) fn write_lock(location: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(location.to_string())
+        .or_default()
+        .clone()
+}
 
 /// A lock on the tables of a lake, keyed by [`TableStore::table_location`].
 ///
@@ -54,6 +66,10 @@ where
     let (held_tx, held_rx) = oneshot::channel::<Result<(), LockError>>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel::<Result<(), LockError>>();
+    let error = |source| Error::Lock {
+        target: target.clone(),
+        source,
+    };
     let thread_lock = lock.clone();
     let thread_target = target.clone();
     std::thread::Builder::new()
@@ -71,8 +87,7 @@ where
             let _ = release_rx.recv();
             let _ = done_tx.send(guard.release());
         })
-        .map_err(|e| lock_error(&target, Box::new(e)))?;
-    let error = |source| lock_error(&target, source);
+        .map_err(|e| error(Box::new(e)))?;
     match held_rx.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(error(e)),
@@ -95,13 +110,6 @@ where
     }
 }
 
-fn lock_error(target: &str, source: LockError) -> Error {
-    Error::Lock {
-        target: target.to_string(),
-        source,
-    }
-}
-
 /// A [`TableStore`] whose commits hold `lock`. A commit goes through the handle it was made
 /// on, so it fails with [`Error::Conflict`] if another commit came first; with the lock
 /// held, the inner store's check of that is reliable even without atomic commits.
@@ -109,12 +117,6 @@ fn lock_error(target: &str, source: LockError) -> Error {
 pub(crate) struct LockingStore {
     inner: Arc<dyn TableStore>,
     lock: Arc<dyn TableLock>,
-}
-
-impl LockingStore {
-    pub(crate) fn new(inner: Arc<dyn TableStore>, lock: Arc<dyn TableLock>) -> Self {
-        Self { inner, lock }
-    }
 }
 
 impl fmt::Debug for LockingStore {
@@ -144,18 +146,16 @@ impl TableStore for LockingStore {
     }
 
     async fn create(&self, name: &str, batch: RecordBatch, options: &CreateOptions) -> Result<()> {
-        let target = self.inner.table_location(name)?;
-        locked(
-            &self.lock,
-            target,
-            name,
-            self.inner.create(name, batch, options),
-        )
-        .await
+        self.commit(name, self.inner.create(name, batch, options))
+            .await
     }
 }
 
 impl LockingStore {
+    pub(crate) fn new(inner: Arc<dyn TableStore>, lock: Arc<dyn TableLock>) -> Self {
+        Self { inner, lock }
+    }
+
     fn wrap(&self, name: &str, table: Box<dyn StoredTable>) -> Box<dyn StoredTable> {
         Box::new(LockingTable {
             store: self.clone(),
