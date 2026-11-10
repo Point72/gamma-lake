@@ -1,19 +1,4 @@
-"""Generate the Delta-lake fixtures and expected results used by the Rust tests.
-
-``make fixtures`` runs this script with ``GammaFeatureLake`` imported from the pure-Python
-engine of a release (``COMPAT_REF``, by default v0.2.0). The outputs are not committed.
-
-Each lake under ``lakes/`` is written by ``GammaFeatureLake`` from a scripted write
-history. ``queries.json`` lists the queries run by ``rust/tests/read_parity.rs``;
-``expected/<name>.arrow`` holds the reference result of each successful query.
-
-The reference is ``GammaFeatureLake.read`` itself, filtered by the query predicate and
-with columns selected in request order (Python's own column order is not stable). Both
-engines align feature tables to the index by row position, so lakes whose tables are not
-row-aligned (see Point72/gamma-lake#45) read identically misaligned in both. Such queries
-set ``validate_expect``: with ``validate=True`` the Rust core must fail with an integrity
-error instead.
-"""
+"""Generate the Delta-lake fixtures and expected results used by the Rust tests."""
 
 from __future__ import annotations
 
@@ -54,11 +39,7 @@ def frame(days, symbols, **features) -> pl.DataFrame:
 def new_lake(name: str, **kwargs) -> GammaFeatureLake:
     path = LAKES / name
     shutil.rmtree(path, ignore_errors=True)
-    counter = itertools.count()
-    lake = GammaFeatureLake(base_path=str(path), **kwargs).initialize()
-    # Deterministic table addresses keep regenerated fixtures diff-friendly.
-    object.__setattr__(lake, "gen_table_addr", lambda: f"{lake.table_name_prefix}delta_{next(counter):08x}")
-    return lake
+    return GammaFeatureLake(base_path=str(path), **kwargs).initialize()
 
 
 def build_lakes() -> dict[str, GammaFeatureLake]:
@@ -121,9 +102,6 @@ def build_lakes() -> dict[str, GammaFeatureLake]:
     return lakes
 
 
-# --------------------------------------------------------------------------- DNF
-
-
 def literal(spec: dict):
     kind, value = spec["type"], spec["value"]
     if kind in ("timestamp_us_utc", "timestamp_ns_utc"):
@@ -138,7 +116,7 @@ def literal(spec: dict):
 
 
 def term_expr(term: dict) -> pl.Expr:
-    column, op, values = pl.col(term["column"]), term["op"], term.get("values", [])
+    column, op, values = pl.col(term["column"]), term["op"], term["values"]
     if op == "is_null":
         return column.is_null()
     if op == "is_not_null":
@@ -156,9 +134,6 @@ def dnf_expr(dnf: list[list[dict]]) -> pl.Expr:
     if not dnf:
         return pl.lit(True)
     return pl.any_horizontal([pl.all_horizontal([term_expr(t) for t in conj]) for conj in dnf]).fill_null(False)
-
-
-# ------------------------------------------------------------------------ oracle
 
 
 def reference_read(lake: GammaFeatureLake, features: list[str], targets: list[str], dnf) -> pl.DataFrame:
@@ -183,10 +158,12 @@ def primary_window(lake: GammaFeatureLake, dnf) -> dict | None:
     return window if len(window) == len(dnf[0]) else None
 
 
-# ----------------------------------------------------------------------- queries
+def T(day: int) -> dict:
+    return {"type": "timestamp_us_utc", "value": ts(day).isoformat()}
 
-T = lambda day: {"type": "timestamp_us_utc", "value": ts(day).isoformat()}  # noqa: E731
-S = lambda value: {"type": "utf8", "value": value}  # noqa: E731
+
+def S(value: str) -> dict:
+    return {"type": "utf8", "value": value}
 
 
 def term(column, op, *values):
