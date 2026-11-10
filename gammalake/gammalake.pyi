@@ -1,6 +1,7 @@
 """Native core of gamma-lake. Results are exported through the Arrow PyCapsule interface."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from typing import Protocol, TypeAlias
 
 class _ArrowArray(Protocol):
@@ -12,13 +13,18 @@ class _ArrowStreamable(Protocol):
 class _ArrowSchemaLike(Protocol):
     def __arrow_c_schema__(self) -> object: ...
 
+class _DeltaOptions(Protocol):
+    """Read by attribute, as from a ``gammalake.native.DeltaOptions``."""
+
+    compression: str
+    target_file_size: int
+    storage_options: dict[str, str]
+
 # A predicate in disjunctive normal form: OR-ed lists of AND-ed (column, op, values) terms.
 # `op` is "==", "!=", "<", "<=", ">", ">=", "in", "not_in", "is_null" or "is_not_null".
 # `values` is None for "is_null" and "is_not_null", one element for comparisons and any number for "in" and "not_in".
 # An empty outer list matches every row.
 Predicate: TypeAlias = Sequence[Sequence[tuple[str, str, _ArrowArray | None]]]
-# (feature_name, table_addr, comment, tags); None keeps the stored value.
-_Annotation: TypeAlias = tuple[str, str | None, str | None, Sequence[str] | None]
 # (feature_name, table_addr, signal_type, feature_params) of a feature metadata row.
 SelectedRow: TypeAlias = tuple[str, str, str, str | None]
 
@@ -42,6 +48,7 @@ class Lake:
         self,
         base_path: str,
         *,
+        index_schema: _ArrowSchemaLike | None = None,
         primary_sort_key: str | None = None,
         index_path: str | None = None,
         feature_metadata_path: str | None = None,
@@ -49,30 +56,12 @@ class Lake:
         batch_size: int | None = None,
         validate: bool = False,
         table_name_prefix: str | None = None,
-        compression: str | None = None,
-        target_file_size: int | None = None,
-        storage_options: Mapping[str, str] | None = None,
+        delta_options: _DeltaOptions | None = None,
+        lock: Callable[[str], AbstractContextManager] | None = None,
         memory_limit: int | None = None,
         transaction_log_path: str | None = None,
-    ) -> None: ...
-    @staticmethod
-    def create(
-        base_path: str,
-        index_schema: _ArrowSchemaLike,
-        *,
-        primary_sort_key: str | None = None,
-        index_path: str | None = None,
-        feature_metadata_path: str | None = None,
-        table_metadata_path: str | None = None,
-        batch_size: int | None = None,
-        validate: bool = False,
-        table_name_prefix: str | None = None,
-        compression: str | None = None,
-        target_file_size: int | None = None,
-        storage_options: Mapping[str, str] | None = None,
-        memory_limit: int | None = None,
-        transaction_log_path: str | None = None,
-    ) -> Lake: ...
+    ) -> None:
+        """Opens the lake, first creating its index and metadata tables where missing when ``index_schema`` is given."""
     @property
     def location(self) -> str: ...
     @property
@@ -81,10 +70,10 @@ class Lake:
     def primary_sort_key(self) -> str: ...
     @property
     def index_schema(self) -> ArrowSchema: ...
+    def feature_table(self, features: Sequence[str], targets: Sequence[str] | None = None) -> FeatureTable: ...
     def read(self, features: Sequence[str], targets: Sequence[str] | None = None, predicate: Predicate | None = None) -> ArrowStream: ...
-    def read_schema(self, features: Sequence[str], targets: Sequence[str] | None = None) -> ArrowSchema: ...
-    def read_versions(self, features: Sequence[tuple[str, int]], predicate: Predicate | None = None) -> ArrowStream: ...
-    def read_versions_schema(self, features: Sequence[tuple[str, int]]) -> ArrowSchema: ...
+    def resolve(self, features: Sequence[str], targets: Sequence[str] | None = None) -> list[SelectedRow]: ...
+    def resolve_versions(self, features: Sequence[tuple[str, int]]) -> list[SelectedRow]: ...
     def read_selected(self, features: Sequence[SelectedRow], predicate: Predicate | None = None) -> ArrowStream: ...
     def read_selected_schema(self, features: Sequence[SelectedRow]) -> ArrowSchema: ...
     def index(self, predicate: Predicate | None = None) -> ArrowStream: ...
@@ -103,15 +92,26 @@ class Lake:
         signal_type: str = "feature",
         overlap_mode: str = "copy",
         feature_params: str | None = None,
-        annotations: Sequence[_Annotation] | None = None,
+        annotations: Sequence[tuple[str, str | None, str | None, Sequence[str] | None]] | None = None,
     ) -> None: ...
     def add_index_rows(self, data: _ArrowStreamable) -> None: ...
-    def annotate(self, annotations: Sequence[_Annotation]) -> None: ...
-    def add_expressions(self, expressions: Sequence[tuple[str, str, str, Sequence[str]]], owner: str) -> None: ...
+    # (feature_name, table_addr, comment, tags); None keeps the stored value.
+    def annotate(self, annotations: Sequence[tuple[str, str | None, str | None, Sequence[str] | None]]) -> None: ...
+    # (feature_name, expression, root_names)
+    def add_expressions(self, expressions: Sequence[tuple[str, str, Sequence[str]]], owner: str) -> None: ...
     def annotations(self, features: Sequence[tuple[str, str]]) -> ArrowStream: ...
     def describe(self, features: Sequence[str]) -> ArrowStream: ...
     def restore(self, at: int) -> None: ...
     def consolidate(self, features: Sequence[str]) -> str | None: ...
+
+class FeatureTable:
+    """Features of a lake as a DataFusion table, for datafusion-python's ``SessionContext.register_table``."""
+
+    @property
+    def schema(self) -> ArrowSchema: ...
+    @property
+    def features(self) -> list[str]: ...
+    def __datafusion_table_provider__(self, session: object) -> object: ...
 
 def version() -> str: ...
 def _live_streams() -> int: ...
