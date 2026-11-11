@@ -40,6 +40,17 @@ Prefer **wide-and-shallow** writes over **tall-and-skinny** writes. Here, wide m
 all secondary-key values for a primary-sort-key period; shallow means writing fewer complete periods at a time. Avoid
 splitting the same period across many calls.
 
+Representative object-storage benchmarks for one feature group and one primary-sort-key period, measured with Gamma Lake
+0.2 (whose Ray execution mode has since been removed), show the per-call cost:
+
+| Write shape                                        | Execution mode |   Time |
+| -------------------------------------------------- | -------------- | -----: |
+| 1,000 features × 1,000 secondary-key values        | Ray            |   ~4 s |
+| 1,000 features × 5,000 secondary-key values        | Ray            | ~6.5 s |
+| 1,000 features × 5,000 secondary-key values        | Local          |   ~9 s |
+| The same 5,000 values split across two local calls | Local          |  ~14 s |
+| Ten local calls of 1,000 values each               | Local          |  55+ s |
+
 For backfills, build blocks containing every secondary-key value for each primary-sort-key period, include as many
 complete periods as fit comfortably in memory, and write each block in one call. Do not repeatedly batch the same
 period by entity. Keep unrelated owners or update cadences in separate feature groups even when batching writes.
