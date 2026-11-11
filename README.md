@@ -1,10 +1,8 @@
 <br />
 <a href="https://github.com/point72/gamma-lake#gh-light-mode-only">
   <img src="https://github.com/point72/gamma-lake/raw/main/docs/img/light.png?raw=true#gh-light-mode-only" alt="gamma-lake logo" width="400"></a>
-</a>
 <a href="https://github.com/point72/gamma-lake#gh-dark-mode-only">
   <img src="https://github.com/point72/gamma-lake/raw/main/docs/img/dark.png?raw=true#gh-dark-mode-only" alt="gamma-lake logo" width="400"></a>
-</a>
 <br/>
 <br/>
 
@@ -15,8 +13,9 @@
 
 ## Overview
 
-Gamma Lake is a **feature store** built on [Delta Lake](https://delta.io/) with optional [Ray](https://www.ray.io/) parallelism, designed for
-efficient storage, versioning, and retrieval of time-indexed features backed by [Polars](https://pola.rs/) DataFrames.
+Gamma Lake is a **feature store** built on [Delta Lake](https://delta.io/), designed for efficient storage, versioning,
+and retrieval of time-indexed features. Reads and writes run in a shared Rust core exposed as a Rust crate and Python
+extension; the Python package returns [Polars](https://pola.rs/) DataFrames.
 
 It was built to solve the real-world pain points that teams encounter when using flat Parquet files for ML feature
 storage: expensive column additions, no versioning, and painful cross-team collaboration.
@@ -25,26 +24,26 @@ storage: expensive column additions, no versioning, and painful cross-team colla
 
 The most common alternative — storing features in per-day Parquet files — breaks down quickly:
 
-| Problem                                                  | Gamma Lake's answer                                                                                 |
-| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| Adding a new feature group rewrites *all* existing files | Gamma Lake writes one new Delta table per feature group — **O(1) cost regardless of existing data** |
-| Multiple teams can't write features in parallel          | Each feature group is an independent Delta table — concurrent writes don't conflict                 |
-| No versioning or audit trail                             | Delta Lake's transaction log provides full time-travel and version history                          |
-| Cross-group reads require expensive joins                | Gamma Lake maintains a master index; reads are aligned horizontal concatenations                    |
-| Experimental features pollute production data            | Features carry `owner` and `version` metadata; `read()` accepts a filtered metadata frame           |
+| Problem                                                  | Gamma Lake's answer                                                                             |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Adding a new feature group rewrites *all* existing files | Gamma Lake writes each new feature group to its own Delta table and leaves existing files alone |
+| Multiple teams can't write features in parallel          | Each feature group is an independent Delta table; see [concurrent writers](#concurrent-writers) |
+| No versioning or audit trail                             | Delta Lake's transaction log provides full time-travel and version history                      |
+| Cross-group reads require expensive joins                | Gamma Lake maintains a master index; reads are aligned horizontal concatenations                |
+| Experimental features pollute production data            | Features carry `owner` and `version` metadata; `read()` accepts a filtered metadata frame       |
 
-See [performance](https://github.com/Point72/gamma-lake/wiki/Performance) for benchmark data comparing Gamma Lake against per-day Parquet at scale.
+See [performance](https://github.com/Point72/gamma-lake/wiki/Performance) for how Gamma Lake compares with per-day Parquet files.
 
 ## Key Features
 
 - **Sortable index** — a master index table ensures all feature groups stay aligned for efficient range-filtered reads
-- **Parallel reads and writes** — Ray remote functions parallelise across feature groups for large-scale workloads
-- **Feature versioning** — every `add_features()` call records owner and version; read any historical version by
+- **Rust core** — reads and writes run in Rust on delta-rs and DataFusion, callable from Python and Rust
+- **Feature versioning** — every new feature and new version records its owner and version; read any historical version by
   filtering the metadata frame
 - **Multiple signal types** — standard features, as-of features, sparse features, and runtime-computed features
 - **Native Delta Lake storage** — ACID transactions, schema enforcement, and time-travel out of the box
 - **Local or cloud** — `base_path` accepts a local directory, an on-prem object store path, or an `s3://` URI
-- **Configurable compression** — `zstd` by default; pluggable via `compression` field
+- **Configurable compression** — `zstd` by default, configured through `delta_options`
 
 ## Quick Start
 
@@ -60,10 +59,10 @@ from gammalake import GammaFeatureLake
 
 # 1. Create and initialise a feature lake
 with tempfile.TemporaryDirectory() as tmp:
-    lake = GammaFeatureLake(base_path=tmp, run_on_ray_cluster=False)
+    lake = GammaFeatureLake(base_path=tmp)
     lake.initialize(
         ArrowSchema.make(
-            pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.large_string())])
+            pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())])
         )
     )
 
@@ -87,8 +86,6 @@ with tempfile.TemporaryDirectory() as tmp:
     print(lake.feature_metadata_frame().collect())
 ```
 
-Run the full annotated demo: [`examples/quickstart.py`](examples/quickstart.py)
-
 ## How Gamma Lake Works
 
 ### The index and feature groups
@@ -100,11 +97,13 @@ common choice. A lake stores one master index Delta table and one Delta table pe
 
 Dense feature groups persist rows in canonical index order over their covered range. Missing rows inside that range
 are stored explicitly for alignment, while a group may remain shorter when the index grows only beyond its latest
-update. Reads never need keyed joins: Polars pads any missing trailing values during horizontal concatenation. Delta
+update. Reads never need keyed joins: the reader pads any missing trailing values during horizontal concatenation. Delta
 files are not assumed to be physically ordered; each source is sorted by the configured sort keys before assembly.
 
-As-of and sparse feature tables are intentionally not padded. Their read paths first align them to the bounded master
-index with as-of and left joins, respectively, before they enter the same positional assembly path.
+New sparse tables are not padded, and new as-of tables are. Later writes to either kind can add null rows for index keys
+the input does not hold, unless every input row is a new index key. Neither kind is read by position: their read paths
+first align them to the bounded master index with as-of and left joins, respectively, before they enter the same
+positional assembly path.
 
 ### Reading features
 
@@ -125,7 +124,7 @@ Feature groups do not need to end at the same index value:
 
 ![Partially updated feature groups](docs/assets/gammalake/20250728093638.png)
 
-Polars pads shorter groups with implicit trailing nulls during horizontal concatenation:
+The reader pads shorter groups with implicit trailing nulls during horizontal concatenation:
 
 ![Concatenated feature groups with implicit nulls](docs/assets/gammalake/20250728093712.png)
 
@@ -181,6 +180,9 @@ The read result combines stored values with implicit trailing nulls:
 Backfills can therefore be expensive. Adding a new secondary-key value across historical primary-key periods may
 require alignment updates to many feature groups; adding it only for future periods does not.
 
+To write only to keys already in the index, pass `allow_new_index_values=False` to an `add_*` method: an input holding
+any new key raises `ValueError` and writes nothing.
+
 If incoming rows overlap existing rows, `overlap_mode="copy"` creates a new versioned Delta table, while
 `overlap_mode="merge"` performs an in-place Delta merge. Both paths preserve the alignment invariant.
 
@@ -202,25 +204,70 @@ Default reads select the latest feature version. Copy mode preserves earlier phy
 filtering the metadata frame. Merge mode reuses the current table and does not retain pre-merge values as a separate
 feature version.
 
-### Lazy predicate pushdown
+### Lazy reads
 
-Local lazy reads use `polars-io-tools` to coordinate supported sort-key predicates into the bounded index and every
-feature source before positional concatenation. Runtime-computed reads defer downstream predicates until after
-computation to preserve neighbour context. As-of reads retain the right-hand history required for carry-forward
-semantics.
+`read(..., materialized=False)` returns a LazyFrame. Explicit `start`, `end` and filter arguments are applied by the
+Rust read. Predicates added later to the LazyFrame are applied by Polars after the native scan.
 
-Projection-only aggregations remain correct, but a requested feature group that is later projected away must still
-read one column to preserve its row count during horizontal concatenation.
+### Querying with DataFusion
 
-### Parallel I/O
+With the `datafusion` extra (`pip install gamma-lake[datafusion]`), `feature_table()` returns features as a table for
+[DataFusion](https://datafusion.apache.org/python/) SQL:
 
-With `run_on_ray_cluster=True`, Gamma Lake dispatches feature-group operations independently through Ray. Group writes
-and the single master-index update run in parallel. Metadata becomes visible only after the feature and index writes
-succeed. Install Ray support with `pip install "gamma-lake[ray]"`.
+```python
+import datafusion
+
+ctx = datafusion.SessionContext()
+ctx.register_table("features", lake.feature_table(["feature_a", "feature_b"]))
+ctx.sql("SELECT symbol, avg(feature_a) FROM features WHERE timestamp >= '2024-01-01' GROUP BY symbol").to_polars()
+```
+
+`SELECT *` returns what `read()` returns, and filters on sort keys are pushed into the read. The `datafusion` package
+must have the same major version as the DataFusion gamma-lake is built with (55); see
+[Native Engine](https://github.com/Point72/gamma-lake/wiki/Native-Engine#querying-with-datafusion) for details.
+
+### Concurrent writers
+
+A write commits to several Delta tables: the feature tables first, then the index, then the metadata tables, so
+metadata becomes visible only after the feature and index writes succeed. Each commit is atomic, and writes to one
+lake from a single process run one at a time.
+
+A write commits to a table only if the table has not changed since the write read it. If another process committed to
+it in between, the write stops there and the tables it already committed to are
+[rolled back](#transactions-and-rollback): it raises `ConflictError`, and the lake is unchanged, so the write can be
+run again. If the rollback cannot complete, it raises `PartialWriteError` instead, and the lake holds part of the
+write.
+
+For writers in several processes, pass `lock`: a callable that takes the absolute path or URL of a table and returns
+a context manager. Gamma Lake enters it around each commit to that table, so commits to one table from different
+processes run one at a time, which object stores without atomic commits need. Reads take no lock.
+
+The lock serialises commits; it does not make a write atomic. A write plans where its rows go in the index before it
+commits, and a write that adds no index rows, like `consolidate_feature_groups`, reads the index without committing
+to it. If another process extends the index in between, the tables can end up misaligned, even when the two writes
+touch different keys and features. Writers in several processes must therefore coordinate each `add_*` and
+`consolidate_feature_groups` call, for example by holding one lake-wide lock. Reading through a
+`gammalake.native.NativeLake` opened with `validate=True` detects misaligned tables.
+
+```python
+import hashlib
+
+from filelock import FileLock
+
+def table_lock(table: str) -> FileLock:
+    return FileLock(f"/shared/locks/{hashlib.sha1(table.encode()).hexdigest()}.lock")
+
+lake = GammaFeatureLake(base_path="s3://my-bucket/features", lock=table_lock)
+```
+
+An exception raised by the lock propagates unchanged once the write is rolled back. If part of the write committed and
+could not be rolled back, a `PartialWriteError` is raised instead, with the lock's exception as its cause. A table
+whose lock failed to release after its commit counts as committed, and is rolled back with the others.
 
 ### Metadata and versioning
 
-Every feature write records its name, version, owner, table address, signal type, and optional feature parameters.
+Every new feature, and every new version of one, records its name, version, owner, table address, signal type, and
+optional feature parameters. Appending rows to the latest version records nothing new.
 `read()` selects the latest version by default; pass a filtered metadata frame to select an owner or historical
 version explicitly.
 
@@ -232,32 +279,38 @@ version explicitly.
 | New index rows        | Extend the index once; preserve aligned prefixes                  |
 | Overlapping rows      | Versioned copy or Delta merge                                     |
 | Cross-group assembly  | Predicate-distributed positional horizontal concatenation         |
-| Parallel I/O          | Ray task per feature group                                        |
 | Versioning            | Append-only metadata records owner and version per feature column |
 | Write tracking        | Append-only transaction log; failed writes are rolled back        |
 
 ### Transactions and rollback
 
-Each write (`add_features`, `add_targets`, and the other `add_*` methods) is recorded in the append-only
-`transaction_log` table as `pending`, then `success`. A transaction's current status is its row with the latest
-`updated_at`. If a write fails, it is recorded as `failed`, the lake is restored to its state when the write started with
-`restore_to_timestamp`, and it is recorded as `rolled_back`. A transaction that stays `failed` or `pending` was not
-rolled back, and `restore_to_timestamp(started_at)` recovers the lake. Rollback inherits the limits of
-`restore_to_timestamp`, such as assuming no concurrent writers.
+Each `add_*` write of rows is recorded in the append-only `transaction_log` table as `pending`, then `success`. A
+transaction's current status is its row with the latest `updated_at`. If a write fails after committing to some
+tables, it is recorded as `failed`, its commits are undone on each table it committed to, and it is recorded as
+`rolled_back`; the write then fails as if it had committed nothing. Tables it created are left in place,
+unreferenced, so reads never see them.
+
+Rollback identifies the failed write's commits by transaction id and preserves unrelated writers' commits. If the
+write cannot be undone without removing another writer's changes, it remains `failed` and raises
+`PartialWriteError` naming the affected tables. Other operations, such as `annotate`,
+`consolidate_feature_groups` and runtime-feature methods, are not logged.
 
 ## Documentation
 
-| Document                                                                    | Description                                                 |
-| --------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| [Architecture](#how-gamma-lake-works)                                       | Index design, feature groups, and append/merge semantics    |
-| [Best practices](https://github.com/Point72/gamma-lake/wiki/Best-Practices) | Recommended versioning, update, and parallel-write patterns |
-| [Performance](https://github.com/Point72/gamma-lake/wiki/Performance)       | Benchmark comparison against per-day Parquet files          |
-| [docs/benchmarking.md](docs/benchmarking.md)                                | Running the portable ASV read/write benchmarks              |
-| [examples/quickstart.py](examples/quickstart.py)                            | Runnable end-to-end demo                                    |
+| Document                                                                             | Description                                                 |
+| ------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| [Architecture](#how-gamma-lake-works)                                                | Index design, feature groups, and append/merge semantics    |
+| [Best practices](https://github.com/Point72/gamma-lake/wiki/Best-Practices)          | Recommended versioning, update, and parallel-write patterns |
+| [Performance](https://github.com/Point72/gamma-lake/wiki/Performance)                | Comparison with per-day Parquet files                       |
+| [Benchmarking](https://github.com/Point72/gamma-lake/blob/main/docs/benchmarking.md) | Running the read/write benchmarks                           |
+| [Native engine](https://github.com/Point72/gamma-lake/wiki/Native-Engine)            | Rust reads and writes, from Python and Rust                 |
+| [Migrating from 0.2](https://github.com/Point72/gamma-lake/wiki/Migrating-from-0.2)  | Removed and moved options, methods and modules              |
 
 ## Core API
 
 ```python
+from datetime import date
+
 from gammalake import GammaFeatureLake
 
 lake = GammaFeatureLake(base_path="s3://my-bucket/features")
@@ -278,7 +331,7 @@ trusted_lake.add_runtime_transforms(["feature_a"], ["abs", "reciprocal"])  # nam
 
 # Reading
 lake.read(["feature_a", "feature_b"])                        # latest versions
-lake.read(["feature_a"], start="2023-01-01", end="2024-01-01")  # date range
+lake.read(["feature_a"], start=date(2023, 1, 1), end=date(2024, 1, 1))  # date range, inclusive
 lake.read(lake.feature_metadata_frame()                      # specific owner/version
           .filter(pl.col("owner") == "team-a").collect())
 
@@ -297,12 +350,6 @@ To install `gamma-lake` via **pip**, run this command in your terminal:
 
 ```bash
 pip install gamma-lake
-```
-
-This installs the local execution dependencies without Ray. To enable distributed execution:
-
-```bash
-pip install "gamma-lake[ray]"
 ```
 
 To install `gamma-lake` via **conda**, run this command in your terminal:

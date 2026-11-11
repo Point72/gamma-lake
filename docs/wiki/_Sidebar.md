@@ -13,9 +13,11 @@ Notes for editors:
 - [Architecture](https://github.com/Point72/gamma-lake#how-gamma-lake-works)
 - [Installation](Installation)
 - [Performance](Performance)
+- [Native Engine](Native-Engine)
 - [Best Practices](Best-Practices)
 - [API Reference](API-Reference)
 - [Examples](Examples)
+- [Migrating from 0.2](Migrating-from-0.2)
 
 **Developer Guide**
 

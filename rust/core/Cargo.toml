@@ -1,0 +1,26 @@
+[package]
+name = "gamma_lake_core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Storage-independent core of gamma-lake: feature lakes over any table store, read through DataFusion"
+keywords = ["feature-store", "arrow", "datafusion"]
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+tokio.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+datafusion = { workspace = true, features = ["sql"] }
+tempfile.workspace = true

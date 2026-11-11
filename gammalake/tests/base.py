@@ -1,8 +1,7 @@
 """Shared test logic for GammaFeatureLake.
 
 Each ``_test_*`` method receives a fully initialized ``GammaFeatureLake``
-instance and performs all assertions through ``fs.io.*`` so the scenarios
-remain backend agnostic.
+instance and checks it through its public API and the Delta tables it writes.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ import pytest
 from ccflow import ArrowSchema
 from packaging import version
 from polars.testing import assert_frame_equal
+from polars_io_tools import scan_delta
 
 from gammalake import (
     GammaFeatureLake,
@@ -141,9 +141,9 @@ class GammaFeatureLakeTestsMixin:
         n_unique_deltatable,
         n_unique_versions,
     ):
-        fm = fs.io.scan_delta(fs.feature_metadata).collect()
-        tm = fs.io.scan_delta(fs.table_metadata).collect()
-        idx = fs.io.scan_delta(fs.index).collect()
+        fm = scan_delta(fs.feature_metadata).collect()
+        tm = scan_delta(fs.table_metadata).collect()
+        idx = scan_delta(fs.index).collect()
 
         assert sorted(fm["feature_name"].unique().to_list()) == sorted(feature_names)
         assert fm.height == feature_metadata_height
@@ -169,12 +169,12 @@ class GammaFeatureLakeTestsMixin:
            which always writes null sentinel rows for every pre-existing global index
            entry, ensuring the newest table always spans the complete index.
         """
-        index = fs.io.scan_delta(fs.index).collect().sort(fs.sort_keys)
+        index = scan_delta(fs.index).collect().sort(fs.sort_keys)
         index_keys = index.select(fs.sort_keys)
 
         # --- Invariant 1: physical tables are subsets of the global index with no dupes ---
-        for table_addr in fs.io.scan_delta(fs.table_metadata).collect()["table_addr"].unique():
-            physical = fs.io.scan_delta(fs.get_path(table_addr)).collect().select(fs.sort_keys).sort(fs.sort_keys)
+        for table_addr in scan_delta(fs.table_metadata).collect()["table_addr"].unique():
+            physical = scan_delta(fs.get_path(table_addr)).collect().select(fs.sort_keys).sort(fs.sort_keys)
             orphans = physical.join(index_keys, on=fs.sort_keys, how="anti")
             assert orphans.height == 0, (
                 f"Physical table {table_addr} has {orphans.height} row(s) whose sort keys are absent from the global index:\n{orphans}"
@@ -215,7 +215,7 @@ class GammaFeatureLakeTestsMixin:
         sparse_feature tables are excluded: they intentionally store only a subset of index rows.
         """
         pk = fs.primary_sort_key
-        index = fs.io.scan_delta(fs.index).collect().sort(fs.sort_keys)
+        index = scan_delta(fs.index).collect().sort(fs.sort_keys)
 
         fm = fs.feature_metadata_frame().collect()
         sparse_addrs = fm.filter(pl.col("signal_type") == "sparse_feature")["table_addr"].unique().to_list()
@@ -228,7 +228,7 @@ class GammaFeatureLakeTestsMixin:
             .unique()
         )
         for table_addr in current_addrs:
-            table_latest = fs.io.scan_delta(fs.get_path(table_addr)).collect().select(fs.sort_keys).sort(fs.sort_keys)
+            table_latest = scan_delta(fs.get_path(table_addr)).collect().select(fs.sort_keys).sort(fs.sort_keys)
             if table_latest.height == 0:
                 continue
             pk_min = table_latest[pk].min()
@@ -243,15 +243,13 @@ class GammaFeatureLakeTestsMixin:
     def _test_exceptions_uninitialized(self, fs: GammaFeatureLake):
         """Requires an *uninitialized* GammaFeatureLake instance."""
         with pytest.raises(UninitializedDeltaLakeException):
-            fs._get_latest_feature_tables(...)
-        with pytest.raises(UninitializedDeltaLakeException):
             fs.read(...)
         with pytest.raises(UninitializedDeltaLakeException):
-            fs._write_new_feature_table(...)
-        with pytest.raises(UninitializedDeltaLakeException):
-            fs._get_tables_to_update(...)
+            fs.feature_metadata_frame()
         with pytest.raises(UninitializedDeltaLakeException):
             fs.add_features(...)
+        with pytest.raises(UninitializedDeltaLakeException):
+            fs.add_targets(...)
 
     def _test_exceptions(self, fs: GammaFeatureLake):
         """Requires an already-initialized GammaFeatureLake instance."""
@@ -267,7 +265,7 @@ class GammaFeatureLakeTestsMixin:
         with pytest.raises(ValueError):
             fs.add_features(pl.DataFrame())
 
-    def _test_simple_operations(self, fs: GammaFeatureLake, use_remote_data=False, run_on_ray_cluster=False):
+    def _test_simple_operations(self, fs: GammaFeatureLake):
         n_features = 3
         n_symbols = 10
         n_days = 30
@@ -279,12 +277,7 @@ class GammaFeatureLakeTestsMixin:
             .with_columns(pl.lit(0).alias("event"))
             .select(["event"] + fs.sort_keys)
         )
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df))
-        else:
-            fs.add_features(df, owner="test-owner")
+        fs.add_features(df, owner="test-owner")
         fs.add_as_of_features(event_df.select(fs.sort_keys + ["event"]), params={"tolerance": "1h"})
         self.assertExpected(
             fs,
@@ -297,19 +290,10 @@ class GammaFeatureLakeTestsMixin:
         )
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
-        with pytest.raises(MissingFeaturesException):
-            fs.read(["feature_does_not_exist"])
-
-        with pytest.raises(MissingOrMisregisteredSignalsException):
-            fs.read(["feature_0", "feature_1"], targets=["feature_2"])
-
-        with pytest.raises(ValueError):
-            fs.add_features(pl.DataFrame())
-
         with pytest.raises(ValueError):
             fs.add_targets(pl.DataFrame())
 
-    def _test_adding_days(self, fs: GammaFeatureLake, use_remote_data=False, run_on_ray_cluster=False):
+    def _test_adding_days(self, fs: GammaFeatureLake):
         # Step 1: Add 10 days worth of features, starting on day 0.
         # Step 2: Add 20 days worth of features, starting on day 0.
         # Step 3: Add 20 days worth of features, starting on day 50.
@@ -322,12 +306,7 @@ class GammaFeatureLakeTestsMixin:
 
         # Step 1
         df = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date)
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df))
-        else:
-            fs.add_features(df)
+        fs.add_features(df)
         df = clean(df, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -339,19 +318,14 @@ class GammaFeatureLakeTestsMixin:
             index_height=n_symbols * n_days,
         )
         assert df.sort(fs.sort_keys).select(features).equals(fs.read(features).select(features))
-        last_updates = fs.io.scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
+        last_updates = scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
         assert sorted(last_updates["last_updated"]) == [start_date + timedelta(days=n_days)]
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
         # Step 2
         df2 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days * 2, start_date=start_date)
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df2), overlap_mode="merge")
-        else:
-            fs.add_features(df2, overlap_mode="merge")
+        fs.add_features(df2, overlap_mode="merge")
         df2 = clean(df2, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -363,19 +337,14 @@ class GammaFeatureLakeTestsMixin:
             index_height=2 * (n_symbols * n_days),
         )
         assert df2.sort(fs.sort_keys).select(features).equals(fs.read(features).select(features))
-        last_updates = fs.io.scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
+        last_updates = scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
         assert sorted(last_updates["last_updated"]) == [start_date + timedelta(days=n_days * 2)]
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
         # Step 3
         df3 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days * 2, start_date=start_date + timedelta(days=50))
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df3))
-        else:
-            fs.add_features(df3)
+        fs.add_features(df3)
         df3 = clean(df3, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -387,19 +356,14 @@ class GammaFeatureLakeTestsMixin:
             index_height=2 * (n_symbols * n_days) + 2 * (n_symbols * n_days),
         )
         assert pl.concat([df2.sort(fs.sort_keys), df3.sort(fs.sort_keys)]).select(features).equals(fs.read(features).select(features))
-        last_updates = fs.io.scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
+        last_updates = scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
         assert sorted(last_updates["last_updated"]) == [start_date + timedelta(days=50) + timedelta(days=n_days * 2)]
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
         # Step 4
         df4 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days * 2, start_date=start_date + timedelta(days=40))
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df4), overlap_mode="merge")
-        else:
-            fs.add_features(df4, overlap_mode="merge")
+        fs.add_features(df4, overlap_mode="merge")
         df4 = clean(df4, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -413,12 +377,12 @@ class GammaFeatureLakeTestsMixin:
         df3_remainder = df3.filter(pl.col("timestamp") > df4["timestamp"].max())
         expected = pl.concat([df2.sort(fs.sort_keys), df4.sort(fs.sort_keys), df3_remainder.sort(fs.sort_keys)]).sort(fs.sort_keys)
         assert expected.select(features).equals(fs.read(features).select(features))
-        last_updates = fs.io.scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
+        last_updates = scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
         assert sorted(last_updates["last_updated"]) == [start_date + timedelta(days=50) + timedelta(days=n_days * 2)]
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
-    def _test_adding_symbols(self, fs: GammaFeatureLake, use_remote_data=False, run_on_ray_cluster=False):
+    def _test_adding_symbols(self, fs: GammaFeatureLake):
         # Step 1: Add 10 days worth of features for 5 symbols
         # Step 2: Add 10 days worth of the same features, for the original 5 symbols + 5 new symbols
         # Step 3: Add 10 days worth of the same features, for 10 new symbols
@@ -433,12 +397,7 @@ class GammaFeatureLakeTestsMixin:
 
         # Step 1
         df1 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date)
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df1), overlap_mode="merge")
-        else:
-            fs.add_features(df1, overlap_mode="merge")
+        fs.add_features(df1, overlap_mode="merge")
         df1 = clean(df1, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -455,12 +414,7 @@ class GammaFeatureLakeTestsMixin:
 
         # Step 2
         df2 = generate_test_data(n_features=n_features, n_symbols=2 * n_symbols, n_days=n_days, start_date=start_date)
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df2), overlap_mode="merge")
-        else:
-            fs.add_features(df2, overlap_mode="merge")
+        fs.add_features(df2, overlap_mode="merge")
         df2 = clean(df2, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -477,12 +431,7 @@ class GammaFeatureLakeTestsMixin:
 
         # Step 3
         df3 = generate_test_data(n_features=n_features, n_symbols=10, symbols_id_start=10, n_days=n_days, start_date=start_date)
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df3), overlap_mode="merge")
-        else:
-            fs.add_features(df3, overlap_mode="merge")
+        fs.add_features(df3, overlap_mode="merge")
         df3 = clean(df3, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -499,12 +448,7 @@ class GammaFeatureLakeTestsMixin:
 
         # Step 4
         df4 = generate_test_data(n_features=n_features, n_symbols=20, symbols_id_start=20, n_days=n_days, start_date=start_date + timedelta(days=20))
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df4), overlap_mode="merge")
-        else:
-            fs.add_features(df4, overlap_mode="merge")
+        fs.add_features(df4, overlap_mode="merge")
         df4 = clean(df4, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -528,12 +472,7 @@ class GammaFeatureLakeTestsMixin:
             n_days=n_days,
             start_date=start_date + timedelta(days=20),
         )
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df5), overlap_mode="merge")
-        else:
-            fs.add_features(df5, overlap_mode="merge")
+        fs.add_features(df5, overlap_mode="merge")
         df5 = clean(df5, fs.sort_keys)
         new_features = features + [f"feature_{i}" for i in range(n_features, 2 * n_features)]
         self.assertExpected(
@@ -561,12 +500,7 @@ class GammaFeatureLakeTestsMixin:
             start_date=start_date + timedelta(days=20),
         )
         new_features = features + [f"feature_{i}" for i in range(2 * n_features, 3 * n_features)]
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df6), overlap_mode="merge")
-        else:
-            fs.add_features(df6, overlap_mode="merge")
+        fs.add_features(df6, overlap_mode="merge")
         df6 = clean(df6, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -577,9 +511,7 @@ class GammaFeatureLakeTestsMixin:
             n_unique_versions=2,
             index_height=650,
         )
-        assert sorted(fs.io.scan_delta(fs.feature_metadata).collect()["feature_name"].unique().to_list()) == [
-            f"feature_{i}" for i in range(3 * n_features)
-        ]
+        assert sorted(scan_delta(fs.feature_metadata).collect()["feature_name"].unique().to_list()) == [f"feature_{i}" for i in range(3 * n_features)]
         step5_and_6_index_values = pl.concat([df5, df6], how="diagonal").select(fs.sort_keys).unique()
         new_values_added = step5_and_6_index_values.join(df5, how="left", on=fs.sort_keys).join(df6, how="left", on=fs.sort_keys)
         assert (
@@ -599,7 +531,7 @@ class GammaFeatureLakeTestsMixin:
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
-    def _test_appending_new_features(self, fs: GammaFeatureLake, use_remote_data=False, run_on_ray_cluster=False):
+    def _test_appending_new_features(self, fs: GammaFeatureLake):
         # Step 1: Add 10 days worth of 3 features (f0, f1, f2) for 5 symbols
         # Step 2: Add 10 days worth of 3 old features and 2 new features (f3, f4) for 5 symbols.
         n_symbols = 5
@@ -608,12 +540,7 @@ class GammaFeatureLakeTestsMixin:
         # Step 1
         df = generate_test_data(n_features=3, n_symbols=5, n_days=10)
         features = [f"feature_{i}" for i in range(3)]
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df))
-        else:
-            fs.add_features(df)
+        fs.add_features(df)
         df = clean(df, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -631,12 +558,7 @@ class GammaFeatureLakeTestsMixin:
         # Step 2
         df = generate_test_data(n_features=5, n_symbols=5, n_days=10)
         features = [f"feature_{i}" for i in range(5)]
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df), overlap_mode="merge")
-        else:
-            fs.add_features(df, overlap_mode="merge")
+        fs.add_features(df, overlap_mode="merge")
         df = clean(df, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -652,7 +574,7 @@ class GammaFeatureLakeTestsMixin:
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
-    def _test_features_with_holes(self, fs: GammaFeatureLake, use_remote_data=False, run_on_ray_cluster=False):
+    def _test_features_with_holes(self, fs: GammaFeatureLake):
         # Step 1: Add 10 days worth of 5 features, starting on day 0.
         # Step 2: Add 10 days worth of 3 features, starting on day 10
         # Step 3: Add 10 days worth of 5 features, starting on day 20.
@@ -664,12 +586,7 @@ class GammaFeatureLakeTestsMixin:
 
         # Step 1
         df = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date)
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df))
-        else:
-            fs.add_features(df)
+        fs.add_features(df)
         df = clean(df, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -681,19 +598,14 @@ class GammaFeatureLakeTestsMixin:
             index_height=n_symbols * n_days,
         )
         assert df.sort(fs.sort_keys).select(features).equals(fs.read(features).select(features))
-        last_updates = fs.io.scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
+        last_updates = scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
         assert sorted(last_updates["last_updated"]) == [start_date + timedelta(days=n_days)]
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
         # Step 2
         df2 = generate_test_data(n_features=n_features - 2, n_symbols=n_symbols, n_days=n_days, start_date=start_date + timedelta(days=10))
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df2))
-        else:
-            fs.add_features(df2)
+        fs.add_features(df2)
         df2 = clean(df2, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -704,19 +616,14 @@ class GammaFeatureLakeTestsMixin:
             n_unique_versions=1,
             index_height=2 * (n_symbols * n_days),
         )
-        last_updates = fs.io.scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
+        last_updates = scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
         assert sorted(last_updates["last_updated"]) == [start_date + timedelta(days=n_days * 2)]
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
         # Step 3
         df3 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date + timedelta(days=20))
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df3))
-        else:
-            fs.add_features(df3)
+        fs.add_features(df3)
         df3 = clean(df3, fs.sort_keys)
         self.assertExpected(
             fs,
@@ -727,7 +634,7 @@ class GammaFeatureLakeTestsMixin:
             n_unique_versions=1,
             index_height=3 * (n_symbols * n_days),
         )
-        last_updates = fs.io.scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
+        last_updates = scan_delta(fs.table_metadata).collect().group_by("table_addr").agg(pl.col("last_updated").max())
         assert sorted(last_updates["last_updated"]) == [start_date + timedelta(days=n_days * 3)]
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
@@ -852,7 +759,7 @@ class GammaFeatureLakeTestsMixin:
             index_height=n_symbols * n_days,
         )
 
-    def _test_add_index_rows(self, fs: GammaFeatureLake, use_remote_data: bool = False):
+    def _test_add_index_rows(self, fs: GammaFeatureLake):
         """Index-only updates pad overlapping dense tables without changing metadata or sparse tables."""
         n_symbols = 4
         n_days = 10
@@ -874,18 +781,13 @@ class GammaFeatureLakeTestsMixin:
         dense_addrs = [addr for addr in feature_metadata_before["table_addr"].unique() if addr not in excluded_addrs]
 
         def physical_heights(addrs: list[str]) -> dict[str, int]:
-            return {addr: fs.io.scan_delta(fs.get_path(addr)).collect().height for addr in addrs}
+            return {addr: scan_delta(fs.get_path(addr)).collect().height for addr in addrs}
 
         baseline_index_height = all_index.height
         excluded_heights = physical_heights(excluded_addrs)
         within = generate_test_data(n_features=1, n_symbols=n_symbols, n_days=3, start_date=start_date + timedelta(days=2)).select(fs.sort_keys)
         within = clean(within.with_columns(pl.col("timestamp") + pl.duration(hours=6)), fs.sort_keys)
-        if use_remote_data:
-            import ray
-
-            fs.add_index_rows(ray.put(within))
-        else:
-            fs.add_index_rows(within.with_columns(pl.lit(99.0).alias("ignored_feature")))
+        fs.add_index_rows(within.with_columns(pl.lit(99.0).alias("ignored_feature")))
 
         expected_height = baseline_index_height + within.height
         assert fs.index_frame().collect().height == expected_height
@@ -960,16 +862,16 @@ class GammaFeatureLakeTestsMixin:
         df1 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date)
         fs.add_features(df1)
 
-        table_addr = fs.io.scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
+        table_addr = scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
         table_path = fs.get_path(table_addr)
-        rows_after_step1 = fs.io.scan_delta(table_path).collect().height
+        rows_after_step1 = scan_delta(table_path).collect().height
 
         # Step 2: overlapping upload triggers merge
         df2 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days * 2, start_date=start_date)
         fs.add_features(df2, overlap_mode="merge")
         df2 = clean(df2, fs.sort_keys)
 
-        current_data = fs.io.scan_delta(table_path).collect().sort(fs.sort_keys)
+        current_data = scan_delta(table_path).collect().sort(fs.sort_keys)
         assert current_data.height > rows_after_step1
         assert rows_after_step1 == n_symbols * n_days
         assert current_data.height == n_symbols * n_days * 2
@@ -984,11 +886,11 @@ class GammaFeatureLakeTestsMixin:
         df1 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date)
         fs.add_features(df1)
 
-        table_addr = fs.io.scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
+        table_addr = scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
         table_path = fs.get_path(table_addr)
 
         # Steps 2-4: each overlaps with previous, triggering merge; row count grows each time
-        prev_height = fs.io.scan_delta(table_path).collect().height
+        prev_height = scan_delta(table_path).collect().height
         for step in range(3):
             df_new = generate_test_data(
                 n_features=n_features,
@@ -997,12 +899,12 @@ class GammaFeatureLakeTestsMixin:
                 start_date=start_date,
             )
             fs.add_features(df_new, overlap_mode="merge")
-            current_height = fs.io.scan_delta(table_path).collect().height
+            current_height = scan_delta(table_path).collect().height
             assert current_height > prev_height
             prev_height = current_height
 
         # Final state has the largest date range
-        final_data = fs.io.scan_delta(table_path).collect()
+        final_data = scan_delta(table_path).collect()
         assert final_data.height == n_symbols * n_days * 4
 
     def _test_merge_updates_overlap_values(self, fs: GammaFeatureLake):
@@ -1017,7 +919,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df1)
         df1_clean = clean(df1, fs.sort_keys)
 
-        table_addr = fs.io.scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
+        table_addr = scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
         table_path = fs.get_path(table_addr)
 
         # Step 2: overlap merge with different random data
@@ -1025,7 +927,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df2, overlap_mode="merge")
         df2_clean = clean(df2, fs.sort_keys)
 
-        final_table = fs.io.scan_delta(table_path).collect().sort(fs.sort_keys)
+        final_table = scan_delta(table_path).collect().sort(fs.sort_keys)
         assert_frame_equal(final_table.select(features), df2_clean.sort(fs.sort_keys).select(features))
 
         # The overlap rows (step 1 range) reflect df2's values, not df1's
@@ -1044,7 +946,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df1)
         df1 = clean(df1, fs.sort_keys)
 
-        table_addr = fs.io.scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
+        table_addr = scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
         table_path = fs.get_path(table_addr)
 
         # Step 2: 10 symbols (5 original + 5 new), same date range → merge
@@ -1052,7 +954,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df2, overlap_mode="merge")
         df2 = clean(df2, fs.sort_keys)
 
-        final_data = fs.io.scan_delta(table_path).collect()
+        final_data = scan_delta(table_path).collect()
         assert len(final_data["symbol"].unique()) == 2 * n_symbols
         assert set(df1["symbol"].unique().to_list()).issubset(set(final_data["symbol"].unique().to_list()))
 
@@ -1066,9 +968,9 @@ class GammaFeatureLakeTestsMixin:
         df1 = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days, start_date=start_date)
         fs.add_features(df1)
 
-        table_addr = fs.io.scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
+        table_addr = scan_delta(fs.feature_metadata).collect().filter(pl.col("table_addr") != "n/a")["table_addr"].unique().item()
         table_path = fs.get_path(table_addr)
-        rows_before = fs.io.scan_delta(table_path).collect().height
+        rows_before = scan_delta(table_path).collect().height
         assert rows_before == n_symbols * n_days
 
         # Step 2: overlap with first n_days + extend by another n_days
@@ -1076,7 +978,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df2, overlap_mode="merge")
         df2_clean = clean(df2, fs.sort_keys)
 
-        new_data = fs.io.scan_delta(table_path).collect()
+        new_data = scan_delta(table_path).collect()
         assert new_data.height == df2_clean.height
 
     def _test_read_with_feature_metadata_dataframe(self, fs: GammaFeatureLake):
@@ -1111,13 +1013,6 @@ class GammaFeatureLakeTestsMixin:
                 fs.read(duplicate_meta)
 
     def _test_merge_cross_table_alignment(self, fs: GammaFeatureLake):
-        """Verifies that alignment appends to table B are recorded in feature_metadata so that
-        reads via feature_metadata produce correctly aligned frames across tables.
-
-        Scenario: A and B initially lack a mid-range day. A is re-inserted including that day,
-        triggering a merge on A and an alignment append on B. The fix ensures align_feature_tables
-        writes a new feature_metadata row for B so reads see the aligned version.
-        """
         n_symbols = 3
         n_days = 10
         start_date = datetime(2020, 6, 20, tzinfo=UTC)
@@ -1142,25 +1037,25 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(make_df(feature_ids_start=0, skip_day=missing_day))
         fs.add_features(make_df(feature_ids_start=3, skip_day=missing_day))
 
-        fm_initial = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm_initial = scan_delta(fs.feature_metadata).collect()
         table_addr_b = fm_initial.filter(pl.col("feature_name") == "feature_3")["table_addr"].unique().item()
-        rows_b_before = fs.io.scan_delta(fs.get_path(table_addr_b)).collect().height
+        rows_b_before = scan_delta(fs.get_path(table_addr_b)).collect().height
 
         # Step 2: re-insert feature_0 for ALL days including missing_day.
         fs.add_features(make_df(feature_ids_start=0, skip_day=None), overlap_mode="merge")
 
         expected_total_rows = n_symbols * n_days
-        assert missing_day in fs.io.scan_delta(fs.index).collect()["timestamp"].to_list()
+        assert missing_day in scan_delta(fs.index).collect()["timestamp"].to_list()
 
         # B's Delta table at latest version has the alignment rows.
-        b_latest_delta = fs.io.scan_delta(fs.get_path(table_addr_b)).collect()
+        b_latest_delta = scan_delta(fs.get_path(table_addr_b)).collect()
         assert b_latest_delta.height == expected_total_rows
         assert b_latest_delta.height > rows_b_before
 
         # align_feature_tables no longer writes a new feature_metadata row (version counter
         # is not affected by alignment appends — the table_addr is unchanged and reads always
         # use the latest physical version).
-        fm_after = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm_after = scan_delta(fs.feature_metadata).collect()
         b_meta_versions = fm_after.filter(pl.col("feature_name") == "feature_3")["version"].to_list()
         assert len(b_meta_versions) == 1, (
             f"feature_metadata for feature_3 should still have 1 version row after alignment append, got {b_meta_versions}"
@@ -1188,14 +1083,6 @@ class GammaFeatureLakeTestsMixin:
         )
 
     def _test_merge_with_new_mid_range_index_row(self, fs: GammaFeatureLake):
-        """Verify that a merge insert which includes a brand-new mid-range index row (a
-        (timestamp, symbol) pair that was never in the index) correctly:
-
-          1. Inserts real feature values for the new row into the target feature table.
-          2. Propagates a null-padded alignment row for the new index row to every other
-             feature table whose last_updated date covers that row.
-          3. Adds the new row to the global index.
-        """
         n_symbols = 5
         n_days = 10
         start_date = datetime(2020, 6, 20, tzinfo=UTC)
@@ -1220,7 +1107,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df_b_partial)
 
         # Sanity-check: the missing day must not yet be in the index.
-        index_before = fs.io.scan_delta(fs.index).collect()
+        index_before = scan_delta(fs.index).collect()
         assert index_before.height == (n_days - 1) * n_symbols
         assert missing_day not in index_before["timestamp"].to_list()
         self.verify_index_alignment(fs)
@@ -1235,7 +1122,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df_a_full, overlap_mode="merge")
 
         # The global index must now contain the previously missing day.
-        index_after = fs.io.scan_delta(fs.index).collect()
+        index_after = scan_delta(fs.index).collect()
         assert index_after.height == n_days * n_symbols
         assert missing_day in index_after["timestamp"].to_list()
 
@@ -1256,21 +1143,6 @@ class GammaFeatureLakeTestsMixin:
         self.verify_delta_version_alignment(fs)
 
     def _test_selective_version_update(self, fs: GammaFeatureLake):
-        """Verify that alignment appends and feature_metadata version recording only happen for
-        feature tables whose range covers the new index rows.
-
-        Setup:
-          - Table A (feature_0): wide date range Jan 1 – Apr 10, 2020, skipping missing_day.
-          - Table B (feature_1): overlapping range Jan 21 – Apr 10, 2020, skipping missing_day.
-            missing_day (Feb 20) falls within B's range so B should receive alignment rows.
-          - Table C (feature_2): early range Jan 2 – Jan 31, 2020.
-            missing_day (Feb 20) is AFTER C's last_updated so C must NOT be touched.
-
-        After re-inserting feature_0 with missing_day included:
-          - A: merge fires → new feature_metadata version row.
-          - B: alignment append fires → new feature_metadata version row.
-          - C: untouched → Delta version and feature_metadata row count unchanged.
-        """
         n_symbols = 3
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         missing_day = start_date + timedelta(days=50)  # Feb 20, 2020
@@ -1306,15 +1178,15 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(df_b)
         fs.add_features(df_c)
 
-        fm_initial = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm_initial = scan_delta(fs.feature_metadata).collect()
         table_addr_b = fm_initial.filter(pl.col("feature_name") == "feature_1")["table_addr"].unique().item()
         table_addr_c = fm_initial.filter(pl.col("feature_name") == "feature_2")["table_addr"].unique().item()
 
-        rows_b_before = fs.io.scan_delta(fs.get_path(table_addr_b)).collect().height
-        rows_c_before = fs.io.scan_delta(fs.get_path(table_addr_c)).collect().height
+        rows_b_before = scan_delta(fs.get_path(table_addr_b)).collect().height
+        rows_c_before = scan_delta(fs.get_path(table_addr_c)).collect().height
 
         # Confirm C's last_updated is strictly before missing_day.
-        table_meta = fs.io.scan_delta(fs.table_metadata).collect()
+        table_meta = scan_delta(fs.table_metadata).collect()
         c_last_updated = table_meta.filter(pl.col("table_addr") == table_addr_c)["last_updated"].max()
         assert c_last_updated < missing_day, f"Test setup error: C last_updated ({c_last_updated}) should be before missing_day ({missing_day})"
         b_last_updated = table_meta.filter(pl.col("table_addr") == table_addr_b)["last_updated"].max()
@@ -1325,10 +1197,10 @@ class GammaFeatureLakeTestsMixin:
         df_a_full = make_feature_df(0, n_days_a, start_date, skip_day=None)
         fs.add_features(df_a_full, overlap_mode="merge")
 
-        fm_after = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm_after = scan_delta(fs.feature_metadata).collect()
 
         # B must have received an alignment append (row count increased).
-        rows_b_after = fs.io.scan_delta(fs.get_path(table_addr_b)).collect().height
+        rows_b_after = scan_delta(fs.get_path(table_addr_b)).collect().height
         assert rows_b_after > rows_b_before, "Table B row count should have increased after alignment append"
 
         # align_feature_tables no longer writes a new feature_metadata row — B still has 1.
@@ -1338,7 +1210,7 @@ class GammaFeatureLakeTestsMixin:
         )
 
         # C must be completely untouched: same row count, no new feature_metadata rows.
-        rows_c_after = fs.io.scan_delta(fs.get_path(table_addr_c)).collect().height
+        rows_c_after = scan_delta(fs.get_path(table_addr_c)).collect().height
         assert rows_c_after == rows_c_before, (
             f"Table C row count should be unchanged (C's range does not cover missing_day): before={rows_c_before}, after={rows_c_after}"
         )
@@ -1360,19 +1232,13 @@ class GammaFeatureLakeTestsMixin:
         self.verify_delta_version_alignment(fs)
 
     def _test_feature_params_preserved_on_remerge(self, fs: GammaFeatureLake):
-        """Verify that when a feature is re-added (triggering the merge path) with new
-        feature_params, the new version row in feature_metadata records the updated params.
-
-        Old bug: the merge path wrote feature_df.with_columns(version=..., owner=...) only,
-        carrying forward the old feature_params silently.
-        """
         import json as _json
 
         n_symbols = 3
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
-        old_params = {"strategy": "linear", "window": 5}
-        new_params = {"strategy": "exponential", "window": 10}
+        old_params = {"strategy": "backward", "tolerance": "5d"}
+        new_params = {"strategy": "nearest", "tolerance": "10d"}
 
         df = clean(
             generate_test_data(n_features=1, n_symbols=n_symbols, n_days=n_days, start_date=start_date),
@@ -1382,7 +1248,7 @@ class GammaFeatureLakeTestsMixin:
         # First insert: stores old_params.
         fs.add_as_of_features(df, params=old_params)
 
-        fm_v0 = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm_v0 = scan_delta(fs.feature_metadata).collect()
         assert fm_v0.filter(pl.col("feature_name") == "feature_0")["feature_params"].first() == _json.dumps(old_params)
 
         # Second insert overlaps → merge path fires. Should record new_params.
@@ -1392,7 +1258,7 @@ class GammaFeatureLakeTestsMixin:
         )
         fs.add_as_of_features(df2, params=new_params, overlap_mode="merge")
 
-        fm_after = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm_after = scan_delta(fs.feature_metadata).collect()
         # Get the row with the highest version for feature_0.
         latest_row = fm_after.filter(pl.col("feature_name") == "feature_0").sort("version", descending=True, nulls_last=True).head(1)
         assert latest_row["feature_params"].first() == _json.dumps(new_params), (
@@ -1403,20 +1269,6 @@ class GammaFeatureLakeTestsMixin:
         assert v0_row["feature_params"].first() == _json.dumps(old_params), "v0 row should retain original params"
 
     def _test_as_of_feature_alignment_skipped(self, fs: GammaFeatureLake):
-        """Verify that align_feature_tables never injects null sentinels into as_of_feature tables.
-
-        as_of features are read via join_asof(strategy="backward") against the global index —
-        not as a direct scan. join_asof naturally carries the last known observation forward
-        to any date that lacks an entry in the as_of table. Injecting null sentinels would
-        corrupt that carry-forward semantics.
-
-        Two scenarios are tested:
-          A) New index row falls WITHIN the as_of table's existing range (mid-range gap).
-          B) New index row falls BEYOND the as_of table's last_updated.
-
-        In both cases the as_of physical table must remain unchanged, and read() must return
-        the correctly carried-forward value (not null).
-        """
         n_symbols = 3
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
@@ -1430,11 +1282,11 @@ class GammaFeatureLakeTestsMixin:
         ).filter(pl.col("timestamp") != mid_gap)
         fs.add_as_of_features(df_b, params={"strategy": "backward"})
 
-        fm = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm = scan_delta(fs.feature_metadata).collect()
         table_addr_b = fm.filter(pl.col("feature_name") == "feature_1")["table_addr"].unique().item()
-        rows_before = fs.io.scan_delta(fs.get_path(table_addr_b)).collect().height
+        rows_before = scan_delta(fs.get_path(table_addr_b)).collect().height
 
-        assert mid_gap not in fs.io.scan_delta(fs.index).collect()["timestamp"].to_list()
+        assert mid_gap not in scan_delta(fs.index).collect()["timestamp"].to_list()
 
         # Scenario A: add normal feature_0 for T1–T10 INCLUDING T5 → T5 is new mid-range index row.
         df_a = clean(
@@ -1442,10 +1294,10 @@ class GammaFeatureLakeTestsMixin:
             fs.sort_keys,
         )
         fs.add_features(df_a, overlap_mode="merge")
-        assert mid_gap in fs.io.scan_delta(fs.index).collect()["timestamp"].to_list()
+        assert mid_gap in scan_delta(fs.index).collect()["timestamp"].to_list()
 
         # as_of physical table must be unchanged — no null sentinels injected.
-        rows_after_a = fs.io.scan_delta(fs.get_path(table_addr_b)).collect().height
+        rows_after_a = scan_delta(fs.get_path(table_addr_b)).collect().height
         assert rows_after_a == rows_before, f"align_feature_tables must not touch as_of tables: expected {rows_before} rows, got {rows_after_a}"
 
         # read() must return the carry-forward value for T5, NOT null.
@@ -1462,9 +1314,9 @@ class GammaFeatureLakeTestsMixin:
             fs.sort_keys,
         )
         fs.add_features(df_c, overlap_mode="merge")
-        assert t11 in fs.io.scan_delta(fs.index).collect()["timestamp"].to_list()
+        assert t11 in scan_delta(fs.index).collect()["timestamp"].to_list()
 
-        rows_after_b = fs.io.scan_delta(fs.get_path(table_addr_b)).collect().height
+        rows_after_b = scan_delta(fs.get_path(table_addr_b)).collect().height
         assert rows_after_b == rows_before, (
             f"align_feature_tables must not touch as_of tables for beyond-last_updated rows: expected {rows_before}, got {rows_after_b}"
         )
@@ -1478,9 +1330,6 @@ class GammaFeatureLakeTestsMixin:
         )
 
     def _test_read_validation_errors(self, fs: GammaFeatureLake):
-        """Verify that read(feature_metadata_df) raises clear errors for invalid inputs:
-        1. Duplicate feature names in the supplied DataFrame.
-        """
         n_symbols = 3
         n_days = 5
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
@@ -1499,7 +1348,7 @@ class GammaFeatureLakeTestsMixin:
             overlap_mode="merge",
         )
 
-        fm = fs.io.scan_delta(fs.feature_metadata).collect()
+        fm = scan_delta(fs.feature_metadata).collect()
 
         # Case 1: duplicate feature name in the passed DataFrame.
         row_f0 = fm.filter(pl.col("feature_name") == "feature_0").sort("version", descending=True, nulls_last=True).head(1)
@@ -1507,53 +1356,7 @@ class GammaFeatureLakeTestsMixin:
         with pytest.raises(ValueError, match="multiple versions"):
             fs.read(dup_df)
 
-    def _test_local_vs_parallel_read(self, fs: GammaFeatureLake):
-        """Verify serial (run_on_ray_cluster=False) and parallel (run_on_ray_cluster=True) reads
-        return identical results from the same underlying data.
-        """
-        n_symbols = 3
-        n_days = 10
-        start_date = datetime(2020, 1, 1, tzinfo=UTC)
-
-        df = clean(
-            generate_test_data(n_features=2, n_symbols=n_symbols, n_days=n_days, start_date=start_date),
-            fs.sort_keys,
-        )
-        fs.add_features(df)
-
-        feature_names = ["feature_0", "feature_1"]
-        serial_fs = fs.model_copy(update={"run_on_ray_cluster": False})
-        parallel_fs = fs.model_copy(update={"run_on_ray_cluster": True})
-
-        def assert_serial_parallel_equal(start=None, end=None):
-            serial = serial_fs.read(feature_names, start=start, end=end).sort(fs.sort_keys)
-            parallel = parallel_fs.read(feature_names, start=start, end=end).sort(fs.sort_keys)
-            assert_frame_equal(serial, parallel, check_row_order=True, check_column_order=False)
-
-        mid_start = start_date + timedelta(days=3)
-        mid_end = start_date + timedelta(days=7)
-
-        assert_serial_parallel_equal()
-        assert_serial_parallel_equal(start=mid_start)
-        assert_serial_parallel_equal(end=mid_end)
-        assert_serial_parallel_equal(start=mid_start, end=mid_end)
-
     def _test_partial_symbol_overlap_nulls_missing_symbols(self, fs: GammaFeatureLake):
-        """Verify that re-adding a feature for a subset of symbols in an overlapping date range
-        nulls out the rows for symbols absent from the re-add.
-
-        ``add_features`` has "complete replacement" semantics for the supplied date range: any
-        (timestamp, symbol) pair in the existing table that falls within [input_min, input_max]
-        but is absent from the new input is treated as having no value and is set to null.
-
-        Setup:
-          - Add feature_0 for T1–T10, symbols S1 and S2.
-          - Re-add feature_0 for T5–T10 with S1 only (S2 absent).
-
-        Expected:
-          - T1–T4: S1 and S2 values preserved (outside the re-add range).
-          - T5–T10: S1 updated to new values, S2 nulled (absent from re-add input).
-        """
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -1594,25 +1397,6 @@ class GammaFeatureLakeTestsMixin:
         assert s2_overlap["feature_0"].is_null().all(), "S2 values in overlap range must be null (complete-replacement semantics)"
 
     def _test_beyond_range_index_entries_null_padded(self, fs: GammaFeatureLake):
-        """Verify that global-index entries introduced by a *different* feature table, which
-        lie beyond the current table's last_updated, are read as null for the current table.
-
-        Polars ``concat(how="horizontal")`` null-pads shorter frames, so no physical null rows
-        need to be written for index entries that post-date a table's last_updated.
-
-        Setup:
-          - Add feature_A for T1–T10 (S1 only).  Global index: T1–T10.
-          - Add feature_B for T1–T15 (S1 only).  Global index grows to T1–T15.
-          - Re-add feature_A for T8–T12 only.  T13–T15 are in the global index but NOT
-            provided in the re-add input.
-
-        Expected:
-          - Reading feature_A: 15 rows total (T1–T15).
-          - feature_A values for T13–T15 are null (index rows that exceed feature_A's physical
-            range are automatically null-padded during horizontal concat).
-          - feature_A values for T8–T12 are the re-add sentinel values.
-          - feature_A values for T1–T7 are the original values.
-        """
         n_days_short = 10
         n_days_long = 15
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
@@ -1668,22 +1452,6 @@ class GammaFeatureLakeTestsMixin:
         assert beyond_range["feature_A"].is_null().all(), "feature_A must be null for global-index entries beyond the table's physical range"
 
     def _test_colocated_feature_preserved_on_partial_remerge(self, fs: GammaFeatureLake):
-        """Verify that when two features share a physical table and only one is re-added with
-        an overlap, the other feature's values are preserved for all rows.
-
-        Old code used write_delta(mode="overwrite") in the overlap path which replaced the
-        entire physical table, silently dropping columns (and data) for co-located features
-        not present in the re-add input.  The new merge_delta path only touches columns
-        present in the source, so the sibling feature must be fully preserved.
-
-        Setup:
-          - Add feature_0 and feature_1 together in one call → they share a table_addr.
-          - Re-add feature_0 only for T5–T10 (overlapping range).
-
-        Expected:
-          - feature_0 updated for T5–T10.
-          - feature_1 values unchanged for ALL timestamps (T1–T10).
-        """
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -1727,86 +1495,7 @@ class GammaFeatureLakeTestsMixin:
         f1_vals = result["feature_1"].to_list()
         assert f1_vals == list(range(100, 110)), f"feature_1 must be entirely preserved after co-located re-add, got {f1_vals}"
 
-    def _test_user_metadata_overlap_uses_merge(self, fs: GammaFeatureLake):
-        """Verify that add_features(df, metadata=custom_df) still performs a correct in-place
-        merge when there is an overlap, now that the old overwrite/copy-on-overlap path has
-        been replaced with merge_delta.
-
-        The ``metadata`` parameter now only affects _get_tables_to_update (Step 2 alignment
-        exclusions); the Step 1 write path always uses merge_delta regardless.
-
-        Setup:
-          - Add feature_0 for T1–T10.
-          - Re-add feature_0 for T5–T10 via add_features(df, metadata=custom_metadata_df).
-          - custom_metadata_df is a valid feature_metadata slice (the current version row).
-
-        Expected:
-          - feature_0 values updated for T5–T10.
-          - T1–T4 values preserved.
-          - No orphaned tables created (table_addr unchanged).
-        """
-        n_days = 10
-        start_date = datetime(2020, 1, 1, tzinfo=UTC)
-        timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
-        overlap_start = start_date + timedelta(days=4)
-
-        df = pl.DataFrame(
-            {
-                "timestamp": timestamps,
-                "symbol": ["S1"] * n_days,
-                "feature_0": list(range(n_days)),
-            }
-        )
-        fs.add_features(df)
-
-        original_addr = fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "feature_0")["table_addr"].unique().item()
-
-        # Build a metadata df that the caller "owns" (mimics an Airflow/ETL use case).
-        custom_meta = fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "feature_0").sort("version", descending=True).head(1)
-
-        df2 = pl.DataFrame(
-            {
-                "timestamp": [overlap_start + timedelta(days=i) for i in range(6)],
-                "symbol": ["S1"] * 6,
-                "feature_0": [999] * 6,
-            }
-        )
-        fs.add_features(df2, metadata=custom_meta, overlap_mode="merge")
-
-        result = fs.read(["feature_0"]).sort("timestamp")
-
-        # Values correct.
-        assert result.filter(pl.col("timestamp") < overlap_start)["feature_0"].to_list() == list(range(4))
-        assert result.filter(pl.col("timestamp") >= overlap_start)["feature_0"].to_list() == [999] * 6
-
-        # table_addr must not have changed (still in-place merge, not copy-to-new-path).
-        new_addr = (
-            fs.feature_metadata_frame()
-            .collect()
-            .filter(pl.col("feature_name") == "feature_0")
-            .sort("version", descending=True)
-            .head(1)["table_addr"]
-            .item()
-        )
-        assert new_addr == original_addr, f"table_addr must not change after merge-based overlap (was {original_addr}, got {new_addr})"
-
     def _test_as_of_feature_overlap_remerge(self, fs: GammaFeatureLake):
-        """Verify that re-adding an as_of feature with an overlapping date range correctly
-        updates values and does NOT null out existing as_of rows within the input range.
-
-        as_of tables are excluded from when_not_matched_by_source_update (not_matched_predicate
-        is set to None), so existing rows outside the input must be preserved.
-
-        Setup:
-          - Add regular feature_reg for T1–T10 (populates global index).
-          - Add as_of feature_asof for T1–T8 with values 0–7.
-          - Re-add feature_asof for T5–T10 with sentinel value 999.
-
-        Expected:
-          - T1–T4: original values 0–3 preserved.
-          - T5–T10: updated to 999.
-          - Reading via join_asof still returns non-null values for all T1–T10.
-        """
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -1854,24 +1543,6 @@ class GammaFeatureLakeTestsMixin:
         assert after == [999] * 6, f"as_of values in overlap range must all be 999, got {after}"
 
     def _test_feature_params_json_on_overlap_remerge(self, fs: GammaFeatureLake):
-        """Verify that re-adding an as_of feature with updated params via an overlapping
-        merge correctly JSON-serializes the new params and that read_table can deserialize
-        them via json.loads to drive join_asof.
-
-        Old code used pl.lit(feature_params) in the overlap write path, which stored a
-        Python dict repr (e.g. \"{'strategy': 'backward'}\") instead of valid JSON.  New
-        code uses json.dumps consistently.
-
-        Setup:
-          - Add regular feature_reg for T1–T10 (populates index).
-          - Add as_of feature_asof with params={'strategy': 'backward'}.
-          - Re-add feature_asof with overlap and params={'strategy': 'backward', 'tolerance': '1d'}.
-
-        Expected:
-          - feature_metadata records the new params as valid JSON.
-          - read(['feature_asof']) succeeds (would raise json.JSONDecodeError with old code).
-          - The new params are retrievable via json.loads from feature_metadata.
-        """
         import json as _json
 
         n_days = 10
@@ -1930,9 +1601,6 @@ class GammaFeatureLakeTestsMixin:
     # ------------------------------------------------------------------
 
     def _test_copy_mode_creates_new_table(self, fs: GammaFeatureLake):
-        """Verify that overlap_mode='copy' (default) creates a new table_addr on overlap and
-        that reads return correct values.
-        """
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2008,9 +1676,6 @@ class GammaFeatureLakeTestsMixin:
         assert (result.filter(pl.col("timestamp") >= overlap_start)["feature_0"] == 999).all()
 
     def _test_mixed_overlap_modes(self, fs: GammaFeatureLake):
-        """Verify that copy and merge modes can be mixed across different features and across
-        re-adds of the same feature.  Each mode must produce correct reads independently.
-        """
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2044,10 +1709,6 @@ class GammaFeatureLakeTestsMixin:
         assert f2_overlap == [200] * 6, f"F2 overlap values wrong: {f2_overlap}"
 
     def _test_copy_then_merge_same_feature(self, fs: GammaFeatureLake):
-        """Verify that a feature can be first added with copy mode and then re-added with merge
-        mode (and vice versa).  The latest version always wins for reads regardless of the
-        mode used for each individual write.
-        """
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2080,10 +1741,6 @@ class GammaFeatureLakeTestsMixin:
         assert overlap_vals == [3] * 6, f"Expected [3]*6 after merge on top of copy, got {overlap_vals}"
 
     def _test_parametrized_overlap_modes_read_correctness(self, fs: GammaFeatureLake, overlap_mode: str):
-        """Verify that both overlap modes produce identical read() output for a simple
-        add-then-overlap scenario.  The feature values returned by read() should be the
-        same regardless of whether copy or merge is used.
-        """
         n_days = 10
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2103,12 +1760,6 @@ class GammaFeatureLakeTestsMixin:
         assert result.filter(pl.col("timestamp") >= overlap_start)["feature_0"].to_list() == [999] * 6
 
     def _test_index_alignment_invariant_copy(self, fs: GammaFeatureLake):
-        """Verify the alignment invariant for copy mode.
-
-        After adding new index rows beyond an existing table's range, every
-        table_addr recorded in feature_metadata must scan (at latest physical version)
-        to exactly the global index on its pk range.
-        """
         n_days = 5
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2137,13 +1788,6 @@ class GammaFeatureLakeTestsMixin:
         assert (beyond["feature_A"] == 99).all()
 
     def _test_index_alignment_invariant_merge(self, fs: GammaFeatureLake):
-        """Verify the alignment invariant for merge mode.
-
-        After a merge-mode write introduces a previously-missing index row, every
-        table_addr in feature_metadata must scan (at latest physical version) to exactly
-        the global index on its pk range — including the newly aligned tables updated
-        by align_feature_tables.
-        """
         n_days = 5
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2174,13 +1818,6 @@ class GammaFeatureLakeTestsMixin:
         assert missing_row["feature_B"].item() is None, "feature_B must be null at missing_day (alignment row)"
 
     def _test_index_alignment_invariant_mixed_modes(self, fs: GammaFeatureLake):
-        """Verify the alignment invariant with mixed copy/merge table histories.
-
-        feature_B is copy-mode. After a merge-mode write on feature_A introduces a new
-        index row, align_feature_tables appends to feature_B and records a new
-        feature_metadata entry. Every table_addr must still scan (at latest physical
-        version) to exactly the global index on its pk range.
-        """
         n_days = 5
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2329,8 +1966,6 @@ class GammaFeatureLakeTestsMixin:
         assert (result.filter(pl.col("timestamp") >= overlap_start)["asof_0"] == 99).all()
 
     def _test_mixed_signal_type_overlap_modes(self, fs: GammaFeatureLake):
-        """Verify that features, targets and as_of_features can independently use copy or merge
-        in the same store, with no cross-contamination of table_addr."""
         n_days = 8
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(n_days)]
@@ -2373,20 +2008,6 @@ class GammaFeatureLakeTestsMixin:
         assert (overlap_rows["asof_0"] == 3).all()
 
     def _test_read_equivalence_across_overlap_modes(self, fs_factory: Callable[[], GammaFeatureLake], modes: list[str]):
-        """Verify that read() returns identical results regardless of which overlap_mode is used.
-
-        Runs the same write sequence (initial insert + two overlapping updates) on independent
-        feature stores — one per mode in ``modes`` — then asserts the final read() output is
-        identical across all of them.
-
-        This is the core correctness guarantee: overlap_mode affects storage structure
-        (table_addr reuse vs copy), but must never affect the data returned
-        by read().
-
-        Args:
-            fs_factory: zero-arg callable returning a fresh initialized GammaFeatureLake
-            modes: list of overlap_mode strings to compare (e.g. ["copy", "merge"])
-        """
         from polars.testing import assert_frame_equal
 
         n_days = 10
@@ -2421,8 +2042,6 @@ class GammaFeatureLakeTestsMixin:
             )
 
     def _test_read_equivalence_multi_symbol(self, fs_factory: Callable[[], GammaFeatureLake], modes: list[str]):
-        """Same as _test_read_equivalence_across_overlap_modes but with multiple symbols and
-        features to catch any symbol-level grouping differences between modes."""
         from polars.testing import assert_frame_equal
 
         n_days = 8
@@ -2465,16 +2084,6 @@ class GammaFeatureLakeTestsMixin:
             )
 
     def _test_last_updated_cutoff_boundary(self, fs: GammaFeatureLake):
-        """Verify alignment when a merge write introduces a missing index row.
-
-        When feature_C is written for days 5-9, missing_input_rows fills in null sentinel
-        rows for days 0-4 (all existing index rows below its pk_max). So table C physically
-        spans day0-day9 from the start, with nulls for days 0-4.
-
-        When a merge on feature_A later introduces the previously-missing day2, align_feature_tables
-        must append day2 to both B (which has real data in that range) and C (which already
-        has null sentinels spanning that range). Both must pass verify_delta_version_alignment.
-        """
         start = datetime(2020, 1, 1, tzinfo=UTC)
         days = [start + timedelta(days=i) for i in range(10)]
         missing_day = days[2]
@@ -2492,7 +2101,7 @@ class GammaFeatureLakeTestsMixin:
         table_addr_c = fm.filter(pl.col("feature_name") == "feature_C")["table_addr"].unique().item()
 
         # C must already span day0-day9 due to missing_input_rows filling in null sentinels.
-        c_before = fs.io.scan_delta(fs.get_path(table_addr_c)).collect()
+        c_before = scan_delta(fs.get_path(table_addr_c)).collect()
         assert c_before[fs.primary_sort_key].min() == days[0], "feature_C pk_min must be day0 (null sentinels filled by missing_input_rows)"
 
         self.verify_index_alignment(fs)
@@ -2513,13 +2122,6 @@ class GammaFeatureLakeTestsMixin:
         assert day2_rows["feature_C"].is_null().all()
 
     def _test_new_symbol_via_merge_aligned(self, fs: GammaFeatureLake):
-        """Pitfall 2: verify that introducing a new symbol via merge aligns all co-resident tables.
-
-        Initially both feature_A and feature_B exist for symbols {S1, S2}.
-        A merge write on feature_A includes symbol S3 (new). The global index gains S3 rows.
-        feature_B must then have S3 null-sentinel rows appended for every date in its range,
-        and verify_delta_version_alignment must pass.
-        """
         start = datetime(2020, 1, 1, tzinfo=UTC)
         days = [start + timedelta(days=i) for i in range(5)]
 
@@ -2543,7 +2145,7 @@ class GammaFeatureLakeTestsMixin:
         # feature_B must now have S3 null-sentinel rows for each day.
         fm = fs.feature_metadata_frame().collect()
         table_addr_b = fm.filter(pl.col("feature_name") == "feature_B")["table_addr"].unique().item()
-        b_latest = fs.io.scan_delta(fs.get_path(table_addr_b)).collect()
+        b_latest = scan_delta(fs.get_path(table_addr_b)).collect()
         b_s3 = b_latest.filter(pl.col("symbol") == "S3")
         assert b_s3.height == len(days), f"feature_B must have {len(days)} S3 sentinel rows after new-symbol merge, got {b_s3.height}"
         assert b_s3["feature_B"].is_null().all(), "S3 sentinel rows in feature_B must be null"
@@ -2556,11 +2158,6 @@ class GammaFeatureLakeTestsMixin:
         assert s3_rows["feature_B"].is_null().all(), "feature_B S3 values must be null (no data written for S3)"
 
     def _test_copy_mode_zero_overlap_reuses_table(self, fs: GammaFeatureLake):
-        """Pitfall 4: copy mode with entirely new data (no pk overlap) must reuse the same table_addr.
-
-        'copy' semantics mean 'on overlap, create a new snapshot'. When there is no overlap
-        the same table should simply be extended (append-only), regardless of overlap_mode.
-        """
         start = datetime(2020, 1, 1, tzinfo=UTC)
         days_1 = [start + timedelta(days=i) for i in range(5)]
         days_2 = [start + timedelta(days=i) for i in range(5, 10)]
@@ -2590,15 +2187,6 @@ class GammaFeatureLakeTestsMixin:
         self.verify_delta_version_alignment(fs)
 
     def _test_merge_feature_asof_colocated_not_aligned(self, fs: GammaFeatureLake):
-        """Pitfall 6: a merge write on a regular feature must NOT inject null sentinels into an as-of table.
-
-        as_of_feature tables are excluded from align_feature_tables because they are read
-        via join_asof carry-forward, which naturally handles gaps. Injecting nulls would corrupt
-        that semantics. This test verifies:
-        1. The as-of table's physical Delta version is unchanged after the merge write.
-        2. The as-of table contains no null-sentinel rows for the new index row.
-        3. read() on the as-of feature still returns correct carry-forward values.
-        """
         start = datetime(2020, 1, 1, tzinfo=UTC)
         days = [start + timedelta(days=i) for i in range(5)]
         missing_day = days[2]
@@ -2614,7 +2202,7 @@ class GammaFeatureLakeTestsMixin:
 
         fm = fs.feature_metadata_frame().collect()
         asof_addr = fm.filter(pl.col("feature_name") == "asof_0")["table_addr"].unique().item()
-        asof_rows_before = fs.io.scan_delta(fs.get_path(asof_addr)).collect().height
+        asof_rows_before = scan_delta(fs.get_path(asof_addr)).collect().height
 
         # Merge write on feature_A including missing_day → introduces missing_day to global index.
         full_df = pl.DataFrame([{"timestamp": t, "symbol": "S1", "feature_A": 1.0} for t in days]).with_columns(
@@ -2623,7 +2211,7 @@ class GammaFeatureLakeTestsMixin:
         fs.add_features(full_df, overlap_mode="merge")
 
         # as-of table must be completely untouched.
-        asof_rows_after = fs.io.scan_delta(fs.get_path(asof_addr)).collect().height
+        asof_rows_after = scan_delta(fs.get_path(asof_addr)).collect().height
         assert asof_rows_after == asof_rows_before, f"as-of table row count must not change (before={asof_rows_before}, after={asof_rows_after})"
 
         # read() on asof_0 must carry forward the last known value across missing_day.
@@ -2648,8 +2236,8 @@ class GammaFeatureLakeTestsMixin:
             pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_ml", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_mr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_ml").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_mr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2671,8 +2259,8 @@ class GammaFeatureLakeTestsMixin:
             pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_dl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_dr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_dl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_dr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2695,8 +2283,8 @@ class GammaFeatureLakeTestsMixin:
             pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_pol", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_por", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_pol").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_por").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2717,8 +2305,8 @@ class GammaFeatureLakeTestsMixin:
         df_left = pl.DataFrame(left_rows).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
         df_right = pl.DataFrame(right_rows).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_msl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_msr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_msl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_msr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2741,8 +2329,8 @@ class GammaFeatureLakeTestsMixin:
             generate_test_data(n_features=2, n_symbols=n_symbols, n_days=n_days, feature_suffix="R", symbols_id_start=2), ["timestamp", "symbol"]
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_jl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_jr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_jl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_jr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2764,8 +2352,8 @@ class GammaFeatureLakeTestsMixin:
             pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_drl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_drr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_drl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_drr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2789,8 +2377,8 @@ class GammaFeatureLakeTestsMixin:
             pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_scl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_scr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_scl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_scr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2802,11 +2390,11 @@ class GammaFeatureLakeTestsMixin:
 
     def _test_merge_static_mismatched_sort_keys_raises(self, fs: GammaFeatureLake):
         """merge() raises ValueError when the two lakes have different sort_keys."""
-        lake_a = GammaFeatureLake(base_path=fs.base_path + "_mka", run_on_ray_cluster=False).initialize(
+        lake_a = GammaFeatureLake(base_path=fs.base_path + "_mka").initialize(
             schema=ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())]))
         )
         # Second lake initialized with a different secondary key column name
-        lake_b = GammaFeatureLake(base_path=fs.base_path + "_mkb", run_on_ray_cluster=False, primary_sort_key="timestamp").initialize(
+        lake_b = GammaFeatureLake(base_path=fs.base_path + "_mkb", primary_sort_key="timestamp").initialize(
             schema=ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("PointID", pa.int64())]))
         )
 
@@ -2824,8 +2412,8 @@ class GammaFeatureLakeTestsMixin:
             pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_tl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_tr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_tl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_tr").initialize()
         lake_left.add_features(df_left.select(["timestamp", "symbol", "feat_a"]))
         lake_left.add_targets(df_left.select(["timestamp", "symbol", "tgt_a"]))
         lake_right.add_features(df_right.select(["timestamp", "symbol", "feat_b"]))
@@ -2835,32 +2423,6 @@ class GammaFeatureLakeTestsMixin:
         assert set(result.columns) == {"timestamp", "symbol", "feat_a", "tgt_a", "feat_b", "tgt_b"}
         assert result["tgt_a"].null_count() == 0
         assert result["tgt_b"].null_count() == 0
-
-    def _test_merge_serial_parallel_equivalence(self, fs: GammaFeatureLake):
-        """merge() with run_on_ray_cluster=True and run_on_ray_cluster=False return identical results."""
-        start_date = datetime(2020, 1, 1, tzinfo=UTC)
-        timestamps = [start_date + timedelta(days=i) for i in range(10)]
-        df_left = pl.DataFrame({"timestamp": timestamps, "symbol": ["S1"] * 10, "feat_a": list(range(10))}).with_columns(
-            pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
-        )
-        df_right = pl.DataFrame({"timestamp": timestamps, "symbol": ["S1"] * 10, "feat_b": list(range(100, 110))}).with_columns(
-            pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
-        )
-
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_mspl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_mspr", run_on_ray_cluster=False).initialize()
-        lake_left.add_features(df_left)
-        lake_right.add_features(df_right)
-
-        serial_left = lake_left.model_copy(update={"run_on_ray_cluster": False})
-        serial_right = lake_right.model_copy(update={"run_on_ray_cluster": False})
-        parallel_left = lake_left.model_copy(update={"run_on_ray_cluster": True})
-        parallel_right = lake_right.model_copy(update={"run_on_ray_cluster": True})
-
-        serial_result = GammaFeatureLake.merge(serial_left, serial_right, ["feat_a"], ["feat_b"]).sort(fs.sort_keys)
-        parallel_result = GammaFeatureLake.merge(parallel_left, parallel_right, ["feat_a"], ["feat_b"]).sort(fs.sort_keys)
-
-        assert_frame_equal(serial_result, parallel_result, check_row_order=True, check_column_order=False)
 
     def _test_merge_static_large_frame_performance(self, fs: GammaFeatureLake):
         """merge() on large sorted frames should complete without error (smoke test)."""
@@ -2872,8 +2434,8 @@ class GammaFeatureLakeTestsMixin:
             generate_test_data(n_features=5, n_symbols=n_symbols, n_days=n_days, feature_suffix="R", symbols_id_start=50), ["timestamp", "symbol"]
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_pefl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_pefr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_pefl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_pefr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2885,23 +2447,14 @@ class GammaFeatureLakeTestsMixin:
         assert elapsed < 30.0, f"merge() took {elapsed:.1f}s — unexpectedly slow"
 
     def _test_merge_static_streaming_sort_merge(self, fs: GammaFeatureLake):
-        """merge() uses streaming sort-merge join on polars >= _STREAMING_MERGE_JOIN_MIN_VERSION.
-
-        Two correctness checks:
-        1. The result matches a plain polars full-outer join (functional correctness is
-           identical regardless of which engine path is taken).
-        2. When the installed polars version supports streaming sort-merge joins, the lazy
-           plan produced by merge() carries a ``hint.sorted`` annotation on the primary sort
-           key of both sides, confirming the optimizer will promote to a sort-merge join.
-        """
         n_days, n_symbols = 8, 3
         df_left = clean(generate_test_data(n_features=2, n_symbols=n_symbols, n_days=n_days, feature_suffix="L"), ["timestamp", "symbol"])
         df_right = clean(
             generate_test_data(n_features=2, n_symbols=n_symbols, n_days=n_days, feature_suffix="R", symbols_id_start=1), ["timestamp", "symbol"]
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_smjl", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_smjr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_smjl").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_smjr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2921,12 +2474,6 @@ class GammaFeatureLakeTestsMixin:
             assert f"hint.sorted('{pk}'" in plan, f"Expected sort hint in streaming plan for polars {pl.__version__}, got:\n{plan}"
 
     def _test_merge_static_with_metadata_frame(self, fs: GammaFeatureLake):
-        """merge() accepts pre-filtered metadata DataFrames in addition to feature name lists.
-
-        Passing a filtered ``feature_metadata`` DataFrame lets callers pin a specific version
-        or read a hand-curated subset — the same flexibility as the ``read(pl.DataFrame, ...)``
-        dispatch.  The result must be identical to the equivalent list-based call.
-        """
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         timestamps = [start_date + timedelta(days=i) for i in range(5)]
         df_left = pl.DataFrame({"timestamp": timestamps, "symbol": ["S1"] * 5, "feat_a": list(range(5))}).with_columns(
@@ -2936,8 +2483,8 @@ class GammaFeatureLakeTestsMixin:
             pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
         )
 
-        lake_left = GammaFeatureLake(base_path=fs.base_path + "_mml", run_on_ray_cluster=False).initialize()
-        lake_right = GammaFeatureLake(base_path=fs.base_path + "_mmr", run_on_ray_cluster=False).initialize()
+        lake_left = GammaFeatureLake(base_path=fs.base_path + "_mml").initialize()
+        lake_right = GammaFeatureLake(base_path=fs.base_path + "_mmr").initialize()
         lake_left.add_features(df_left)
         lake_right.add_features(df_right)
 
@@ -2954,22 +2501,6 @@ class GammaFeatureLakeTestsMixin:
         assert_frame_equal(result_meta.sort(lake_left.sort_keys), result_list.sort(lake_left.sort_keys), check_column_order=False)
 
     def _test_sparse_features(self, fs: GammaFeatureLake):
-        """Verify the behaviour of sparse features end-to-end.
-
-        Four invariants are checked:
-
-        1. **No null sentinels in physical storage**: the sparse physical table stores only the
-           explicitly-uploaded rows; it is never padded with null sentinel rows.
-
-        2. **Alignment skipped on subsequent dense uploads**: after adding new dense features
-           (which grow the global index), the sparse physical table must remain unchanged.
-
-        3. **Read path — nulls for missing rows**: ``fs.read()`` of a sparse feature returns every
-           row in the bounded index with ``null`` where the sparse feature has no observation.
-
-        4. **Read path — global index coverage**: rows after the last sparse observation remain in
-           the result with null sparse values.
-        """
         start_date = datetime(2020, 1, 1, tzinfo=UTC)
         n_symbols, n_days = 4, 20
 
@@ -2989,7 +2520,7 @@ class GammaFeatureLakeTestsMixin:
         sparse_meta = fs.feature_metadata_frame().collect().filter(pl.col("signal_type") == "sparse_feature")
         assert sparse_meta.height == 1, f"Expected 1 sparse feature metadata row, got {sparse_meta.height}"
         sparse_table_addr = sparse_meta["table_addr"][0]
-        physical_sparse = fs.io.scan_delta(fs.get_path(sparse_table_addr)).collect()
+        physical_sparse = scan_delta(fs.get_path(sparse_table_addr)).collect()
         assert physical_sparse.height == sparse_df.height, (
             f"Sparse physical table has {physical_sparse.height} rows; expected {sparse_df.height} (no null sentinels)"
         )
@@ -3001,7 +2532,7 @@ class GammaFeatureLakeTestsMixin:
         start_date2 = start_date + timedelta(days=n_days + 1)
         dense_df2 = clean(generate_test_data(n_features=1, n_symbols=n_symbols, n_days=5, start_date=start_date2, feature_suffix="new"), fs.sort_keys)
         fs.add_features(dense_df2, owner="test")
-        rows_after = fs.io.scan_delta(fs.get_path(sparse_table_addr)).collect().height
+        rows_after = scan_delta(fs.get_path(sparse_table_addr)).collect().height
         assert rows_after == rows_before, (
             f"Sparse physical table grew from {rows_before} to {rows_after} rows after dense upload — "
             "align_feature_tables must not inject null sentinels into sparse tables"
@@ -3032,8 +2563,6 @@ class GammaFeatureLakeTestsMixin:
         assert beyond_cutoff["sparse_val"].is_null().all()
 
     def _test_read_with_filtered_metadata_resolves_runtime_upstream_features(self, fs: GammaFeatureLake):
-        """When passing a filtered feature_metadata DataFrame to read(), runtime features whose upstream
-        root features are absent from the filter must still be computed correctly."""
         n_features = 3
         n_symbols = 5
         n_days = 10
@@ -3101,7 +2630,7 @@ class GammaFeatureLakeTestsMixin:
         with pytest.raises(ValueError, match="annotations schema"):
             fs.annotate(metadata.with_columns(comment=pl.lit("x")))
 
-    def _test_runtime_computed_features(self, fs: GammaFeatureLake, use_remote_data: bool = False):
+    def _test_runtime_computed_features(self, fs: GammaFeatureLake):
         """Register runtime-computed features and verify reads."""
         fs.enable_runtime_computed_features = True
         n_features = 3
@@ -3109,12 +2638,7 @@ class GammaFeatureLakeTestsMixin:
         n_days = 30
         features = [f"feature_{i}" for i in range(n_features)]
         df = generate_test_data(n_features=n_features, n_symbols=n_symbols, n_days=n_days)
-        if use_remote_data:
-            import ray
-
-            fs.add_features(ray.put(df))
-        else:
-            fs.add_features(df, owner="test-owner")
+        fs.add_features(df, owner="test-owner")
         self.assertExpected(
             fs,
             feature_names=features,
@@ -3169,7 +2693,7 @@ class GammaFeatureLakeTestsMixin:
         )
         assert_frame_equal(expected_df.sort(fs.sort_keys), df2.select("timestamp", "symbol", "event_cleaned").sort(fs.sort_keys))
 
-    def _test_runtime_transforms(self, fs: GammaFeatureLake, use_remote_data: bool = False):
+    def _test_runtime_transforms(self, fs: GammaFeatureLake):
         """Register the supported row-local transforms and verify their semantics."""
         fs.enable_runtime_computed_features = True
         timestamps = pl.datetime_range(
@@ -3187,14 +2711,8 @@ class GammaFeatureLakeTestsMixin:
                 "label": ["a", "b", "c", "d", "e"],
             }
         )
-        if use_remote_data:
-            import ray
-
-            input_df = ray.put(df)
-        else:
-            input_df = df
         transforms = ["missing", "nan", "abs", "sign", "squared", "signed_log1p", "positive", "negative", "nonzero", "reciprocal"]
-        fs.add_features(input_df, owner="tbg")
+        fs.add_features(df, owner="tbg")
         fs.add_runtime_transforms(features=["value"], transforms=transforms, owner="tbg")
 
         derived_names = [f"value__{transform}" for transform in transforms]
@@ -3299,7 +2817,7 @@ class GammaFeatureLakeTestsMixin:
 
         all_features = [f"feature_{i}" for i in range(9)]
         pre_consolidation_read = fs.read(all_features)
-        assert fs.io.scan_delta(fs.table_metadata).collect()["table_addr"].n_unique() == 3
+        assert scan_delta(fs.table_metadata).collect()["table_addr"].n_unique() == 3
 
         new_addr = fs.consolidate_feature_groups(all_features)
         assert new_addr is not None
@@ -3307,7 +2825,7 @@ class GammaFeatureLakeTestsMixin:
         latest_metadata = fs.feature_metadata_frame().collect().sort("version", descending=True).group_by("feature_name").agg(pl.all().first())
         assert latest_metadata["table_addr"].unique().to_list() == [new_addr]
         assert latest_metadata["version"].unique().to_list() == [1]
-        table_metadata = fs.io.scan_delta(fs.table_metadata).collect()
+        table_metadata = scan_delta(fs.table_metadata).collect()
         assert table_metadata.filter(pl.col("table_addr") == new_addr).select(pl.col("last_updated").is_not_null()).item()
 
         post_consolidation_read = fs.read(all_features)

@@ -1,81 +1,132 @@
-#########
-# BUILD #
-#########
-.PHONY: develop build install
-
-develop:  ## install dependencies and build library
+.PHONY: develop-py develop-rs develop
+develop-py:
 	uv pip install -e .[develop]
 
-requirements:  ## install prerequisite python build requirements
-	python -m pip install --upgrade pip toml
-	python -m pip install `python -c 'import toml; c = toml.load("pyproject.toml"); print("\n".join(c["build-system"]["requires"]))'`
-	python -m pip install `python -c 'import toml; c = toml.load("pyproject.toml"); print(" ".join(c["project"]["optional-dependencies"]["develop"]))'`
+develop-rs:
+	make -C rust develop
 
-build:  ## build the python library
-	python -m build -n
+develop: develop-rs develop-py  ## setup project for development
 
-install:  ## install library
+.PHONY: requirements-py requirements-rs requirements
+requirements-py:  ## install prerequisite python build requirements
+	uv pip install -r pyproject.toml --extra develop
+
+requirements-rs:  ## install prerequisite rust build requirements
+	make -C rust requirements
+
+requirements: requirements-rs requirements-py  ## setup project for development
+
+.PHONY: build-py build-rs build
+build-py:
+	python -m build -w -n
+
+build-rs:
+	make -C rust build
+
+build: build-rs build-py  ## build the project
+
+.PHONY: install
+install:  ## install python library
 	uv pip install .
 
-#########
-# LINTS #
-#########
-.PHONY: lint-py lint-docs fix-py fix-docs lint lints fix format
+.PHONY: lint-py lint-rs lint-docs lint lints
+lint-py:  ## run python linter with ruff
+	python -m ruff check gammalake
+	python -m ruff format --check gammalake
 
-lint-py:  ## lint python with ruff
-	python -m ruff check gammalake benchmarks
-	python -m ruff format --check gammalake benchmarks
+lint-rs:  ## run rust linter
+	make -C rust lint
+	cargo clippy --all-features
+	cargo fmt -- --check
 
 lint-docs:  ## lint docs with mdformat and codespell
-	python -m mdformat --check README.md docs/wiki/
-	python -m codespell_lib README.md docs/wiki/
+	python -m mdformat --check README.md $(wildcard docs/src) docs/wiki/
+	python -m codespell_lib README.md $(wildcard docs/src) docs/wiki/
 
-fix-py:  ## autoformat python code with ruff
-	python -m ruff check --fix gammalake benchmarks
-	python -m ruff format gammalake benchmarks
+lint: lint-rs lint-py lint-docs  ## run project linters
+
+lints: lint
+
+.PHONY: fix-py fix-rs fix-docs fix format
+fix-py:  ## fix python formatting with ruff
+	python -m ruff check --fix gammalake
+	python -m ruff format gammalake
+
+fix-rs:  ## fix rust formatting
+	make -C rust fix
+	cargo fmt
 
 fix-docs:  ## autoformat docs with mdformat and codespell
-	python -m mdformat README.md docs/wiki/
-	python -m codespell_lib --write README.md docs/wiki/
+	python -m mdformat README.md $(wildcard docs/src) docs/wiki/
+	python -m codespell_lib --write README.md $(wildcard docs/src) docs/wiki/
 
-lint: lint-py lint-docs  ## run all linters
-lints: lint
-fix: fix-py fix-docs  ## run all autoformatters
+fix: fix-rs fix-py fix-docs  ## run project autoformatters
+
 format: fix
 
-################
-# Other Checks #
-################
 .PHONY: check-dist check-types checks check
 
 check-dist:  ## check python sdist and wheel with check-dist
 	check-dist -v
 
 check-types:  ## check python types with ty
-	ty check --python $$(which python)
+	python -m ty check
 
 checks: check-dist
 
-# Alias
 check: checks
 
-#########
-# TESTS #
-#########
+.PHONY: test-py tests-py coverage-py
+test-py: old-engine  ## run python tests
+	GAMMA_LAKE_OLD_SRC=$(OLD_SRC) python -m pytest -v gammalake/tests
+
+tests-py: test-py
+
+coverage-py: old-engine  ## run python tests and collect test coverage
+	GAMMA_LAKE_OLD_SRC=$(OLD_SRC) python -m pytest -v gammalake/tests --cov=gammalake --cov-report term-missing --cov-report xml
+
+.PHONY: test-rs tests-rs coverage-rs
+test-rs: fixtures  ## run rust tests
+	make -C rust test
+
+tests-rs: test-rs
+
+coverage-rs: fixtures  ## run rust tests and collect test coverage
+	make -C rust coverage
+
+# The pure-Python engine of COMPAT_REF, extracted into OLD_SRC. CI checkouts are shallow, without tags.
+# COMPAT_REF predates polars 2, so OLD_SRC carries its own polars.
+COMPAT_REF ?= v0.2.0
+OLD_SRC := $(CURDIR)/build/old-engine
+define extract-old-engine
+	git rev-parse -q --verify "$(COMPAT_REF)^{commit}" >/dev/null || git fetch --no-tags origin tag $(COMPAT_REF)
+	rm -rf $(OLD_SRC) && mkdir -p $(OLD_SRC)
+	git archive $(COMPAT_REF) gammalake | tar -x -C $(OLD_SRC)
+	uv pip install -q --python python --target $(OLD_SRC) "polars<2"
+endef
+
+.PHONY: old-engine test-compat
+old-engine:  ## extract the pure-Python engine of COMPAT_REF (default v0.2.0) for the compatibility tests
+	$(extract-old-engine)
+
+test-compat: old-engine  ## compare reads and written files with the pure-Python engine of COMPAT_REF
+	GAMMA_LAKE_OLD_SRC=$(OLD_SRC) python -m pytest -v gammalake/tests/test_compat.py
+
+FIXTURES := rust/tests/fixtures/queries.json
+.PHONY: fixtures
+fixtures: $(FIXTURES)  ## generate the Rust parity fixtures with the pure-Python engine of COMPAT_REF
+
+$(FIXTURES): rust/tests/fixtures/make_fixtures.py
+	$(extract-old-engine)
+	PYTHONPATH=$(OLD_SRC) python rust/tests/fixtures/make_fixtures.py
+
 .PHONY: test coverage tests
+test: test-py test-rs  ## run all tests
 
-test:  ## run python tests
-	python -m pytest -v gammalake/tests
+coverage: coverage-py coverage-rs  ## run all tests and collect test coverage
 
-coverage:  ## run tests and collect test coverage
-	python -m pytest -v gammalake/tests --cov=gammalake --cov-report term-missing --cov-report xml
-
-# Alias
 tests: test
 
-###########
-# VERSION #
-###########
 .PHONY: show-version patch minor major
 
 show-version:  ## show current library version
@@ -90,24 +141,24 @@ minor:  ## bump a minor version
 major:  ## bump a major version
 	@bump-my-version bump major
 
-########
-# DIST #
-########
-.PHONY: dist dist-build dist-sdist dist-local-wheel publish
+.PHONY: dist-py-wheel dist-py-sdist dist-rs dist-check dist publish
 
-dist-build:  # build python dists
-	python -m build -w -s
+dist-py-wheel:  ## build python wheel
+	python -m cibuildwheel --output-dir dist
+
+dist-py-sdist:  ## build python sdist
+	python -m build --sdist -o dist
+
+dist-rs:  ## build rust dists
+	make -C rust dist
 
 dist-check:  ## run python dist checker with twine
 	python -m twine check dist/*
 
-dist: clean dist-build dist-check  ## build all dists
+dist: clean dist-rs dist-py-wheel dist-py-sdist dist-check  ## build all dists
 
 publish: dist  ## publish python assets
 
-#########
-# CLEAN #
-#########
 .PHONY: deep-clean clean
 
 deep-clean: ## clean everything from the repository
@@ -116,7 +167,6 @@ deep-clean: ## clean everything from the repository
 clean: ## clean the repository
 	rm -rf .coverage coverage cover htmlcov logs build dist *.egg-info
 
-############################################################################################
 
 .PHONY: help
 
@@ -128,7 +178,7 @@ help:
 print-%:
 	@echo '$*=$($*)'
 
-ASV_CONFIG := $(CURDIR)/benchmarks/asv.conf.json
+ASV_CONFIG := $(CURDIR)/gammalake/benchmarks/asv.conf.json
 
 .PHONY: benchmark-init
 benchmark-init:  ## initialize ASV machine information

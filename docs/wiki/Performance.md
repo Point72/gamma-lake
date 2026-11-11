@@ -4,6 +4,11 @@
 sub-10-second reads for datasets up to 250 GB using parallel Ray reads. It also provides versioning, time-travel,
 as-of features, and runtime-computed features that are impractical with raw Parquet.
 
+The benchmarks on this page were measured with Gamma Lake 0.2, which ran on Ray. To time the current release on your
+own machine and storage, run the ASV suites in `gammalake/benchmarks/gammalake_benchmarks.py`; see
+[docs/benchmarking.md](https://github.com/Point72/gamma-lake/blob/main/docs/benchmarking.md). The core's parallelism is
+set with `GAMMA_LAKE_THREADS`; see [Native Engine](Native-Engine#threads).
+
 ______________________________________________________________________
 
 ## "I'll just use a collection of Parquet files instead."
@@ -51,7 +56,7 @@ Storing different feature groups in separate per-day files is one way to address
 reads then require joins on an identifying key, and those joins scale with the number of groups.
 
 Gamma Lake maintains a master index that all feature groups are aligned to, so reads are horizontal concatenations —
-no joins needed. Ray parallelises the per-group scans.
+no joins needed. The per-group scans run concurrently.
 
 **Benchmark: read latency by window size and number of feature groups**
 _(2,000 symbols × 1,000 features/group, S3 backend)_
@@ -110,5 +115,5 @@ Beyond raw I/O performance, Gamma Lake addresses requirements that pure Parquet 
 | Runtime-computed features           |      ❌       |     ✅     |
 | Sparse feature storage              |      ❌       |     ✅     |
 | Granular owner/permission metadata  |      ❌       |     ✅     |
-| Parallel reads via Ray              |      ❌       |     ✅     |
+| Parallel reads                      |      ❌       |     ✅     |
 | ACID transactions                   |      ❌       |     ✅     |

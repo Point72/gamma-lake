@@ -1,0 +1,31 @@
+[package]
+name = "gamma_lake_delta"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Delta Lake table store for gamma-lake"
+keywords = ["feature-store", "delta-lake", "arrow", "datafusion"]
+
+[dependencies]
+async-trait.workspace = true
+deltalake.workspace = true
+futures.workspace = true
+gamma_lake_core.workspace = true
+serde_json.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[features]
+default = ["s3"]
+# Object stores for remote lakes: `s3://`, `az://` / `abfss://` and `gs://` URLs.
+s3 = ["deltalake/s3"]
+azure = ["deltalake/azure"]
+gcs = ["deltalake/gcs"]
