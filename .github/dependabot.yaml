@@ -38,17 +38,3 @@ updates:
     labels:
       - "lang: rust"
       - "part: dependencies"
-
-  - package-ecosystem: "cargo"
-    directory: "/rust"
-    schedule:
-      interval: "monthly"
-    cooldown:
-      default-days: 7
-    groups:
-      rust-workspace:
-        patterns:
-          - "*"
-    labels:
-      - "lang: rust"
-      - "part: dependencies"

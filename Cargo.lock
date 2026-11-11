@@ -2142,7 +2142,9 @@ dependencies = [
  "buoyant_kernel",
  "ctor",
  "deltalake-aws",
+ "deltalake-azure",
  "deltalake-core",
+ "deltalake-gcp",
 ]
 
 [[package]]
@@ -2167,6 +2169,20 @@ dependencies = [
  "typed-builder",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "deltalake-azure"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16ef4cf47139555d7c837f021d3ecdd616e3d137517ec61235346f59145336bb"
+dependencies = [
+ "bytes",
+ "deltalake-core",
+ "object_store",
+ "thiserror",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -2239,6 +2255,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "deltalake-gcp"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd6490d316e343d462ef3476ab0332f947c4333ca03703ea192c8bc15da932b4"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "deltalake-core",
+ "futures",
+ "object_store",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2523,8 +2556,15 @@ dependencies = [
 name = "gamma_lake"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
+ "datafusion",
+ "futures",
  "gamma_lake_core",
  "gamma_lake_delta",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -2536,6 +2576,7 @@ dependencies = [
  "datafusion",
  "futures",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "uuid",
@@ -2550,6 +2591,8 @@ dependencies = [
  "futures",
  "gamma_lake_core",
  "serde_json",
+ "tempfile",
+ "tokio",
  "url",
 ]
 
@@ -2561,6 +2604,7 @@ dependencies = [
  "gamma_lake",
  "mimalloc",
  "pyo3",
+ "pyo3-build-config",
 ]
 
 [[package]]

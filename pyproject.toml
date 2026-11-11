@@ -83,8 +83,7 @@ tag = true
 commit_args = "-s"
 pre_commit_hooks = [
     "cargo update --workspace",
-    "cargo update --manifest-path rust/Cargo.toml --workspace",
-    "git add Cargo.lock rust/Cargo.lock",
+    "git add Cargo.lock",
 ]
 
 [[tool.bumpversion.files]]
@@ -97,20 +96,14 @@ filename = "pyproject.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 
-# Anchor Cargo version searches on the package name so dependency pins are never rewritten.
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
-search = "name = \"gamma_lake_py\"\nversion = \"{current_version}\""
-replace = "name = \"gamma_lake_py\"\nversion = \"{new_version}\""
-
-[[tool.bumpversion.files]]
-filename = "rust/Cargo.toml"
 search = "[workspace.package]\nversion = \"{current_version}\""
 replace = "[workspace.package]\nversion = \"{new_version}\""
 
 # The exact pins of the workspace crates on each other.
 [[tool.bumpversion.files]]
-filename = "rust/Cargo.toml"
+filename = "Cargo.toml"
 search = 'version = "={current_version}"'
 replace = 'version = "={new_version}"'
 
@@ -137,7 +130,6 @@ archs = "arm64"
 [tool.cibuildwheel.windows]
 environment = {PATH="$USERPROFILE/.cargo/bin;$PATH", CARGO_TERM_COLOR="always"}
 skip = "*win32 *arm64"
-
 
 [tool.coverage.run]
 branch = true
@@ -169,6 +161,7 @@ destination = "gammalake/{python_extension_name}"
 packages = [
     "gammalake",
     "rust",
+    "build.rs",
     "Cargo.toml",
     "Cargo.lock",
 ]

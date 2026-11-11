@@ -1,24 +1,57 @@
+[workspace]
+members = ["rust", "rust/core", "rust/delta"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+authors = ["Point72, L.P. <OpenSource@point72.com>"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Point72/gamma-lake"
+rust-version = "1.95"
+categories = ["database", "science"]
+
+[workspace.dependencies]
+gamma_lake_core = { path = "rust/core", version = "=0.2.0" }
+gamma_lake_delta = { path = "rust/delta", version = "=0.2.0", default-features = false }
+# `arrow`, `datafusion` and `datafusion-ffi` must be the versions deltalake uses; a mismatch
+# fails to compile. datafusion-python must have the major version of `datafusion-ffi`, for
+# `FeatureTable.__datafusion_table_provider__`, and the parquet feature of `datafusion-ffi`
+# must match datafusion-common's, which deltalake enables.
+arrow = { version = "59", default-features = false, features = ["ffi"] }
+datafusion = { version = "55.2", default-features = false, features = ["recursive_protection"] }
+datafusion-ffi = "=55.2.0"
+deltalake = { version = "=1.1.2", default-features = false, features = ["rustls", "datafusion"] }
+async-trait = "0.1"
+futures = "0.3"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"
+
+# The Python extension module, built by hatch-rs.
 [package]
 name = "gamma_lake_py"
-version = "0.2.0"
-edition = "2021"
-rust-version = "1.95"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [lib]
 name = "gammalake"
 path = "rust/python/lib.rs"
 crate-type = ["cdylib"]
+test = false
+doctest = false
 
 [dependencies]
-gamma_lake = { path = "./rust", version = "*" }
+gamma_lake = { path = "rust" }
+datafusion-ffi.workspace = true
 mimalloc = { version = "0.1", default-features = false }
 pyo3 = { version = "0.29.2", features = ["abi3", "extension-module"] }
-# DataFusion's FFI, for `FeatureTable.__datafusion_table_provider__`. It must match the
-# DataFusion version of the core (through deltalake), and datafusion-python must have the same
-# major version.
-# Its parquet feature must match datafusion-common's, which deltalake enables.
-datafusion-ffi = "=55.2.0"
+
+[build-dependencies]
+pyo3-build-config = "0.29.2"
 
 # Panics unwind (no `panic = "abort"`) so PyO3 can surface them as Python exceptions
 # instead of terminating the host process.
@@ -27,3 +60,8 @@ lto = "thin"
 # Drops the symbol table (about 45 MB); exported symbols stay. Panic backtraces lose function
 # names.
 strip = "symbols"
+
+# Every test binary links datafusion and deltalake; with their debuginfo, parallel links outgrow
+# CI runner memory.
+[profile.dev.package."*"]
+debug = false
