@@ -301,6 +301,7 @@ write cannot be undone without removing another writer's changes, it remains `fa
 | [Performance](https://github.com/Point72/gamma-lake/wiki/Performance)                | Comparison with per-day Parquet files                       |
 | [Benchmarking](https://github.com/Point72/gamma-lake/blob/main/docs/benchmarking.md) | Running the read/write benchmarks                           |
 | [Native engine](https://github.com/Point72/gamma-lake/wiki/Native-Engine)            | Rust reads and writes, from Python and Rust                 |
+| [Migrating from 0.2](https://github.com/Point72/gamma-lake/wiki/Migrating-from-0.2)  | Removed and moved options, methods and modules              |
 
 ## Core API
 
