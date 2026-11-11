@@ -236,6 +236,16 @@ fn nullable(schema: &Schema) -> SchemaRef {
     ))
 }
 
+/// `n` rows as an exclusive bound of `take` indices, which are `u32`.
+fn row_count(n: usize) -> Result<u32> {
+    u32::try_from(n).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "cannot write {n} rows at once, more than {}",
+            u32::MAX
+        ))
+    })
+}
+
 /// `batch` sorted by its `keys` columns, ascending with nulls first as reads sort.
 fn sort_by_keys(batch: RecordBatch, keys: &[String]) -> Result<RecordBatch> {
     let columns = keys
@@ -257,7 +267,7 @@ fn sort_by_keys(batch: RecordBatch, keys: &[String]) -> Result<RecordBatch> {
     if (1..rows.num_rows()).all(|i| rows.row(i - 1) <= rows.row(i)) {
         return Ok(batch);
     }
-    let mut order: Vec<u32> = (0..rows.num_rows() as u32).collect();
+    let mut order: Vec<u32> = (0..row_count(rows.num_rows())?).collect();
     order.sort_by_key(|&r| rows.row(r as usize));
     Ok(take_record_batch(&batch, &UInt32Array::from(order))?)
 }
@@ -782,10 +792,13 @@ impl Lake {
         let nkeys = self.sort_keys.len();
         let keys = key_converter.convert_columns(&batch.columns()[..nkeys])?;
         let mut kept = HashSet::new();
-        let rows: Vec<u32> = (0..batch.num_rows())
-            .filter(|&r| batch.columns()[..nkeys].iter().all(|c| c.is_valid(r)))
-            .filter(|&r| kept.insert(keys.row(r)))
-            .map(|r| r as u32)
+        let rows: Vec<u32> = (0..row_count(batch.num_rows())?)
+            .filter(|&r| {
+                batch.columns()[..nkeys]
+                    .iter()
+                    .all(|c| c.is_valid(r as usize))
+            })
+            .filter(|&r| kept.insert(keys.row(r as usize)))
             .collect();
         if rows.is_empty() {
             return Err(Error::InvalidArgument(
@@ -856,13 +869,11 @@ impl Lake {
                 "the index holds duplicate keys",
             ));
         }
-        let new: Vec<u32> = (0..input.keys.num_rows())
-            .filter(|&r| !in_index.contains(&input.keys.row(r)))
-            .map(|r| r as u32)
+        let new: Vec<u32> = (0..row_count(input.keys.num_rows())?)
+            .filter(|&r| !in_index.contains(&input.keys.row(r as usize)))
             .collect();
-        let missing: Vec<u32> = (0..index_keys.num_rows())
-            .filter(|&r| !in_input.contains(&index_keys.row(r)))
-            .map(|r| r as u32)
+        let missing: Vec<u32> = (0..row_count(index_keys.num_rows())?)
+            .filter(|&r| !in_input.contains(&index_keys.row(r as usize)))
             .collect();
         let pk_index = self.index_schema.index_of(pk_name)?;
         let index_pk = pk_converter.convert_columns(&[index_batch.column(pk_index).clone()])?;
@@ -954,7 +965,7 @@ impl Planner<'_> {
             .filter_map(|(_, a)| a.as_deref())
             .collect();
 
-        let input_rows: Vec<u32> = (0..self.input.batch.num_rows() as u32).collect();
+        let input_rows: Vec<u32> = (0..row_count(self.input.batch.num_rows())?).collect();
         let all_new = self.index.new.len() == input_rows.len();
         let (min, max) = (&self.input.min, &self.input.max);
         let mut actions = vec![];
@@ -1392,6 +1403,15 @@ mod tests {
     use crate::store::TableScan;
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use async_trait::async_trait;
+
+    #[test]
+    fn row_count_rejects_more_rows_than_take_indices_hold() {
+        assert_eq!(row_count(u32::MAX as usize).unwrap(), u32::MAX);
+        assert!(matches!(
+            row_count(u32::MAX as usize + 1),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
 
     fn frame(ts: &[i64]) -> RecordBatch {
         let schema = Schema::new(vec![
