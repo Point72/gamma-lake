@@ -97,7 +97,8 @@ batch arrives once every scan is sorted.
 
 The limit covers sorting only. While a scan is sorted, the Parquet reader holds the compressed data of the columns it
 reads for a whole row group, and feature files hold row groups of up to a million rows. As-of and sparse feature
-tables, the feature metadata and the output batches are also held outside the limit. A share too small to sort one
+tables, the feature metadata and the output batches are also held outside the limit, as is a whole `scan()` filtered
+by a predicate with a literal per row, such as a Series. A share too small to sort one
 batch fails the read with a resources-exhausted error; for features with long strings or nested values, a smaller
 `batch_size` avoids this.
 

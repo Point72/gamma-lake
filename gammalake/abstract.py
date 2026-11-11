@@ -132,36 +132,22 @@ class BaseFeatureLake(abc.ABC):
         """
 
     @abc.abstractmethod
-    def add_features(
-        self,
-        df: pl.DataFrame,
-        owner: str = "missing_owner",
-        metadata: pl.DataFrame | None = None,
-    ) -> None:
-        """Add features to this FeatureLake object. An optional metadata frame argument allows users to increment very specific feature versions, otherwise we fallback
-        to generic insertion logic around latest feature version value.
+    def add_features(self, df: pl.DataFrame, owner: str = "missing_owner") -> None:
+        """Add features to this FeatureLake object.
 
         Args:
             df: an input polars DataFrame containing feature values to be added to this FeatureLake's underlying DeltaTables.
             owner: a string argument for use in identifying ownership in metadata tables.
-            metadata: an optional DataFrame object, expected to be a (possibly) filtered version of this object's feature metadata frame, identifying which DeltaTables to update
         """
         ...
 
     @abc.abstractmethod
-    def add_targets(
-        self,
-        df: pl.DataFrame,
-        owner: str = "missing_owner",
-        metadata: pl.DataFrame | None = None,
-    ) -> None:
-        """Add targets to this FeatureLake object. An optional metadata frame argument allows users to increment very specific feature versions, otherwise we fallback
-        to generic insertion logic around latest feature version value.
+    def add_targets(self, df: pl.DataFrame, owner: str = "missing_owner") -> None:
+        """Add targets to this FeatureLake object.
 
         Args:
             df: an input polars DataFrame containing feature values to be added to this FeatureLake's underlying DeltaTables.
             owner: a string argument for use in identifying ownership in metadata tables.
-            metadata: an optional DataFrame object, expected to be a (possibly) filtered version of this object's feature metadata frame, identifying which DeltaTables to update
         """
         ...
 

@@ -341,11 +341,14 @@ class NativeLake:
     By default a read sorts each table it reads in memory. With ``memory_limit`` set, the
     tables of a read share that many bytes for sorting and spill to the system temporary
     directory (``TMPDIR``) beyond it, so reads larger than memory can be streamed with
-    :meth:`scan`.
+    :meth:`scan`. As-of and sparse tables are read into memory outside the limit, and so is
+    a whole scan filtered by a predicate with a literal per row, such as a Series.
 
     Runtime-computed features are Polars expressions stored in the feature metadata and
     evaluated when read. Deserializing an expression can run code, so reading or registering
-    them requires ``runtime_computed_features=True``, set only when the metadata is trusted.
+    them requires ``runtime_computed_features=True``. Anyone who can write the feature
+    metadata can then run code in every process that reads it, so enable it only where
+    write access to the lake is limited to those trusted to run code.
     A read of a runtime-computed feature also returns the stored and runtime-computed features
     its expression reads, at their latest versions, after the requested ones.
     """
@@ -713,7 +716,9 @@ class NativeLake:
         The index and metadata tables are restored first, then every table the restored
         feature metadata refers to. Tables with no commit after ``timestamp`` are left as
         they are, and tables created after it are left in place, unreferenced. Restore is not
-        atomic across tables: :class:`PartialWriteError` means some tables were restored.
+        atomic across tables: :class:`PartialWriteError` means some tables were restored. Run
+        it with no writers in other processes, while the Delta logs and files of
+        ``timestamp`` are still retained.
         """
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
             raise ValueError("restore_to_timestamp requires a timezone-aware datetime")

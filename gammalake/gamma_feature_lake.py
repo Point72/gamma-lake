@@ -53,11 +53,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     memory_limit: int | None = Field(
         None,
         description="Bytes a read may hold while sorting the tables it reads; beyond it the sorts spill to the system temporary "
-        "directory. None sorts in memory. The frame read() returns is held in memory either way.",
+        "directory. None sorts in memory. As-of and sparse tables are read into memory outside the limit, as is a whole lazy "
+        "read filtered by a predicate with a literal per row, such as a Series. The frame read() returns is held in memory either way.",
     )
     enable_runtime_computed_features: bool = Field(
         False,
-        description="Enables runtime-computed features. Only enable this when feature metadata is trusted because Polars expressions may execute Python code.",
+        description="Enables runtime-computed features. Their Polars expressions can run code when read, so anyone who can write "
+        "the feature metadata can run code in every process that enables this.",
     )
     lock: Callable[[str], AbstractContextManager] | None = Field(
         None,
@@ -206,28 +208,10 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
 
     @ensure_deltalake_is_initialized
     def restore_to_timestamp(self, timestamp: datetime) -> GammaFeatureLake:
-        """Revert the entire feature store to its state as of ``timestamp``.
-
-        Every Delta commit after ``timestamp`` is undone across the index,
-        metadata, and referenced physical data tables. Choose a cutoff between
-        the last good write and the writes to undo.
-
-        The system tables are restored first. Restored feature metadata then
-        identifies the physical data tables that existed at the cutoff. Tables
-        created later are left unreferenced and can be reclaimed separately.
-        Runtime-computed features are skipped because their ``n/a`` table
-        address does not refer to a physical table.
-
-        Restore is idempotent per table but is not atomic across tables. Run it
-        without concurrent writers. The cutoff must be after initialization
-        and within Delta's retention window, with all required data files still
-        available.
+        """Reverts the lake to its state at ``timestamp`` and returns it; see :meth:`NativeLake.restore_to_timestamp`.
 
         Args:
             timestamp: Timezone-aware cutoff; commits after it are reverted.
-
-        Returns:
-            This feature store, restored in place.
 
         """
         self._native_lake().restore_to_timestamp(timestamp)
@@ -338,19 +322,14 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
-        """
-        Onboards a new table of features to our FeatureStore.
+        """Writes the columns of ``df`` as ``signal_type`` features.
+
+        Each call scans the index once, so write every column and secondary key of a period in one
+        call rather than several (see the Best-Practices wiki page).
 
         Args:
-            overlap_mode: ``"copy"`` (default) writes overlapping features to a new DeltaTable, preserving the
-                old table as an immutable snapshot.  ``"merge"`` upserts into the existing table in-place.
-
-        Performance:
-            Each call scans the global index once and sends newly discovered index rows through a
-            single append. Prefer wide-and-shallow writes over tall-and-skinny writes: batch related
-            value columns and all secondary-key values for each primary-sort-key period instead of
-            splitting the same period across calls. For backfills, write blocks of complete periods
-            sized to fit memory. See the ``Best-Practices`` wiki page.
+            overlap_mode: ``"copy"`` writes features that already exist to a new table, leaving the old
+                one as it was; ``"merge"`` upserts into the existing table.
 
         """
         annotated = [*(comments or {}), *(tags or {})]
@@ -467,7 +446,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         self._add(df=df, signal_type="sparse_feature", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
 
     @ensure_deltalake_is_initialized
-    def add_runtime_computed_features(self, exprs=list[PolarsExpression], owner: str = "missing_owner") -> None:
+    def add_runtime_computed_features(self, exprs: list[PolarsExpression], owner: str = "missing_owner") -> None:
         """Add (and possibly increment the version) a serialized expression representing an adhoc runtime feature computation"""
         self._native_lake().add_runtime_computed_features(exprs, owner)
 
@@ -537,18 +516,9 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     ) -> pl.DataFrame:
         """Read from two GammaFeatureLakes with the same sort keys and full-outer-join their outputs.
 
-        Both lakes must share identical ``sort_keys`` (i.e. the same ``primary_sort_key`` and
-        secondary key columns).  Features present in only one lake will appear with nulls in the
-        rows sourced from the other lake.
-
-        The join exploits the fact that both ``read()`` calls return frames that are already sorted
-        on ``sort_keys``.  Rather than building a hash table (the default eager join strategy),
-        we route through Polars' streaming execution engine.  On Polars ≥
-        ``_STREAMING_MERGE_JOIN_MIN_VERSION`` the ``primary_sort_key`` column is declared sorted
-        (via ``set_sorted``) so the optimizer promotes the join to an O(n+m) sort-merge join,
-        which is typically **3–18× faster** on large frames.  On older Polars versions the same
-        streaming engine is used but falls back to a hash join (correct, just without the
-        sort-merge optimisation).
+        The join runs on Polars' streaming engine. Both reads are sorted on ``sort_keys``; on
+        Polars 1.37.0 and later they are declared sorted on ``primary_sort_key``, so the join merges
+        them instead of building a hash table.
 
         Args:
             left: First GammaFeatureLake instance.
@@ -584,8 +554,6 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         left_lf = _read_lazy(left, left_features, left_targets)
         right_lf = _read_lazy(right, right_features, right_targets)
 
-        # Polars ≥ 1.37.0: hint that both frames are sorted so the streaming engine
-        # uses an O(n+m) sort-merge join instead of a hash join.
         if version.parse(pl.__version__) >= version.parse("1.37.0"):
             left_lf = left_lf.set_sorted(left.primary_sort_key)
             right_lf = right_lf.set_sorted(right.primary_sort_key)

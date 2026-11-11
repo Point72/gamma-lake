@@ -148,8 +148,10 @@ ______________________________________________________________________
 
 ### Runtime transforms
 
-Set `enable_runtime_computed_features=True` only when the lake's feature metadata is trusted. The opt-in is required both
-to register runtime transforms and to read them.
+Set `enable_runtime_computed_features=True` only where write access to the lake is limited to those trusted to run code:
+runtime-computed features are Polars expressions that can run code when read, so anyone who can write the feature metadata
+can run code in every process that enables them. The opt-in is required both to register runtime transforms and to read
+them.
 
 `add_runtime_transforms(features, transforms, owner)` creates the cross-product of the supplied lists with deterministic
 `<feature>__<transform>` names. Supported transforms are `abs`, `missing`, `nan`, `negative`, `nonzero`, `positive`,
