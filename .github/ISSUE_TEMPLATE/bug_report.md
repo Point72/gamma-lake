@@ -23,7 +23,7 @@ What actually happened. Include full error messages or tracebacks if available.
 **Environment**
 - OS: [e.g. Ubuntu 22.04, macOS 14.0, Windows 11]
 - Python version: [e.g. 3.11.5] (`python --version`)
-- Rust version: [e.g. 1.75.0] (`rustc --version`)
+- Rust version, if building from source: [e.g. 1.95.0] (`rustc --version`)
 - Package version: (`pip show gamma-lake | grep Version`)
 
 **Additional Context**

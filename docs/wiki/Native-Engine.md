@@ -84,7 +84,9 @@ cores, use CPU affinity (`taskset`) as well. Polars has its own pool, set with `
 ## Memory
 
 By default a read sorts each table it reads in memory, so its peak memory is about the size of the data it reads, and
-more for tables stored out of key order. Writes hold their input in memory.
+more for tables stored out of key order. A write holds in memory its input, the index rows up to the input's largest
+primary key and the metadata tables; a copy-mode overlap also holds every row of the table it rewrites. The 0.2 engine
+did the same, and `memory_limit` does not apply to writes.
 
 The `memory_limit` option (`NativeLake(memory_limit=...)`, `GammaFeatureLake(memory_limit=...)`,
 `LakeOptions::memory_limit` in Rust) bounds the memory a read uses for sorting. The

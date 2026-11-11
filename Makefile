@@ -74,13 +74,13 @@ checks: check-dist
 check: checks
 
 .PHONY: test-py tests-py coverage-py
-test-py:  ## run python tests
-	python -m pytest -v gammalake/tests
+test-py: old-engine  ## run python tests
+	GAMMA_LAKE_OLD_SRC=$(OLD_SRC) python -m pytest -v gammalake/tests
 
 tests-py: test-py
 
-coverage-py:  ## run python tests and collect test coverage
-	python -m pytest -v gammalake/tests --cov=gammalake --cov-report term-missing --cov-report xml
+coverage-py: old-engine  ## run python tests and collect test coverage
+	GAMMA_LAKE_OLD_SRC=$(OLD_SRC) python -m pytest -v gammalake/tests --cov=gammalake --cov-report term-missing --cov-report xml
 
 .PHONY: test-rs tests-rs coverage-rs
 test-rs: fixtures  ## run rust tests
@@ -102,9 +102,11 @@ define extract-old-engine
 	uv pip install -q --python python --target $(OLD_SRC) "polars<2"
 endef
 
-.PHONY: test-compat
-test-compat:  ## compare reads and written files with the pure-Python engine of COMPAT_REF (default v0.2.0)
+.PHONY: old-engine test-compat
+old-engine:  ## extract the pure-Python engine of COMPAT_REF (default v0.2.0) for the compatibility tests
 	$(extract-old-engine)
+
+test-compat: old-engine  ## compare reads and written files with the pure-Python engine of COMPAT_REF
 	GAMMA_LAKE_OLD_SRC=$(OLD_SRC) python -m pytest -v gammalake/tests/test_compat.py
 
 FIXTURES := rust/tests/fixtures/queries.json
