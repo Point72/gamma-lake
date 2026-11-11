@@ -424,6 +424,7 @@ impl Lake {
         overlap_mode = "copy",
         feature_params = None,
         annotations = None,
+        allow_new_index_values = true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add(
@@ -435,9 +436,11 @@ impl Lake {
         overlap_mode: &str,
         feature_params: Option<String>,
         annotations: Option<Vec<AnnotationRow>>,
+        allow_new_index_values: bool,
     ) -> PyResult<()> {
         let mut options = AddOptions {
             annotations: annotations.into_iter().flatten().map(annotation).collect(),
+            allow_new_index_values,
             ..Default::default()
         };
         if let Some(owner) = owner {

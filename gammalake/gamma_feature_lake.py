@@ -321,6 +321,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         overlap_mode: str = "copy",
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        allow_new_index_values: bool = True,
     ) -> None:
         """Writes the columns of ``df`` as ``signal_type`` features.
 
@@ -330,16 +331,18 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         Args:
             overlap_mode: ``"copy"`` writes features that already exist to a new table, leaving the old
                 one as it was; ``"merge"`` upserts into the existing table.
+            allow_new_index_values: If ``False``, raise ``ValueError`` and write nothing when ``df`` holds
+                keys that are not in the index.
 
         """
         annotated = [*(comments or {}), *(tags or {})]
         if unknown := sorted({name for name in annotated if name not in df.columns or name in self.sort_keys}):
             raise ValueError(f"comments and tags name columns that are not written features: {unknown}")
         native = self._native_lake()
-        if set(df.columns) <= set(self.sort_keys):
+        if allow_new_index_values and set(df.columns) <= set(self.sort_keys):
             native.add_index_rows(df)
         else:
-            native._add(df, signal_type, owner, overlap_mode, feature_params, comments, tags)
+            native._add(df, signal_type, owner, overlap_mode, feature_params, comments, tags, allow_new_index_values)
 
     @ensure_deltalake_is_initialized
     def add_targets(
@@ -349,9 +352,19 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         overlap_mode: Literal["copy", "merge"] = "copy",
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """Add target columns to the lake; see :meth:`add_features`."""
-        self._add(df=df, signal_type="target", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
+        self._add(
+            df=df,
+            signal_type="target",
+            owner=owner,
+            overlap_mode=overlap_mode,
+            comments=comments,
+            tags=tags,
+            allow_new_index_values=allow_new_index_values,
+        )
 
     @ensure_deltalake_is_initialized
     def add_features(
@@ -361,6 +374,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         overlap_mode: Literal["copy", "merge"] = "copy",
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """Add feature columns to the lake.
 
@@ -371,8 +386,19 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         ``comments`` and ``tags`` map written columns to the comment and tags of the versions
         written, as :meth:`annotate` stores them. A feature given a comment but no tags keeps
         the tags stored with its table, and the reverse.
+
+        Keys of ``df`` that are not in the index are added to it. With
+        ``allow_new_index_values=False``, they raise ``ValueError`` instead, and nothing is written.
         """
-        self._add(df=df, signal_type="feature", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
+        self._add(
+            df=df,
+            signal_type="feature",
+            owner=owner,
+            overlap_mode=overlap_mode,
+            comments=comments,
+            tags=tags,
+            allow_new_index_values=allow_new_index_values,
+        )
 
     @ensure_deltalake_is_initialized
     @validate_call(config=ConfigDict(arbitrary_types_allowed=True))
@@ -417,9 +443,20 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         overlap_mode: Literal["copy", "merge"] = "copy",
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """Add as-of feature columns; see :meth:`add_features` for ``comments`` and ``tags``."""
-        self._add(df=df, signal_type="as_of_feature", owner=owner, feature_params=params, overlap_mode=overlap_mode, comments=comments, tags=tags)
+        self._add(
+            df=df,
+            signal_type="as_of_feature",
+            owner=owner,
+            feature_params=params,
+            overlap_mode=overlap_mode,
+            comments=comments,
+            tags=tags,
+            allow_new_index_values=allow_new_index_values,
+        )
 
     @ensure_deltalake_is_initialized
     def add_sparse_features(
@@ -429,6 +466,8 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         overlap_mode: Literal["copy", "merge"] = "copy",
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """Add sparse features to this FeatureLake.
 
@@ -443,7 +482,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         use :meth:`add_as_of_features` instead. See :meth:`add_features` for ``comments`` and
         ``tags``.
         """
-        self._add(df=df, signal_type="sparse_feature", owner=owner, overlap_mode=overlap_mode, comments=comments, tags=tags)
+        self._add(
+            df=df,
+            signal_type="sparse_feature",
+            owner=owner,
+            overlap_mode=overlap_mode,
+            comments=comments,
+            tags=tags,
+            allow_new_index_values=allow_new_index_values,
+        )
 
     @ensure_deltalake_is_initialized
     def add_runtime_computed_features(self, exprs: list[PolarsExpression], owner: str = "missing_owner") -> None:

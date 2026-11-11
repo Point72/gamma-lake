@@ -8,6 +8,7 @@
 * [breaking] `GammaFeatureLake` takes Delta settings as `delta_options=DeltaOptions(compression=..., target_file_size=..., storage_options=...)`; the top-level `compression` and `target_file_size` fields are removed. `DeltaOptions` rejects unknown fields.
 * [feature] A write commits to a table only if no other writer changed it after the write read it, and otherwise raises `ConflictError`, or `PartialWriteError` if part of the write had already committed.
 * [feature] Add the `lock` option: a per-table lock factory held around every commit.
+* [feature] `add_*` methods take `allow_new_index_values=False` to reject, writing nothing, an input with keys not in the index.
 * [bugfix] Rollback undoes only the failed write's commits, preserving other writers' commits.
 * [feature] Store list and struct features; copy-mode overlaps widen numeric types as Polars does.
 * [feature] With the `datafusion` extra, `GammaFeatureLake.feature_table` and `NativeLake.feature_table` return features as a DataFusion table for SQL, with filters on sort keys pushed into the scan.

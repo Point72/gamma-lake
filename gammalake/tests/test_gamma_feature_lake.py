@@ -632,6 +632,23 @@ def test_rejected_input_is_not_logged_as_a_transaction(tmp_path):
     assert _log(fs).is_empty()
 
 
+def test_new_index_values_can_be_disallowed(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    fs.add_features(_frame(range(1, 4), 1), owner="me")
+    index, features, log = fs.index_frame().collect(), fs.feature_metadata_frame().collect(), _log(fs)
+
+    for df in (_frame([3, 4], 2).rename({"f": "g"}), _frame([4], 2).drop("f")):
+        with pytest.raises(ValueError, match="2 input keys are not in the index"):
+            fs.add_features(df, owner="me", allow_new_index_values=False)
+    assert_frame_equal(fs.index_frame().collect(), index)
+    assert_frame_equal(fs.feature_metadata_frame().collect(), features)
+    assert_frame_equal(_log(fs), log)
+
+    fs.add_features(_frame([2], 2).rename({"f": "g"}), owner="me", allow_new_index_values=False)
+    assert_frame_equal(fs.index_frame().collect(), index)
+    assert fs.read(["g"]).sort("timestamp", "symbol")["g"].to_list() == [None, None, 2.0, 2.0, None, None]
+
+
 def test_failed_add_is_rolled_back_and_later_writes_do_not_see_it(tmp_path):
     """Regression test for upstream issue #52: feature tables must not keep a failed write that the index never received."""
     fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()

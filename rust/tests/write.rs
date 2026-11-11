@@ -585,6 +585,39 @@ fn unsupported_input_writes_nothing() {
 }
 
 #[test]
+fn new_index_values_can_be_disallowed() {
+    let (dir, lake) = create();
+    add(
+        &lake,
+        frame(&keys(1..=3, &["a", "b"]), &[("f", 1.0)]),
+        OverlapMode::Copy,
+    );
+    let before = commits(dir.path());
+    let options = AddOptions {
+        allow_new_index_values: false,
+        ..Default::default()
+    };
+    let err = error(lake.add(
+        vec![frame(&[(2, "a"), (2, "c"), (4, "a")], &[("g", 1.0)])],
+        &options,
+    ));
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    assert!(err.to_string().contains("2 input keys"), "{err}");
+    assert_eq!(commits(dir.path()), before);
+
+    lake.add(vec![frame(&[(2, "a"), (3, "b")], &[("g", 10.0)])], &options)
+        .unwrap();
+    check_invariant(dir.path());
+    assert_eq!(
+        read(&lake, "g"),
+        expect(&keys(1..=3, &["a", "b"]), |t, s| match (t, s) {
+            (2, "a") | (3, "b") => Some(10.0 * t as f64),
+            _ => None,
+        })
+    );
+}
+
+#[test]
 fn targets_and_metadata_options_are_recorded() {
     let (dir, lake) = create();
     let options = AddOptions {

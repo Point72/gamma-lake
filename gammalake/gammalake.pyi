@@ -93,6 +93,7 @@ class Lake:
         overlap_mode: str = "copy",
         feature_params: str | None = None,
         annotations: Sequence[tuple[str, str | None, str | None, Sequence[str] | None]] | None = None,
+        allow_new_index_values: bool = True,
     ) -> None: ...
     def add_index_rows(self, data: _ArrowStreamable) -> None: ...
     # (feature_name, table_addr, comment, tags); None keeps the stored value.

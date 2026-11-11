@@ -20,6 +20,7 @@ use arrow::array::{
 use arrow::compute::{cast, concat, concat_batches, take, take_record_batch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, Rows, SortField};
+use arrow::util::display::array_value_to_string;
 use futures::future::join_all;
 use futures::{StreamExt, TryStreamExt};
 
@@ -94,6 +95,9 @@ pub struct AddOptions {
     /// Comments and tags for the written versions, applied after the write; see
     /// [`Lake::annotate`]. Each names an input feature and has no `table_addr`.
     pub annotations: Vec<Annotation>,
+    /// Whether the write may add keys to the index. If not, a write whose input holds a key
+    /// the index does not is rejected before anything is written.
+    pub allow_new_index_values: bool,
 }
 
 impl Default for AddOptions {
@@ -104,6 +108,7 @@ impl Default for AddOptions {
             overlap_mode: OverlapMode::Copy,
             feature_params: None,
             annotations: vec![],
+            allow_new_index_values: true,
         }
     }
 }
@@ -632,7 +637,8 @@ impl Lake {
     ///
     /// Rows with a null key are dropped and, of rows sharing keys, the first is kept. Keys
     /// new to the index are added to it, and every dense table whose coverage includes them
-    /// gets them as rows of nulls.
+    /// gets them as rows of nulls. If [`AddOptions::allow_new_index_values`] is false, an input
+    /// with keys new to the index fails with [`Error::InvalidArgument`] instead.
     ///
     /// Features new to the lake go to a new table. Features whose table covers none of
     /// the input keys already in the index are appended to it. Otherwise the input
@@ -872,6 +878,26 @@ impl Lake {
         let new: Vec<u32> = (0..row_count(input.keys.num_rows())?)
             .filter(|&r| !in_index.contains(&input.keys.row(r as usize)))
             .collect();
+        if let (false, Some(&r)) = (options.allow_new_index_values, new.first()) {
+            let key = self
+                .index_schema
+                .fields()
+                .iter()
+                .zip(input.batch.columns())
+                .map(|(f, c)| {
+                    Ok(format!(
+                        "{}={}",
+                        f.name(),
+                        array_value_to_string(c, r as usize)?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Err(Error::InvalidArgument(format!(
+                "{} input keys are not in the index, such as ({}), and new index values are not allowed",
+                new.len(),
+                key.join(", ")
+            )));
+        }
         let missing: Vec<u32> = (0..row_count(index_keys.num_rows())?)
             .filter(|&r| !in_input.contains(&index_keys.row(r as usize)))
             .collect();

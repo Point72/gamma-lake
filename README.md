@@ -180,6 +180,9 @@ The read result combines stored values with implicit trailing nulls:
 Backfills can therefore be expensive. Adding a new secondary-key value across historical primary-key periods may
 require alignment updates to many feature groups; adding it only for future periods does not.
 
+To write only to keys already in the index, pass `allow_new_index_values=False` to an `add_*` method: an input holding
+any new key raises `ValueError` and writes nothing.
+
 If incoming rows overlap existing rows, `overlap_mode="copy"` creates a new versioned Delta table, while
 `overlap_mode="merge"` performs an in-place Delta merge. Both paths preserve the alignment invariant.
 

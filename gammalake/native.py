@@ -593,12 +593,21 @@ class NativeLake:
         feature_params: dict | None,
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        allow_new_index_values: bool = True,
     ) -> None:
         params = json.dumps(feature_params) if feature_params is not None else None
         comments, tags = comments or {}, tags or {}
         names = dict.fromkeys([*comments, *tags])
         annotations = [(name, None, comments.get(name), list(tags[name]) if name in tags else None) for name in names]
-        self._lake.add(df, owner=owner, signal_type=signal_type, overlap_mode=overlap_mode, feature_params=params, annotations=annotations)
+        self._lake.add(
+            df,
+            owner=owner,
+            signal_type=signal_type,
+            overlap_mode=overlap_mode,
+            feature_params=params,
+            annotations=annotations,
+            allow_new_index_values=allow_new_index_values,
+        )
 
     def add_features(
         self,
@@ -608,13 +617,16 @@ class NativeLake:
         feature_params: dict | None = None,
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """Adds the non-key columns of ``df`` as features.
 
         ``df`` is a Polars frame or any object implementing ``__arrow_c_stream__``. Rows with a
         null sort key are dropped and the first row of each key is kept. New keys are added to
         the index and every feature and target table is padded so that it stays aligned to the
-        index.
+        index; with ``allow_new_index_values=False``, an input with keys not in the index raises
+        ``ValueError`` and writes nothing.
 
         ``overlap_mode`` is ``"copy"`` (write overlapping features to a new table) or
         ``"merge"`` (upsert into the existing one). ``feature_params`` is stored with the new
@@ -624,7 +636,7 @@ class NativeLake:
 
         Raises :class:`PartialWriteError` if a table fails to commit after others did.
         """
-        self._add(df, "feature", owner, overlap_mode, feature_params, comments, tags)
+        self._add(df, "feature", owner, overlap_mode, feature_params, comments, tags, allow_new_index_values)
 
     def add_targets(
         self,
@@ -634,9 +646,11 @@ class NativeLake:
         feature_params: dict | None = None,
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """As :meth:`add_features`, registering the columns as targets."""
-        self._add(df, "target", owner, overlap_mode, feature_params, comments, tags)
+        self._add(df, "target", owner, overlap_mode, feature_params, comments, tags, allow_new_index_values)
 
     def add_as_of_features(
         self,
@@ -646,13 +660,15 @@ class NativeLake:
         overlap_mode: str = "copy",
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """As :meth:`add_features`, for features read with ``join_asof`` on the primary sort key.
 
         ``params`` holds the ``join_asof`` arguments, such as ``{"strategy": "forward",
         "tolerance": "1h"}``. The table is not padded to the index.
         """
-        self._add(df, "as_of_feature", owner, overlap_mode, params, comments, tags)
+        self._add(df, "as_of_feature", owner, overlap_mode, params, comments, tags, allow_new_index_values)
 
     def add_sparse_features(
         self,
@@ -661,10 +677,12 @@ class NativeLake:
         overlap_mode: str = "copy",
         comments: Mapping[str, str] | None = None,
         tags: Mapping[str, Sequence[str]] | None = None,
+        *,
+        allow_new_index_values: bool = True,
     ) -> None:
         """As :meth:`add_features`, for features stored only where they have values and
         left-joined to the index when read."""
-        self._add(df, "sparse_feature", owner, overlap_mode, None, comments, tags)
+        self._add(df, "sparse_feature", owner, overlap_mode, None, comments, tags, allow_new_index_values)
 
     def add_runtime_computed_features(self, exprs: Sequence[pl.Expr], owner: str = "missing_owner") -> None:
         """Registers each of ``exprs`` as a runtime-computed feature named by its output name.
