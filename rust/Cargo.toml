@@ -36,7 +36,7 @@ repository.workspace = true
 rust-version.workspace = true
 categories.workspace = true
 readme = "../README.md"
-description = "Feature store on Delta Lake with Arrow and DataFusion APIs"
+description = "High-performance feature store built on Delta Lake with Arrow and DataFusion APIs"
 keywords = ["feature-store", "delta-lake", "arrow", "datafusion"]
 # Lakes written by the pure-Python gamma-lake, used by the parity tests; 9 MB.
 exclude = ["tests/fixtures"]

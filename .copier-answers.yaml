@@ -7,7 +7,7 @@ add_pyodide: false
 add_wiki: true
 email: OpenSource@point72.com
 github: Point72
-project_description: Feature store on Delta Lake with a Rust core and a Polars front end
+project_description: High-performance feature store built on Delta Lake with a Rust core
 project_name: gamma-lake
 python_version_primary: '3.11'
 team: Point72, L.P.

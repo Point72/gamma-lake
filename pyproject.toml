@@ -10,7 +10,7 @@ name = "gamma-lake"
 authors = [
     {name = "Point72, L.P.", email = "OpenSource@point72.com"},
 ]
-description = "Feature store on Delta Lake with a Rust core and a Polars front end"
+description = "High-performance feature store built on Delta Lake with a Rust core"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 version = "0.2.0"
