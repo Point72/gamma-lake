@@ -140,6 +140,9 @@ skip = "*win32 *arm64"
 
 [tool.coverage.run]
 branch = true
+omit = [
+    "gammalake/benchmarks/*",
+]
 
 [tool.coverage.report]
 exclude_also = [

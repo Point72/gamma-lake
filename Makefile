@@ -31,8 +31,8 @@ install:  ## install python library
 
 .PHONY: lint-py lint-rs lint-docs lint lints
 lint-py:  ## run python linter with ruff
-	python -m ruff check gammalake benchmarks
-	python -m ruff format --check gammalake benchmarks
+	python -m ruff check gammalake
+	python -m ruff format --check gammalake
 
 lint-rs:  ## run rust linter
 	make -C rust lint
@@ -49,8 +49,8 @@ lints: lint
 
 .PHONY: fix-py fix-rs fix-docs fix format
 fix-py:  ## fix python formatting with ruff
-	python -m ruff check --fix gammalake benchmarks
-	python -m ruff format gammalake benchmarks
+	python -m ruff check --fix gammalake
+	python -m ruff format gammalake
 
 fix-rs:  ## fix rust formatting
 	make -C rust fix
@@ -178,7 +178,7 @@ help:
 print-%:
 	@echo '$*=$($*)'
 
-ASV_CONFIG := $(CURDIR)/benchmarks/asv.conf.json
+ASV_CONFIG := $(CURDIR)/gammalake/benchmarks/asv.conf.json
 
 .PHONY: benchmark-init
 benchmark-init:  ## initialize ASV machine information

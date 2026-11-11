@@ -5,7 +5,7 @@ sub-10-second reads for datasets up to 250 GB using parallel Ray reads. It also 
 as-of features, and runtime-computed features that are impractical with raw Parquet.
 
 The benchmarks on this page were measured with Gamma Lake 0.2, which ran on Ray. To time the current release on your
-own machine and storage, run the ASV suites in `benchmarks/gammalake_benchmarks.py`; see
+own machine and storage, run the ASV suites in `gammalake/benchmarks/gammalake_benchmarks.py`; see
 [docs/benchmarking.md](https://github.com/Point72/gamma-lake/blob/main/docs/benchmarking.md). The core's parallelism is
 set with `GAMMA_LAKE_THREADS`; see [Native Engine](Native-Engine#threads).
 
