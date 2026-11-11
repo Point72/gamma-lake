@@ -9,6 +9,7 @@ Old-engine steps run in a subprocess with the old source first on ``PYTHONPATH``
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -29,6 +30,8 @@ pytestmark = pytest.mark.skipif(not OLD_SRC, reason="GAMMA_LAKE_OLD_SRC is not s
 # Old-engine bugs the model does not reproduce (Point72/gamma-lake#45, #46 and #48). Scenarios
 # that exercise them are compared between engines only.
 OLD_ENGINE_BUGS = {"all_new_keys_after_coverage", "overlap_copy", "new_key_at_coverage_end"}
+
+_VIEW_TYPE = re.compile(r"\b(string|binary)_view\b")
 
 _RUNNER = textwrap.dedent(
     """
@@ -181,6 +184,9 @@ def _file_settings(path: Path, merged: bool) -> tuple:
     Row order is left out for files a merge wrote.
 
     The ``created_by`` string is left out: it names the parquet library version each engine links.
+    Arrow view types compare as their plain types: the old engine's merges record the view types of
+    their Polars source in the Arrow schema, depending on the ``deltalake`` version, over the same
+    parquet columns.
     """
     parquet = pq.ParquetFile(path).metadata
     columns = []
@@ -209,7 +215,7 @@ def _file_settings(path: Path, merged: bool) -> tuple:
     return (
         parquet.format_version,
         tuple(sorted(k.decode() for k in parquet.metadata or {})),
-        tuple(f"{f.name}: {f.type}" for f in arrow),
+        tuple(_VIEW_TYPE.sub(r"\1", f"{f.name}: {f.type}") for f in arrow),
         tuple(parquet.row_group(i).num_rows for i in range(parquet.num_row_groups)),
         tuple(columns),
         in_order,
