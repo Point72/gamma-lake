@@ -29,6 +29,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: ubuntu-24.04
@@ -44,11 +45,6 @@ jobs:
           - name: macos-26
             dist_path: dist
             os: macos-26
-            python: "3.11"
-            target: native
-          - name: windows-2025
-            dist_path: dist
-            os: windows-2025
             python: "3.11"
             target: native
 
@@ -138,7 +134,7 @@ jobs:
           CIBW_ARCHS_LINUX: native
         if: matrix.name == 'ubuntu-24.04-arm'
 
-      - name: Build distributions (macOS/Windows)
+      - name: Build distributions (macOS)
         run: |
           rm -rf dist
           make dist-py-wheel
