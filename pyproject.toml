@@ -83,7 +83,8 @@ tag = true
 commit_args = "-s"
 pre_commit_hooks = [
     "cargo update --workspace",
-    "git add Cargo.lock",
+    "cargo update --manifest-path rust/Cargo.toml --workspace",
+    "git add Cargo.lock rust/Cargo.lock",
 ]
 
 [[tool.bumpversion.files]]
@@ -96,14 +97,20 @@ filename = "pyproject.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 
+# Anchor Cargo version searches on the package name so dependency pins are never rewritten.
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = "name = \"gamma_lake_py\"\nversion = \"{current_version}\""
+replace = "name = \"gamma_lake_py\"\nversion = \"{new_version}\""
+
+[[tool.bumpversion.files]]
+filename = "rust/Cargo.toml"
 search = "[workspace.package]\nversion = \"{current_version}\""
 replace = "[workspace.package]\nversion = \"{new_version}\""
 
 # The exact pins of the workspace crates on each other.
 [[tool.bumpversion.files]]
-filename = "Cargo.toml"
+filename = "rust/Cargo.toml"
 search = 'version = "={current_version}"'
 replace = 'version = "={new_version}"'
 
@@ -161,7 +168,6 @@ destination = "gammalake/{python_extension_name}"
 packages = [
     "gammalake",
     "rust",
-    "build.rs",
     "Cargo.toml",
     "Cargo.lock",
 ]

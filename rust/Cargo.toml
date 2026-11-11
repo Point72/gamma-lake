@@ -1,3 +1,31 @@
+[workspace]
+members = ["core", "delta"]
+default-members = [".", "core", "delta"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+authors = ["Point72, L.P. <OpenSource@point72.com>"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Point72/gamma-lake"
+rust-version = "1.95"
+categories = ["database", "science"]
+
+[workspace.dependencies]
+gamma_lake_core = { path = "core", version = "=0.2.0" }
+gamma_lake_delta = { path = "delta", version = "=0.2.0", default-features = false }
+# `arrow` and `datafusion` must be the versions deltalake uses.
+arrow = { version = "59", default-features = false, features = ["ffi"] }
+datafusion = { version = "55.2", default-features = false, features = ["recursive_protection"] }
+deltalake = { version = "=1.1.2", default-features = false, features = ["rustls", "datafusion"] }
+async-trait = "0.1"
+futures = "0.3"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"
+
 [package]
 name = "gamma_lake"
 version.workspace = true
@@ -32,3 +60,14 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[profile.release]
+strip = "symbols"
+
+# Every test binary links datafusion and deltalake; with their debuginfo, parallel links outgrow
+# CI runner memory.
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.junit]
+path = "junit.xml"

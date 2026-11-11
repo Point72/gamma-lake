@@ -36,6 +36,8 @@ lint-py:  ## run python linter with ruff
 
 lint-rs:  ## run rust linter
 	make -C rust lint
+	cargo clippy --all-features
+	cargo fmt -- --check
 
 lint-docs:  ## lint docs with mdformat and codespell
 	python -m mdformat --check README.md $(wildcard docs/src) docs/wiki/
@@ -52,6 +54,7 @@ fix-py:  ## fix python formatting with ruff
 
 fix-rs:  ## fix rust formatting
 	make -C rust fix
+	cargo fmt
 
 fix-docs:  ## autoformat docs with mdformat and codespell
 	python -m mdformat README.md $(wildcard docs/src) docs/wiki/
