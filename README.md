@@ -291,7 +291,7 @@ tables, it is recorded as `failed`, its commits are undone on each table it comm
 unreferenced, so reads never see them.
 
 Rollback identifies the failed write's commits by transaction id and preserves unrelated writers' commits. If the
-write cannot be undone without removing another writer's changes, it remains `failed` and raises
+write cannot be undone without removing another writer's changes, no table is reverted; it remains `failed` and raises
 `PartialWriteError` naming the affected tables. Other operations, such as `annotate`,
 `consolidate_feature_groups` and runtime-feature methods, are not logged.
 

@@ -7,6 +7,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import polars as pl
 import pyarrow as pa
 import pytest
@@ -188,6 +189,15 @@ def test_date_bounds_compare_as_midnight_utc(lake):
     result = lake.read(["f1"], start=dt.date(2024, 1, 2), end=dt.date(2024, 1, 4))
     assert_frame_equal(by_columns(result, result.columns), reference_read(lake, latest(lake, ["f1"]), ts(2), ts(4)))
     assert result["timestamp"].min() == ts(2) and result["timestamp"].max() == ts(4)
+
+
+def test_date_and_numpy_bounds_on_a_naive_index(tmp_path):
+    schema = pa.schema([("timestamp", pa.timestamp("us")), ("symbol", pa.string())])
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize(ArrowSchema.make(schema))
+    fs.add_features(frame(range(1, 5), ["A"], f=1).with_columns(pl.col("timestamp").dt.replace_time_zone(None)))
+    for start in (dt.date(2024, 1, 2), np.datetime64("2024-01-02"), np.datetime64("2024-01-02T00:00:00.000000000")):
+        assert fs.read(["f"], start=start)["timestamp"].to_list() == [dt.datetime(2024, 1, d) for d in range(2, 5)]
+        assert fs.index_frame(start).collect().height == 3
 
 
 def test_literals_in_another_time_zone_are_unsupported(lake):
@@ -498,6 +508,11 @@ def test_pushdown_keeps_only_parts_that_select_a_superset(predicate, expected):
     assert seen == [expected]
 
 
+def test_an_empty_not_in_is_not_pushed():
+    # Polars keeps null rows for ``~is_in([])``; the core would drop them.
+    assert gammalake.native._pushdown(~pl.col("x").is_in([]), PUSHDOWN_SCHEMA, ["x"]) == [[]]
+
+
 def test_scan_slices_before_filtering(lake_path):
     lake = NativeLake(lake_path)
     predicate = pl.col("symbol") == "B"
@@ -658,6 +673,21 @@ def test_a_float_sort_key_is_rejected(tmp_path):
     assert not (tmp_path / "lake" / "index").exists() and not (tmp_path / "native" / "index").exists()
 
 
+def test_a_large_string_index_is_stored_as_string(tmp_path):
+    schema = pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.large_string())])
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize(ArrowSchema.make(schema))
+    fs.add_features(frame([1, 2], ["A"], f=1))
+    assert fs.index_frame().collect().schema["symbol"] == pl.String
+    assert fs.read(["f"]).height == 2
+
+
+def test_zoned_features_are_stored_in_utc(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    data = frame([1, 2], ["A"]).with_columns(g=pl.col("timestamp").dt.convert_time_zone("America/New_York"))
+    fs.add_features(data)
+    assert_frame_equal(fs.read(["g"]).select(data.columns).sort(KEYS), data.with_columns(pl.col("g").dt.convert_time_zone("UTC")))
+
+
 def test_a_table_once_as_of_is_never_padded(tmp_path):
     fs = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     fs.add_as_of_features(rows_frame([(1, "A"), (3, "B")], "x", 1), params={"strategy": "backward"})
@@ -694,6 +724,16 @@ def test_unaddressable_lakes_are_rejected(update, lake):
 def test_delta_options_reject_unknown_fields():
     with pytest.raises(ValidationError, match="compresion"):
         DeltaOptions(compresion="gzip")
+
+
+def test_compression_and_target_file_size_move_to_delta_options(tmp_path):
+    with pytest.warns(DeprecationWarning, match="moved to delta_options"):
+        fs = GammaFeatureLake(
+            base_path=str(tmp_path), compression="gzip", target_file_size=1024, delta_options=DeltaOptions(storage_options={"k": "v"})
+        )
+    assert fs.delta_options == DeltaOptions(compression="gzip", target_file_size=1024, storage_options={"k": "v"})
+    with pytest.raises(ValueError, match="both directly and in delta_options"):
+        GammaFeatureLake(base_path=str(tmp_path), compression="gzip", delta_options={"compression": "zstd"})
 
 
 @pytest.mark.parametrize("bad", [{"engine": "python"}, {"compression": "nope"}])

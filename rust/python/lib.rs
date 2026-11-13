@@ -45,11 +45,29 @@ fn lock_exception(error: &Error) -> Option<PyErr> {
     Some(Python::attach(|py| error.clone_ref(py)))
 }
 
+/// The kind of the first I/O error in the chain from `error`.
+fn io_error_kind(mut error: &(dyn std::error::Error + 'static)) -> Option<std::io::ErrorKind> {
+    loop {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        error = error.source()?;
+    }
+}
+
 fn to_py(error: Error) -> PyErr {
     if let Some(raised) = lock_exception(&error) {
         return raised;
     }
     let message = error.to_string();
+    let io = match &error {
+        Error::Store(e) => io_error_kind(e.as_ref()),
+        Error::DataFusion(e) => io_error_kind(e),
+        _ => None,
+    };
+    if let Some(kind) = io {
+        return std::io::Error::new(kind, message).into();
+    }
     match error {
         Error::NotInitialized(_) => UninitializedDeltaLakeException::new_err(message),
         Error::MissingFeatures(_) => MissingFeaturesException::new_err(message),
@@ -60,20 +78,29 @@ fn to_py(error: Error) -> PyErr {
         } => UnsupportedError::new_err((message, feature, signal_type)),
         Error::UnsupportedInput(_) => UnsupportedError::new_err(message),
         Error::Conflict { table } => ConflictError::new_err((message, table)),
+        // Rolled back, so raise what the write failed with, as when it commits nothing.
         Error::Write {
             phase,
             committed,
             source,
-        } => match lock_exception(&source) {
-            // Nothing was written, so the lock's own exception is the whole story.
-            Some(raised) if committed.is_empty() => raised,
-            // Otherwise raise PartialWriteError, chaining any lock exception as `__cause__`.
-            raised => {
-                let error = PartialWriteError::new_err((message, phase, committed));
-                Python::attach(|py| error.set_cause(py, raised));
-                error
-            }
-        },
+        } if committed.is_empty() => {
+            let error = to_py(*source);
+            Python::attach(|py| {
+                let note = format!("The write failed while {phase}.");
+                error.value(py).call_method1("add_note", (note,)).ok();
+            });
+            error
+        }
+        // Chains any lock exception as `__cause__`.
+        Error::Write {
+            phase,
+            committed,
+            source,
+        } => {
+            let error = PartialWriteError::new_err((message, phase, committed));
+            Python::attach(|py| error.set_cause(py, lock_exception(&source)));
+            error
+        }
         Error::InvalidPredicate(_) | Error::InvalidArgument(_) => PyValueError::new_err(message),
         _ => PyRuntimeError::new_err(message),
     }

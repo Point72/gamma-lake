@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, UInt32Array};
-use arrow::compute::{cast, concat_batches, take_record_batch};
+use arrow::compute::{cast, concat_batches, take, take_record_batch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::Column;
@@ -220,7 +220,8 @@ impl JoinedTable {
             }
             Lookup::Sparse(lookup) => lookup.lookup(&index.columns()[..keys])?,
         };
-        Ok(take_record_batch(&self.values, &rows)?.columns().to_vec())
+        let columns = self.values.columns().iter().map(|c| take(c, &rows, None));
+        Ok(columns.collect::<std::result::Result<_, _>>()?)
     }
 }
 
@@ -243,7 +244,15 @@ fn with_joined(
 ) -> Result<SendableRecordBatchStream> {
     let mut fields = index.schema().fields().to_vec();
     for table in &tables {
-        fields.extend(table.values.schema().fields().iter().cloned());
+        // Index rows that match no row of the table get nulls.
+        fields.extend(
+            table
+                .values
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| Arc::new(f.as_ref().clone().with_nullable(true))),
+        );
     }
     let schema = SchemaRef::new(Schema::new(fields));
     let tables = Arc::new(tables);
@@ -1064,5 +1073,28 @@ mod tests {
         assert_eq!(best.len(), 2);
         assert_eq!(rows[best["a"]].row, 1);
         assert_eq!(rows[best["b"]].row, 4);
+    }
+
+    #[test]
+    fn joined_features_are_nullable_where_no_row_matches() {
+        let column = |name: &str| Field::new(name, DataType::Int64, false);
+        let ints = |v: i64| Arc::new(Int64Array::from(vec![v])) as ArrayRef;
+        let table = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![column("k"), column("f")])),
+            vec![ints(1), ints(10)],
+        )
+        .unwrap();
+        let joined = JoinedTable::new(&Join::Sparse, "t", &table, 1, 0).unwrap();
+        let index =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![column("k")])), vec![ints(2)]).unwrap();
+        let index = Box::pin(RecordBatchStreamAdapter::new(
+            index.schema(),
+            futures::stream::iter([Ok(index)]),
+        ));
+        let read = with_joined(index, vec![joined], 1, 0).unwrap();
+        let batches = crate::runtime::block_on(read.try_collect::<Vec<_>>())
+            .unwrap()
+            .unwrap();
+        assert!(batches[0].column(1).is_null(0));
     }
 }

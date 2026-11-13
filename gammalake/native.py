@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from typing import Any
 
+import numpy as np
 import polars as pl
 import pyarrow as pa
 from polars_io_tools.io_sources.base import BaseExprNode, ErrorNode, FunctionNode, UnknownNode, get_parsed_expr
@@ -75,10 +76,11 @@ class ConflictError(RuntimeError):
 
 
 class PartialWriteError(RuntimeError):
-    """A write failed after some of its tables may have committed.
+    """A write failed after some of its tables committed, and they could not be rolled back.
 
-    ``committed`` names the tables that did, and is empty when the write was rolled back;
-    ``phase`` names the step that failed. When a lock failed, its exception is the ``__cause__``.
+    ``committed`` names the tables that may hold part of the write; ``phase`` names the step
+    that failed. When a lock failed, its exception is the ``__cause__``. A write that is rolled
+    back raises the exception it failed with instead, noting the step that failed.
     """
 
     def __init__(self, message: str, phase: str, committed: list[str]):
@@ -93,14 +95,19 @@ LockFactory = Callable[[str], AbstractContextManager]
 
 def _coerce(column: str, dtype: pl.DataType, value: Any) -> Any:
     """``value`` as a Python object of ``dtype``, compared as Polars would compare it."""
+    if isinstance(value, np.datetime64) and np.datetime_data(value.dtype)[0] in ("ns", "ps", "fs", "as"):
+        # ``item`` gives an int for units finer than Python's microseconds; keep exact values.
+        value = value.astype("datetime64[us]") if value == value.astype("datetime64[us]") else value
+    if isinstance(value, np.generic):
+        value = value.item()
     ok = False
     if isinstance(dtype, pl.Datetime):
         if isinstance(value, dt.datetime):
             literal_tz = pl.Series([value]).dtype.time_zone
             ok = literal_tz == dtype.time_zone and (dtype.time_unit != "ms" or value.microsecond % 1000 == 0)
-        elif isinstance(value, dt.date) and dtype.time_zone is not None:
-            # Polars compares a date with a zoned datetime as midnight UTC.
-            value, ok = dt.datetime.combine(value, dt.time(), tzinfo=dt.UTC), True
+        elif isinstance(value, dt.date):
+            # Polars compares a date with a datetime as midnight, in UTC when it is zoned.
+            value, ok = dt.datetime.combine(value, dt.time(), tzinfo=dt.UTC if dtype.time_zone else None), True
     elif dtype == pl.Date:
         ok = isinstance(value, dt.date) and not isinstance(value, dt.datetime)
     elif dtype == pl.String:
@@ -186,7 +193,8 @@ def _pushdown(predicate: pl.Expr | None, schema: pl.Schema, columns: Iterable[st
 def _pushed_term(column: str, op: str, value: Any, dtype: pl.DataType) -> Term | None:
     if value is None and op in ("is", "is not"):
         return (column, "is_null" if op == "is" else "is_not_null", None)
-    if op not in _PUSHED_OPS:
+    if op not in _PUSHED_OPS or (op in ("not in", "!in") and not len(value)):
+        # The core keeps no null rows for ``not in []``, unlike Polars.
         return None
     try:
         return (column, _PUSHED_OPS[op], _encode(column, dtype, value if op in ("in", "not in", "!in") else [value]))

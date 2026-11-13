@@ -11,13 +11,14 @@ and the `ray` extra is gone.
 
 ## `GammaFeatureLake` fields
 
-Passing a removed field raises a pydantic `ValidationError` (`Extra inputs are not permitted`).
+Passing a removed field raises a pydantic `ValidationError` (`Extra inputs are not permitted`). `compression` and
+`target_file_size` still work, with a `DeprecationWarning`, and are moved into `delta_options`.
 
 | 0.2                       | 0.3                                                                                                                            |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `io=PolarsIO(...)`        | Removed; the core does all I/O. Object store options and credentials go in `delta_options=DeltaOptions(storage_options={...})` |
-| `compression=...`         | `delta_options=DeltaOptions(compression=...)`                                                                                  |
-| `target_file_size=...`    | `delta_options=DeltaOptions(target_file_size=...)`                                                                             |
+| `compression=...`         | Deprecated; `delta_options=DeltaOptions(compression=...)`                                                                      |
+| `target_file_size=...`    | Deprecated; `delta_options=DeltaOptions(target_file_size=...)`                                                                 |
 | `run_on_ray_cluster=True` | Removed; writes run on the core's threads                                                                                      |
 
 `memory_limit` and `lock` are new; see [Native Engine](Native-Engine) and "Concurrent writers" in the README.
@@ -41,6 +42,8 @@ Passing a removed field raises a pydantic `ValidationError` (`Extra inputs are n
 
 ## Errors
 
-A write that loses a race with another writer raises `ConflictError` and writes nothing. A write that fails after some of
-its tables may have committed raises `PartialWriteError`, which names them. Requests the core cannot serve raise
-`UnsupportedError`. All three are importable from `gammalake`.
+A write that loses a race with another writer raises `ConflictError` and writes nothing. A write that fails otherwise is
+rolled back and, as in 0.2, raises the exception it failed with; a note names the step that failed. If the rollback cannot
+undo every commit, because another writer has since rewritten a table, the write raises `PartialWriteError`, which names
+the tables that may hold part of it. Requests the core cannot serve raise `UnsupportedError`. All three are importable from
+`gammalake`.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from datetime import datetime
@@ -23,6 +24,7 @@ from gammalake.native import ConflictError, DeltaOptions, NativeLake, PartialWri
 __all__ = ("ConflictError", "DeltaOptions", "GammaFeatureLake", "PartialWriteError", "UnsupportedError")
 
 DEFAULT_INDEX_SCHEMA = ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())]))
+_MOVED_DELTA_OPTIONS = ("compression", "target_file_size")
 
 
 class GammaFeatureLake(BaseFeatureLake, BaseModel):
@@ -73,6 +75,21 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     _native: tuple | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True, hide_input_in_errors=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def move_delta_options(cls, values):
+        """Accept 0.2's ``compression`` and ``target_file_size`` fields, now in ``delta_options``."""
+        if not isinstance(values, dict) or not values.keys() & _MOVED_DELTA_OPTIONS:
+            return values
+        moved = {k: values[k] for k in _MOVED_DELTA_OPTIONS if k in values}
+        delta = values.get("delta_options") or {}
+        if isinstance(delta, DeltaOptions):
+            delta = delta.model_dump(exclude_unset=True)
+        if clash := sorted(moved.keys() & delta.keys()):
+            raise ValueError(f"{clash} set both directly and in delta_options; set them in delta_options only")
+        warnings.warn(f"{sorted(moved)} moved to delta_options", DeprecationWarning, stacklevel=2)
+        return {**{k: v for k, v in values.items() if k not in moved}, "delta_options": {**delta, **moved}}
 
     @model_validator(mode="after")
     def check(self) -> GammaFeatureLake:

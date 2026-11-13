@@ -249,6 +249,10 @@ impl StoredTable for LockingTable {
         let Self { store, name, table } = *self;
         store.commit(&name, table.revert(tag, since)).await
     }
+
+    async fn check_revert(&self, tag: &str, since: u64) -> Result<()> {
+        self.table.check_revert(tag, since).await
+    }
 }
 
 #[cfg(test)]

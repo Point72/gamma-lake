@@ -658,9 +658,10 @@ def test_failed_add_is_rolled_back_and_later_writes_do_not_see_it(tmp_path):
     version_before = DeltaTable(fs.get_path(table)).version()
 
     failing = GammaFeatureLake(base_path=str(tmp_path), lock=_failing_lock(lambda name, _: name == "index"))
-    with pytest.raises(RuntimeError, match="simulated failure locking index"):
+    with pytest.raises(RuntimeError, match="simulated failure locking index") as raised:
         failing.add_features(_frame([6, 7], 2), owner="me")
 
+    assert raised.value.__notes__ == ["The write failed while writing table index (rolled back)."]
     assert DeltaTable(fs.get_path(table)).version() == version_before + 2
     assert_frame_equal(fs.index_frame().collect(), index_before)
     assert fs.read(["f"]).sort("timestamp", "symbol")["f"].to_list() == [1.0] * 10

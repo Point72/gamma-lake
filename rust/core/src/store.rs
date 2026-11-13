@@ -162,6 +162,14 @@ pub trait StoredTable: Send + Sync {
             "this store does not number versions, so it cannot undo commits".into(),
         ))
     }
+
+    /// Fails with [`entangled`] when [`StoredTable::revert`] would, without committing, so
+    /// that a write spanning tables can be refused before any is reverted. Stores that cannot
+    /// tell ahead succeed.
+    async fn check_revert(&self, tag: &str, since: u64) -> Result<()> {
+        let _ = (tag, since);
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -630,6 +638,17 @@ impl StoredTable for MemoryStored {
     }
 
     async fn revert(self: Box<Self>, tag: &str, since: u64) -> Result<bool> {
+        self.revert_to(tag, since, true)
+    }
+
+    async fn check_revert(&self, tag: &str, since: u64) -> Result<()> {
+        self.revert_to(tag, since, false).map(drop)
+    }
+}
+
+impl MemoryStored {
+    /// [`StoredTable::revert`], committing only with `commit`.
+    fn revert_to(&self, tag: &str, since: u64, commit: bool) -> Result<bool> {
         // The versions after `since`, oldest first, each with the one before it.
         let mut versions: Vec<_> = self
             .version
@@ -645,9 +664,11 @@ impl StoredTable for MemoryStored {
         let versions = &versions[first..];
         let base = versions[0].1;
         if versions.iter().all(|(v, _)| ours(v)) {
-            self.store.commit(&self.name, &self.version, None, |_| {
-                Ok((base.schema.clone(), base.batches.clone()))
-            })?;
+            if commit {
+                self.store.commit(&self.name, &self.version, None, |_| {
+                    Ok((base.schema.clone(), base.batches.clone()))
+                })?;
+            }
             return Ok(true);
         }
         // A commit that keeps a batch keeps its first column.
@@ -694,6 +715,9 @@ impl StoredTable for MemoryStored {
         }
         if let Some(number) = rescheming.filter(|_| reschemed) {
             return Err(entangled(&self.name, number));
+        }
+        if !commit {
+            return Ok(true);
         }
         let schema = if reschemed {
             base.schema.clone()

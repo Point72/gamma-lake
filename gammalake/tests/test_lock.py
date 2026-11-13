@@ -174,12 +174,11 @@ def test_a_failed_commit_releases_its_lock(tmp_path):
 
     recorder = Recorder(on_enter=deny)
     try:
-        with pytest.raises(PartialWriteError) as raised:
+        with pytest.raises(PermissionError) as raised:
             with_lock(lake, recorder).add_features(frame(keys(range(3, 5), "ab"), f=1))
     finally:
         log.chmod(mode)
-    assert raised.value.phase == "writing table table_metadata (rolled back)"
-    assert raised.value.committed == []
+    assert raised.value.__notes__ == ["The write failed while writing table table_metadata (rolled back)."]
     assert recorder.names() == sorted(os.path.basename(name) for name, *_ in recorder.held)
     assert ("table_metadata", 2, 2, (None, None, None)) in recorder.held
     assert lake.index_frame().collect().height == 6

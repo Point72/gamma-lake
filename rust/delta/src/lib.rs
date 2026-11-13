@@ -272,9 +272,24 @@ impl fmt::Debug for DeltaStore {
     }
 }
 
+/// Registers the object stores of the enabled features with delta-rs, which registers them
+/// from static constructors that a linker can drop, as from a static library.
+fn register_object_stores() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        #[cfg(feature = "s3")]
+        deltalake::aws::register_handlers(None);
+        #[cfg(feature = "azure")]
+        deltalake::azure::register_handlers(None);
+        #[cfg(feature = "gcs")]
+        deltalake::gcp::register_handlers(None);
+    });
+}
+
 impl DeltaStore {
     /// A store rooted at `base`, a local path or URL, which need not exist yet.
     pub fn new(base: &str, options: DeltaOptions) -> Result<Self> {
+        register_object_stores();
         if options.target_file_size == 0 {
             return Err(Error::InvalidArgument(
                 "target_file_size must be positive".into(),
@@ -732,6 +747,17 @@ impl StoredTable for DeltaStored {
     }
 
     async fn revert(self: Box<Self>, tag: &str, since: u64) -> Result<bool> {
+        self.revert_to(tag, since, true).await
+    }
+
+    async fn check_revert(&self, tag: &str, since: u64) -> Result<()> {
+        self.revert_to(tag, since, false).await.map(drop)
+    }
+}
+
+impl DeltaStored {
+    /// [`StoredTable::revert`], committing only with `commit`.
+    async fn revert_to(&self, tag: &str, since: u64, commit: bool) -> Result<bool> {
         let name = &self.name;
         let latest = self.table.version().unwrap_or(since);
         let log_store = self.table.log_store();
@@ -770,12 +796,15 @@ impl StoredTable for DeltaStored {
         let base = first - 1;
         let properties = strict(Some((REVERTS, tag)));
         if commits.iter().all(|(_, ours, _)| *ours) {
-            self.table
-                .restore()
-                .with_version_to_restore(base)
-                .with_commit_properties(properties)
-                .await
-                .map_err(|e| commit_err(name, e))?;
+            if commit {
+                self.table
+                    .clone()
+                    .restore()
+                    .with_version_to_restore(base)
+                    .with_commit_properties(properties)
+                    .await
+                    .map_err(|e| commit_err(name, e))?;
+            }
             return Ok(true);
         }
         let load = |version: u64| {
@@ -842,6 +871,9 @@ impl StoredTable for DeltaStored {
         }
         if let Some(version) = rescheming.filter(|_| reschemed) {
             return Err(entangled(name, version));
+        }
+        if !commit {
+            return Ok(true);
         }
         let snapshot = self.table.snapshot().map_err(delta_err)?;
         let current: HashMap<_, _> = snapshot

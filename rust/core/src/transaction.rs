@@ -182,19 +182,38 @@ impl Lake {
     }
 
     /// Undoes the commits of `commits` on each of its tables, newest first, retrying an undo
-    /// that conflicts with another writer's commit. Stops at a table whose commits cannot be
-    /// undone alone, and otherwise returns whether any were undone. A failure is an
-    /// [`Error::Write`] naming the tables that may still hold the write.
+    /// that conflicts with another writer's commit, and returns whether any were undone.
+    /// Refuses before undoing any when a table's commits cannot be undone alone, so the
+    /// tables stay aligned; one that becomes so after that check stops the undo there. A
+    /// failure is an [`Error::Write`] naming the tables that may still hold the write.
     async fn undo(&self, commits: &Commits) -> Result<Undo> {
         let tables = commits.tables();
-        let mut undone = false;
-        for (i, commit) in tables.iter().enumerate().rev() {
+        let all = || tables.iter().map(|c| c.addr.clone()).collect();
+        let mut reads = Vec::with_capacity(tables.len());
+        for commit in &tables {
             let addr = &commit.addr;
-            let held = || tables[..=i].iter().map(|c| c.addr.clone()).collect();
             let Some(read) = commit.read else {
                 let reason = format!("the store does not number the versions of table {addr}");
-                return Ok(Undo::Refused(reason, held()));
+                return Ok(Undo::Refused(reason, all()));
             };
+            let check = async {
+                self.table(addr)
+                    .await?
+                    .check_revert(commits.tag(), read)
+                    .await
+            };
+            match check.await {
+                Ok(()) => reads.push(read),
+                Err(Error::Store(e)) if e.is::<Entangled>() => {
+                    return Ok(Undo::Refused(e.to_string(), all()));
+                }
+                Err(e) => return Err(after(format!("checking table {addr}"), all(), e)),
+            }
+        }
+        let mut undone = false;
+        for (i, (commit, read)) in tables.iter().zip(reads).enumerate().rev() {
+            let addr = &commit.addr;
+            let held = || tables[..=i].iter().map(|c| c.addr.clone()).collect();
             let revert = async {
                 let mut attempt = 1;
                 loop {
@@ -585,6 +604,38 @@ mod tests {
         assert_eq!(committed, std::slice::from_ref(&lake.options.index_path));
         assert_eq!(index_ts(&lake), [1, 2, 8, 9]);
         assert_eq!(statuses(&lake)[2..], ["pending", "failed"]);
+    }
+
+    #[test]
+    fn a_rollback_refused_on_one_table_restores_none() {
+        let lake = lake(&Arc::default(), &MemoryStore::new(), "transaction_log");
+        add(&lake, &[1, 2], 1.0).unwrap();
+        let (index, other) = (lake.options.index_path.clone(), "other".to_string());
+        block_on(lake.store.create(&other, row(1), &CreateOptions::default()))
+            .unwrap()
+            .unwrap();
+        let commits = Commits::default();
+        // Commits to the index, then to `other`; another writer then rewrites the index.
+        let body = async {
+            for path in [&index, &other] {
+                let table = commits.tagged(lake.table(path).await?);
+                let read = table.version();
+                commits.count(path, read, table.append(row(8)).await)?;
+            }
+            commit_other(&lake, Some(Other::Merge(9))).await?;
+            Err(Error::Write {
+                phase: "testing".into(),
+                committed: vec![index.clone(), other.clone()],
+                source: Box::new(Error::InvalidArgument("boom".into())),
+            })
+        };
+        let err = block_on(lake.transaction("me", "feature", &commits, body))
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("not rolled back"), "{err}");
+        assert_eq!(index_ts(&lake), [1, 2, 8, 9]);
+        let other = block_on(lake.table(&other)).unwrap().unwrap();
+        assert_eq!(other.version(), Some(1));
     }
 
     #[test]

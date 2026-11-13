@@ -165,9 +165,8 @@ fn storage_type(data_type: &DataType) -> Option<DataType> {
         LargeBinary | BinaryView => Binary,
         Dictionary(_, value) => storage_type(value)?,
         Timestamp(_, None) => Timestamp(TimeUnit::Microsecond, None),
-        Timestamp(_, Some(tz)) if tz.as_ref() == "UTC" => {
-            Timestamp(TimeUnit::Microsecond, Some(tz.clone()))
-        }
+        // Delta stores zoned timestamps in UTC; the instants are unchanged.
+        Timestamp(_, Some(_)) => Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         List(f) | LargeList(f) | ListView(f) | LargeListView(f) | FixedSizeList(f, _) => List(
             Arc::new(Field::new(f.name(), storage_type(f.data_type())?, true)),
         ),
@@ -180,6 +179,33 @@ fn storage_type(data_type: &DataType) -> Option<DataType> {
         ),
         _ => return None,
     })
+}
+
+/// `schema`, the sort keys of a new lake, with the types its index stores.
+fn index_storage_schema(schema: &Schema) -> Result<SchemaRef> {
+    let fields = schema.fields().iter().map(|field| {
+        if is_float(field.data_type()) {
+            return Err(Error::InvalidArgument(format!(
+                "sort key {:?} is floating-point; sort keys are matched by equality, \
+                 which is not reliable for floats",
+                field.name()
+            )));
+        }
+        match storage_type(field.data_type()) {
+            Some(stored) if !stored.is_nested() => {
+                Ok(field.as_ref().clone().with_data_type(stored))
+            }
+            _ => Err(unsupported(format!(
+                "index column {:?} has type {}, which the Rust core cannot store",
+                field.name(),
+                field.data_type()
+            ))),
+        }
+    });
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields.collect::<Result<Vec<_>>>()?,
+        schema.metadata().clone(),
+    )))
 }
 
 /// The type that holds values of both `stored` and `incoming` (storage types), following
@@ -542,6 +568,7 @@ impl Lake {
         options: LakeOptions,
     ) -> Result<Lake> {
         let store = crate::lake::locking(store, &options);
+        let index_schema = index_storage_schema(&index_schema)?;
         let pk = index_schema
             .field_with_name(&options.primary_sort_key)
             .map_err(|_| {
@@ -566,24 +593,6 @@ impl Lake {
                 "index column {:?} appears twice",
                 f.name()
             )));
-        }
-        for field in index_schema.fields() {
-            if is_float(field.data_type()) {
-                return Err(Error::InvalidArgument(format!(
-                    "sort key {:?} is floating-point; sort keys are matched by equality, \
-                     which is not reliable for floats",
-                    field.name()
-                )));
-            }
-            if field.data_type().is_nested()
-                || storage_type(field.data_type()).as_ref() != Some(field.data_type())
-            {
-                return Err(unsupported(format!(
-                    "index column {:?} has type {}, which the Rust core cannot store",
-                    field.name(),
-                    field.data_type()
-                )));
-            }
         }
         let lock = write_lock(store.location());
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
