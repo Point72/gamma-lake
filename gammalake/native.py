@@ -170,25 +170,46 @@ def _pushdown(predicate: pl.Expr | None, schema: pl.Schema, columns: Iterable[st
     ``convert_expr_to_dnf`` gives a DNF selecting every row that ``predicate`` selects. Terms
     the core cannot evaluate, or on other or float columns (the core orders NaNs differently
     from Polars), are dropped from their clause, which only widens it, so ``predicate`` must
-    still be applied to what is read.
+    still be applied to what is read. Each top-level conjunct is converted on its own, smallest
+    first, and those that would push the DNF past ``_MAX_CLAUSES`` are dropped.
     """
     node = _parse(predicate)
     if node is None or _row_aligned(node):
         return [[]]
+    pushable = {c for c in columns if not schema[c].is_float()}
+    pushed: list[list[Term]] = [[]]
+    for conjunct in sorted(_conjuncts(node), key=lambda n: _dnf_size(n)[0]):
+        dnf = _pushed_dnf(conjunct, schema, pushable)
+        if dnf and len(pushed) * len(dnf) <= _MAX_CLAUSES:
+            pushed = _and(pushed, dnf)
+    return pushed
+
+
+def _conjuncts(node: BaseExprNode) -> list[BaseExprNode]:
+    match node:
+        case BinaryExprNode(op=OperatorType.AND | OperatorType.LOGICAL_AND):
+            return _conjuncts(node.left) + _conjuncts(node.right)
+        case FunctionNode(function_type=BooleanFunctionType.ALL_HORIZONTAL):
+            return [c for n in node.inputs for c in _conjuncts(n)]
+    return [node]
+
+
+def _pushed_dnf(node: BaseExprNode, schema: pl.Schema, pushable: set[str]) -> list[list[Term]] | None:
+    """The pushed DNF of ``node``, or ``None`` when it is too large or restricts nothing."""
     if _dnf_size(node)[0] > _MAX_CLAUSES:
-        return [[]]
+        return None
     dnf = convert_expr_to_dnf(node, schema)
     if not dnf or len(dnf) > _MAX_CLAUSES:
-        return [[]]
-    pushable = {c for c in columns if not schema[c].is_float()}
-    return [[t for c, op, v in clause if c in pushable and (t := _pushed_term(c, op, v, schema[c])) is not None] for clause in dnf]
+        return None
+    clauses = [[t for c, op, v in clause if c in pushable and (t := _pushed_term(c, op, v, schema[c])) is not None] for clause in dnf]
+    return None if [] in clauses else clauses
 
 
 def _dnf_size(node: BaseExprNode) -> tuple[int, int]:
     """Upper bounds on the clauses, and on their width, of ``convert_expr_to_dnf(node)``.
 
     The expansion is exponential: an AND of ORs multiplies their clauses, and a NOT of ``n``
-    clauses of width ``w`` gives ``w ** n``, so ``_pushdown`` bounds it before expanding.
+    clauses of width ``w`` gives ``w ** n``, so ``_pushed_dnf`` bounds it before expanding.
     Counts past ``_MAX_CLAUSES`` are capped.
     """
     cap = _MAX_CLAUSES + 1

@@ -18,7 +18,7 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::align::{zip_aligned, AlignInput, Source};
 use crate::error::{integrity, Error, Result};
-use crate::joined::{table_predicate, AsOfParams, AsOfTable, SparseTable};
+use crate::joined::{AsOfParams, AsOfTable, SparseTable};
 use crate::lock::{LockingStore, TableLock};
 use crate::predicate::{column, Dnf};
 use crate::runtime::{block_on, blocking};
@@ -610,12 +610,17 @@ impl Lake {
                 keys: input.keys,
             }))
         };
-        // Sort one physical table at a time to bound Parquet buffers and intermediate data.
-        let index = index.await?;
+        // Under a memory limit, sort one physical table at a time to bound Parquet buffers and
+        // intermediate data; otherwise the index and tables are prepared concurrently.
         let tables = futures::stream::iter(plan.tables)
-            .then(prepare)
-            .try_collect::<Vec<_>>()
-            .await?;
+            .map(prepare)
+            .buffered(if budget.is_some() { 1 } else { 16 })
+            .try_collect::<Vec<_>>();
+        let (index, tables) = if budget.is_some() {
+            (index.await?, tables.await?)
+        } else {
+            futures::try_join!(index, tables)?
+        };
         // The feature columns of joined tables are appended to the index, input 0. `moved`
         // maps each input of the layout to its new input and column offset.
         let (mut aligned, mut joined) = (vec![], vec![]);
@@ -776,7 +781,7 @@ impl Lake {
             let frame = match &join {
                 Some(Join::AsOf(params)) => scan(
                     &names,
-                    &table_predicate(dnf, self.primary_sort_key(), params.strategy),
+                    &params.table_predicate(dnf, self.primary_sort_key(), &pk_type)?,
                 )?,
                 _ => scan(&names, dnf)?,
             };

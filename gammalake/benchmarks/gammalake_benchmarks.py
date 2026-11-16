@@ -309,8 +309,7 @@ class GammaLakeOverlapWriteSuite:
 class GammaLakeReadSuite:
     """Benchmark reads over multiple time windows and feature-group counts."""
 
-    MAX_GROUPS = 3
-    params = ([1, 7, 30], [1, 3])
+    params = ([1, 7, 30], [1, 3, 16])
     param_names = ("n_days", "n_groups")
     timeout = 600
 
@@ -319,13 +318,13 @@ class GammaLakeReadSuite:
         try:
             self._lake = GammaFeatureLake(base_path=self._storage_path).initialize()
             features: list[str] = []
-            for group in range(self.MAX_GROUPS):
+            for group in range(n_groups):
                 self._lake.add_features(_make_feature_df(group, N_FEATURES), owner="benchmark")
                 features.extend(f"g{group}_feat_{feature}" for feature in range(N_FEATURES))
         except Exception:
             _delete_generated_path(self._storage_path)
             raise
-        self._features = features[: n_groups * N_FEATURES]
+        self._features = features
         self._start = _all_days()[0]
         self._end = _all_days()[n_days - 1]
 

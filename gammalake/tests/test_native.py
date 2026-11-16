@@ -1,8 +1,10 @@
 import contextlib
 import datetime as dt
+import functools
 import gc
 import itertools
 import json
+import operator
 import os
 import random
 import shutil
@@ -320,15 +322,21 @@ def test_encode_uses_arrow_utf8_for_polars_strings():
 
 
 def test_predicates_with_too_many_clauses_are_not_expanded(monkeypatch):
-    def expand(*_):
-        raise AssertionError("expanded")
+    convert = gammalake.native.convert_expr_to_dnf
+
+    def expand(node, schema):
+        assert gammalake.native._dnf_size(node)[0] <= gammalake.native._MAX_CLAUSES
+        return convert(node, schema)
 
     monkeypatch.setattr(gammalake.native, "convert_expr_to_dnf", expand)
     # 2 ** 30 clauses as an AND of ORs, and 2 ** 7 as the NOT of a 7-clause OR of ANDs.
-    wide = pl.all_horizontal(*[(pl.col("x") == i) | (pl.col("i") == i) for i in range(30)])
-    negated = ~pl.any_horizontal(*[(pl.col("x") == i) & (pl.col("i") == i) for i in range(7)])
-    for predicate in (wide, negated):
-        assert gammalake.native._pushdown(predicate, PUSHDOWN_SCHEMA, ["x", "i"]) == [[]]
+    wide = functools.reduce(operator.and_, [(pl.col("x") == i) | (pl.col("i") == i) for i in range(30)])
+    assert len(gammalake.native._pushdown(wide, PUSHDOWN_SCHEMA, ["x", "i"])) == 64
+    negated = ~functools.reduce(operator.or_, [(pl.col("x") == i) & (pl.col("i") == i) for i in range(7)])
+    assert gammalake.native._pushdown(negated, PUSHDOWN_SCHEMA, ["x", "i"]) == [[]]
+    # Conjuncts that restrict nothing pushed do not crowd out one that does.
+    selective = functools.reduce(operator.and_, [(pl.col("f") > i) | (pl.col("f") < -i) for i in range(7)], pl.col("x") == 1)
+    assert [[t[:2] for t in clause] for clause in gammalake.native._pushdown(selective, PUSHDOWN_SCHEMA, ["x", "f"])] == [[("x", EQ)]]
 
 
 def test_date_bounds_compare_as_midnight_utc(lake):

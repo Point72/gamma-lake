@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{new_empty_array, Array, ArrayRef, AsArray, UInt32Array};
+use arrow::array::{new_empty_array, Array, ArrayRef, AsArray, Int64Array, UInt32Array};
 use arrow::compute::cast;
 use arrow::datatypes::{
     DataType, Date32Type, Date64Type, DurationMicrosecondType, DurationMillisecondType,
@@ -468,68 +468,118 @@ impl SparseTable {
 /// are dropped from the table predicate instead.
 const MAX_BOUNDED_VALUES: usize = 16;
 
-/// A predicate on an as-of table that keeps every row a read of the index filtered by `dnf`
-/// can match. `pk` is the primary sort key.
-///
-/// Terms on other sort keys are kept, since rows only match within equal keys. For
-/// `Backward`, an index row at or below a bound only matches table rows at or below it, so
-/// `<` and `<=` are kept, `=` becomes `<=`, and `In` becomes `<=` any of its values; other
-/// terms on `pk` are dropped. `Forward` is the mirror image. `Nearest` can match in either
-/// direction, so it drops every term on `pk`.
-pub(crate) fn table_predicate(dnf: &Dnf, pk: &str, strategy: Strategy) -> Dnf {
-    let bound = match strategy {
-        Strategy::Backward => Some(Op::LtEq),
-        Strategy::Forward => Some(Op::GtEq),
-        Strategy::Nearest => None,
-    };
-    let mut clauses: Vec<Vec<Term>> = vec![];
-    for clause in &dnf.0 {
-        let mut kept: Vec<Term> = vec![];
-        let mut alternatives: Option<Vec<Term>> = None;
-        for term in clause {
-            if term.column != pk {
-                kept.push(term.clone());
-                continue;
-            }
-            let Some(bound) = bound else { continue };
-            match (strategy, term.op) {
-                (Strategy::Backward, Op::Lt | Op::LtEq)
-                | (Strategy::Forward, Op::Gt | Op::GtEq) => kept.push(term.clone()),
-                (_, Op::Eq) => kept.push(Term {
-                    op: bound,
-                    ..term.clone()
-                }),
-                (_, Op::In)
-                    if alternatives.is_none() && term.values.len() <= MAX_BOUNDED_VALUES =>
-                {
-                    alternatives = Some(
-                        (0..term.values.len())
-                            .map(|i| Term {
-                                column: term.column.clone(),
-                                op: bound,
-                                values: term.values.slice(i, 1),
-                            })
-                            .collect(),
-                    )
+impl AsOfParams {
+    /// A predicate on the as-of table that keeps every row a read of the index filtered by
+    /// `dnf` can match. `pk` is the primary sort key, of type `pk_type`.
+    ///
+    /// Terms on other sort keys are kept, since rows only match within equal keys. A match
+    /// lies below its index key for `Backward`, above it for `Forward`, and on either side
+    /// for `Nearest`, at most the tolerance away. So a bound on `pk` is kept on the side the
+    /// match cannot cross, moved by the tolerance on a side it can cross, and dropped
+    /// otherwise; `=` and `In` become such bounds. Bounds that do not fit `pk_type` are
+    /// dropped.
+    pub(crate) fn table_predicate(&self, dnf: &Dnf, pk: &str, pk_type: &DataType) -> Result<Dnf> {
+        let tolerance = self.bound(pk_type)?.map(|bound| match bound {
+            Bound::Units(units) => units,
+            Bound::Nanos { nanos, unit } => (nanos + unit - 1) / unit,
+        });
+        // How far below and above its index key a match can lie, in key units.
+        let (below, above) = match self.strategy {
+            Strategy::Backward => (tolerance, Some(0)),
+            Strategy::Forward => (Some(0), tolerance),
+            Strategy::Nearest => (tolerance, tolerance),
+        };
+        let lower =
+            |values: &ArrayRef| below.and_then(|d| bound_term(pk, Op::GtEq, values, pk_type, -d));
+        let upper =
+            |values: &ArrayRef| above.and_then(|d| bound_term(pk, Op::LtEq, values, pk_type, d));
+        let both = |values: &ArrayRef| {
+            lower(values)
+                .into_iter()
+                .chain(upper(values))
+                .collect::<Vec<_>>()
+        };
+        let mut clauses: Vec<Vec<Term>> = vec![];
+        for clause in &dnf.0 {
+            let mut kept: Vec<Term> = vec![];
+            let mut alternatives: Option<Vec<Vec<Term>>> = None;
+            for term in clause {
+                if term.column != pk {
+                    kept.push(term.clone());
+                    continue;
                 }
-                _ => {}
+                match term.op {
+                    Op::Lt | Op::LtEq if above == Some(0) => kept.push(term.clone()),
+                    Op::Gt | Op::GtEq if below == Some(0) => kept.push(term.clone()),
+                    Op::Lt | Op::LtEq => kept.extend(upper(&term.values)),
+                    Op::Gt | Op::GtEq => kept.extend(lower(&term.values)),
+                    Op::Eq => kept.extend(both(&term.values)),
+                    Op::In
+                        if alternatives.is_none()
+                            && term.values.len() <= MAX_BOUNDED_VALUES
+                            && (below.is_some() || above.is_some()) =>
+                    {
+                        alternatives = Some(
+                            (0..term.values.len())
+                                .map(|i| both(&term.values.slice(i, 1)))
+                                .collect(),
+                        )
+                    }
+                    _ => {}
+                }
+            }
+            match alternatives {
+                // `In` with no values matches nothing, and neither does its clause.
+                Some(alternatives) => clauses.extend(alternatives.into_iter().map(|alternative| {
+                    let mut clause = kept.clone();
+                    clause.extend(alternative);
+                    clause
+                })),
+                None => clauses.push(kept),
             }
         }
-        match alternatives {
-            // `In` with no values matches nothing, and neither does its clause.
-            Some(alternatives) => clauses.extend(alternatives.into_iter().map(|alternative| {
-                let mut clause = kept.clone();
-                clause.push(alternative);
-                clause
-            })),
-            None => clauses.push(kept),
-        }
+        Ok(if clauses.iter().any(Vec::is_empty) {
+            Dnf::default()
+        } else {
+            Dnf(clauses)
+        })
     }
-    if clauses.iter().any(Vec::is_empty) {
-        Dnf::default()
+}
+
+/// `column op key`, where `key` is the first of `values` moved by `delta` units of
+/// `pk_type`, or `None` when that is not a valid `pk_type` key.
+fn bound_term(
+    column: &str,
+    op: Op,
+    values: &ArrayRef,
+    pk_type: &DataType,
+    delta: i128,
+) -> Option<Term> {
+    let values = if delta == 0 {
+        values.clone()
     } else {
-        Dnf(clauses)
-    }
+        let value = cast(&values.slice(0, 1), pk_type).ok()?;
+        if !value.is_valid(0) {
+            return None;
+        }
+        let key = i64::try_from(i128::from(keys(value.as_ref()).ok()?[0]) + delta).ok()?;
+        let physical = match pk_type {
+            DataType::Date32 => DataType::Int32,
+            t if t.is_integer() => t.clone(),
+            _ => DataType::Int64,
+        };
+        let key = cast(
+            &cast(&Int64Array::from(vec![key]), &physical).ok()?,
+            pk_type,
+        )
+        .ok()?;
+        key.is_valid(0).then_some(key)?
+    };
+    Some(Term {
+        column: column.into(),
+        op,
+        values,
+    })
 }
 
 #[cfg(test)]
@@ -764,21 +814,26 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+        let predicate = |dnf: &Dnf, json: &str| {
+            params(json)
+                .table_predicate(dnf, "t", &DataType::Int64)
+                .unwrap()
+        };
         let window = Dnf(vec![vec![
             term("t", Op::GtEq, vec![3]),
             term("t", Op::Lt, vec![5]),
             term("s", Op::Eq, vec![1]),
         ]]);
         assert_eq!(
-            show(&table_predicate(&window, "t", Strategy::Backward)),
+            show(&predicate(&window, r#"{"strategy": "backward"}"#)),
             ["tLt[5]&sEq[1]"]
         );
         assert_eq!(
-            show(&table_predicate(&window, "t", Strategy::Forward)),
+            show(&predicate(&window, r#"{"strategy": "forward"}"#)),
             ["tGtEq[3]&sEq[1]"]
         );
         assert_eq!(
-            show(&table_predicate(&window, "t", Strategy::Nearest)),
+            show(&predicate(&window, r#"{"strategy": "nearest"}"#)),
             ["sEq[1]"]
         );
         let points = Dnf(vec![
@@ -786,7 +841,7 @@ mod tests {
             vec![term("t", Op::Eq, vec![7])],
         ]);
         assert_eq!(
-            show(&table_predicate(&points, "t", Strategy::Backward)),
+            show(&predicate(&points, r#"{"strategy": "backward"}"#)),
             ["tLtEq[2]", "tLtEq[9]", "tLtEq[7]"]
         );
         // A clause left without terms matches everything; one with an empty In nothing.
@@ -794,16 +849,42 @@ mod tests {
             vec![term("t", Op::Gt, vec![3])],
             vec![term("s", Op::Eq, vec![1])],
         ]);
-        assert!(table_predicate(&open, "t", Strategy::Backward).is_empty());
+        assert!(predicate(&open, r#"{"strategy": "backward"}"#).is_empty());
         let empty = Dnf(vec![
             vec![term("t", Op::In, vec![])],
             vec![term("s", Op::Eq, vec![1])],
         ]);
         assert_eq!(
-            show(&table_predicate(&empty, "t", Strategy::Forward)),
+            show(&predicate(&empty, r#"{"strategy": "forward"}"#)),
             ["sEq[1]"]
         );
+        // A tolerance bounds the side a match can cross.
+        let backward = r#"{"strategy": "backward", "tolerance": 2}"#;
+        assert_eq!(
+            show(&predicate(&window, backward)),
+            ["tGtEq[1]&tLt[5]&sEq[1]"]
+        );
+        assert_eq!(
+            show(&predicate(&points, backward)),
+            [
+                "tGtEq[0]&tLtEq[2]",
+                "tGtEq[7]&tLtEq[9]",
+                "tGtEq[5]&tLtEq[7]"
+            ]
+        );
+        assert_eq!(
+            show(&predicate(
+                &window,
+                r#"{"strategy": "nearest", "tolerance": 2}"#
+            )),
+            ["tGtEq[1]&tLtEq[7]&sEq[1]"]
+        );
+        let overflow = Dnf(vec![vec![term("t", Op::Eq, vec![i64::MIN])]]);
+        assert_eq!(
+            show(&predicate(&overflow, backward)),
+            [format!("tLtEq[{}]", i64::MIN)]
+        );
         let long = Dnf(vec![vec![term("t", Op::In, (0..17).collect())]]);
-        assert!(table_predicate(&long, "t", Strategy::Backward).is_empty());
+        assert!(predicate(&long, r#"{"strategy": "backward"}"#).is_empty());
     }
 }

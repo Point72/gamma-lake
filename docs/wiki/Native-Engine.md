@@ -19,7 +19,8 @@ Requests the core cannot serve raise `UnsupportedError`.
 and feature table scans. `scan()` returns a `LazyFrame`. Filters applied to it later that compare sort keys
 with literals, test membership with `is_in`, use `is_between` or test for nulls, combined with `&`, `|` and `~`, reach the
 scans, for example `pl.col("timestamp") >= start` or `pl.col("symbol").is_in(symbols)`. The rest, and filters on float
-columns, run after alignment. `scan_index()`, `scan_feature_metadata()`, `scan_table_metadata()` and
+columns, run after alignment. Each `&`-joined part is pushed on its own, and parts that would expand the pushed filter
+past 64 conjunctions are left out. `scan_index()`, `scan_feature_metadata()`, `scan_table_metadata()` and
 `scan_transaction_log()` push the same filters, on any of their columns, into their scans. `read_arrow()` returns a single-use Arrow C stream, which `pyarrow.RecordBatchReader.from_stream` and
 `polars.DataFrame` accept.
 
@@ -99,7 +100,7 @@ cores, use CPU affinity (`taskset`) as well. Polars has its own pool, set with `
 
 ## Memory
 
-By default a read sorts each table it reads in memory, so its peak memory is about the size of the data it reads, and
+By default a read sorts the tables it reads in memory, up to 16 at once, so its peak memory is about the size of the data it reads, and
 more for tables stored out of key order. A write holds in memory its input, the index rows up to the input's largest
 primary key and the metadata tables; a copy-mode overlap also holds every row of the table it rewrites. The 0.2 engine
 did the same, and `memory_limit` does not apply to writes.
