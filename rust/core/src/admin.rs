@@ -11,7 +11,6 @@ use arrow::compute::{cast, concat, concat_batches, take_record_batch, unary};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatchReader;
 use arrow::row::{RowConverter, SortField};
-use futures::future::join_all;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::error::{after, integrity, Error, Result};
@@ -103,7 +102,7 @@ impl Lake {
     /// the first one is stored; a later failure is an [`Error::Write`]. Each annotated table
     /// gets one commit, and annotations of one column are applied in order.
     pub fn annotate(&self, annotations: &[Annotation]) -> Result<()> {
-        let lock = write_lock(self.store.location());
+        let lock = write_lock(self.store.location())?;
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         block_on(self.annotate_locked(annotations, vec![], &Commits::default()))?
     }
@@ -211,7 +210,8 @@ impl Lake {
             (addr, result)
         };
         let mut failure = None;
-        for (addr, result) in join_all(opened.map(annotate)).await {
+        let annotated = futures::stream::iter(opened).map(annotate).buffered(16);
+        for (addr, result) in annotated.collect::<Vec<_>>().await {
             match result {
                 Ok(()) => committed.push(addr),
                 Err(e) => {
@@ -336,7 +336,7 @@ impl Lake {
     /// Tables created after `at` are left in place, unreferenced. Restore is not atomic: a
     /// failure after the first table was restored is an [`Error::Write`].
     pub fn restore(&self, at: i64) -> Result<()> {
-        let lock = write_lock(self.store.location());
+        let lock = write_lock(self.store.location())?;
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         block_on(async {
             let mut committed = vec![];
@@ -378,7 +378,7 @@ impl Lake {
     /// its comment and tags. Each feature gets a new version that differs only in its
     /// table; reads return the same values.
     pub fn consolidate(&self, features: &[&str]) -> Result<Option<String>> {
-        let lock = write_lock(self.store.location());
+        let lock = write_lock(self.store.location())?;
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let plan = block_on(self.consolidation(features))??;
         let Some(plan) = plan else {

@@ -33,7 +33,7 @@ impl Lake {
         if expressions.is_empty() {
             return Ok(());
         }
-        let lock = write_lock(self.store.location());
+        let lock = write_lock(self.store.location())?;
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         block_on(self.add_expressions_locked(expressions, owner))?
     }

@@ -22,17 +22,12 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from gammalake import GammaFeatureLake
-from gammalake.tests._model import KEYS, SCENARIOS, Model, frame, keys
-
-OLD_SRC = os.environ.get("GAMMA_LAKE_OLD_SRC")
-pytestmark = pytest.mark.skipif(not OLD_SRC, reason="GAMMA_LAKE_OLD_SRC is not set")
+from gammalake.tests._model import KEYS, Model, frame, keys, scenarios
 
 # Old-engine bugs the model does not reproduce (Point72/gamma-lake#45, #46 and #48). Scenarios
 # that exercise them are compared between engines only.
 OLD_ENGINE_BUGS = {"all_new_keys_after_coverage", "overlap_copy", "new_key_at_coverage_end"}
-
-_VIEW_TYPE = re.compile(r"\b(string|binary)_view\b")
-
+OLD_SRC = os.environ.get("GAMMA_LAKE_OLD_SRC")
 _RUNNER = textwrap.dedent(
     """
     import json, sys
@@ -52,6 +47,8 @@ _RUNNER = textwrap.dedent(
             result.write_parquet(op["out"])
     """
 )
+_VIEW_TYPE = re.compile(r"\b(string|binary)_view\b")
+pytestmark = pytest.mark.skipif(not OLD_SRC, reason="GAMMA_LAKE_OLD_SRC is not set")
 
 
 class Engines:
@@ -122,9 +119,9 @@ def engines_for(pattern: str, n: int) -> list[str]:
 
 
 @pytest.mark.parametrize("pattern", ["old-first", "new-first"])
-@pytest.mark.parametrize("scenario", list(SCENARIOS))
+@pytest.mark.parametrize("scenario", list(scenarios()))
 def test_engines_take_turns_writing(tmp_path, scenario, pattern):
-    steps = SCENARIOS[scenario]
+    steps = scenarios()[scenario]
     lake = Engines(tmp_path / "lake")
     lake.run(engines_for(pattern, 1)[0], "initialize")
     model, written = Model(), set()

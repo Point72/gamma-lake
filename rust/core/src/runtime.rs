@@ -59,21 +59,35 @@ pub fn session_context(overrides: &[(&str, String)]) -> Result<SessionContext> {
 
 /// Process-wide runtime. It is never dropped, so no runtime is ever torn down from
 /// inside an async context or an FFI release callback.
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
+///
+/// A forked child inherits the runtime but not its threads, so work sent to it would never
+/// run. It fails with [`Error::Forked`] in any process other than the one that started it.
+fn runtime() -> Result<&'static Runtime> {
+    static RUNTIME: OnceLock<(u32, Runtime)> = OnceLock::new();
+    let (pid, runtime) = RUNTIME.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(threads())
             .thread_name("gamma-lake")
             .build()
-            .expect("failed to start the gamma-lake tokio runtime")
-    })
+            .expect("failed to start the gamma-lake tokio runtime");
+        (std::process::id(), runtime)
+    });
+    if *pid != std::process::id() {
+        return Err(Error::Forked);
+    }
+    Ok(runtime)
+}
+
+/// Fails with [`Error::Forked`] in a forked child. Call it before taking any process-wide
+/// lock, which the child may have inherited held by a thread that no longer exists.
+pub(crate) fn check_not_forked() -> Result<()> {
+    runtime().map(|_| ())
 }
 
 /// Handle to the shared runtime, for work started from other executors.
-pub(crate) fn handle() -> Handle {
-    runtime().handle().clone()
+pub(crate) fn handle() -> Result<Handle> {
+    Ok(runtime()?.handle().clone())
 }
 
 /// Runs `future` to completion on the shared runtime. Fails when called from inside a tokio
@@ -84,7 +98,7 @@ pub(crate) fn block_on<F: Future>(future: F) -> Result<F::Output> {
             "the blocking gamma-lake API cannot be called from inside a tokio runtime".into(),
         ));
     }
-    Ok(runtime().block_on(future))
+    Ok(runtime()?.block_on(future))
 }
 
 /// Runs the CPU-bound `f` on the blocking pool, holding one of the [`cpu_permits`].

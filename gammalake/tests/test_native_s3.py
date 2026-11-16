@@ -16,9 +16,9 @@ moto_auth = pytest.importorskip("moto.core.authorization")
 boto3 = pytest.importorskip("boto3")
 
 BUCKET = "lake-bucket"
-SCHEMA = pa.schema([("timestamp", pa.timestamp("us", "UTC")), ("symbol", pa.string())])
 POLICY = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
 ROWS = frame(keys(range(1, 4), "a"), f=1)
+SCHEMA = pa.schema([("timestamp", pa.timestamp("us", "UTC")), ("symbol", pa.string())])
 
 
 @pytest.fixture(scope="module")
@@ -61,14 +61,14 @@ def test_a_lake_on_s3_is_created_written_and_reopened(s3):
     _, _, secret = s3
     base_path, delta_options = f"s3://{BUCKET}/lakes/one", options(*s3)
     uninitialized = GammaFeatureLake(base_path=base_path, delta_options=delta_options)
-    assert not uninitialized._is_initialized
+    assert uninitialized._native is None
 
     lake = uninitialized.initialize()
     lake.add_features(ROWS, owner="me")
     expected = lake.read(["f"])
 
     reopened = GammaFeatureLake(base_path=base_path, delta_options=delta_options)
-    assert reopened._is_initialized
+    assert reopened._native is None
     assert_frame_equal(reopened.read(["f"]), expected)
     assert expected["f"].to_list() == [1.0, 2.0, 3.0]
     assert secret not in repr(reopened)

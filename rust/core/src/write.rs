@@ -21,7 +21,6 @@ use arrow::compute::{cast, concat, concat_batches, take, take_record_batch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, Rows, SortField};
 use arrow::util::display::array_value_to_string;
-use futures::future::join_all;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::admin::Annotation;
@@ -594,7 +593,7 @@ impl Lake {
                 f.name()
             )));
         }
-        let lock = write_lock(store.location());
+        let lock = write_lock(store.location())?;
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
 
         let string = |name: &str| Field::new(name, DataType::Utf8, true);
@@ -725,7 +724,7 @@ impl Lake {
     }
 
     fn write(&self, input: Vec<RecordBatch>, options: &AddOptions) -> Result<()> {
-        let lock = write_lock(self.store.location());
+        let lock = write_lock(self.store.location())?;
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         // Plan (read and build every batch), commit, then annotate the committed versions, all as
         // one logged transaction that undoes its commits if it fails.
@@ -1370,11 +1369,11 @@ fn written(error: Error, committed: &mut Vec<String>) -> Error {
     }
 }
 
-/// Commits the feature tables concurrently, then the index, then the metadata tables, and
-/// returns the addresses of the tables committed, counting the commits in `commits`. A
-/// failure is an [`Error::Write`], unless nothing was committed and every failure was a
-/// conflict; the first conflict is then returned as is. Other errors may come after a
-/// commit, so they never count as conflicts, and are reported ahead of them.
+/// Commits the feature tables concurrently, up to 16 at a time, then the index, then the
+/// metadata tables, and returns the addresses of the tables committed, counting the commits
+/// in `commits`. A failure is an [`Error::Write`], unless nothing was committed and every
+/// failure was a conflict; the first conflict is then returned as is. Other errors may come
+/// after a commit, so they never count as conflicts, and are reported ahead of them.
 pub(crate) async fn commit(
     lake: &Lake,
     actions: Vec<Action>,
@@ -1390,7 +1389,8 @@ pub(crate) async fn commit(
     let mut committed = vec![];
     let mut failure = None;
     let mut only_conflicts = true;
-    for (addr, result) in join_all(actions.into_iter().map(attempt)).await {
+    let attempts = futures::stream::iter(actions).map(attempt).buffered(16);
+    for (addr, result) in attempts.collect::<Vec<_>>().await {
         match result {
             Ok(()) => committed.push(addr),
             Err(e) => {

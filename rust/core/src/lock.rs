@@ -28,16 +28,18 @@ use crate::store::{CreateOptions, StoredTable, TableScan, TableStore};
 /// The error a lock callback reports.
 pub type LockError = Box<dyn StdError + Send + Sync>;
 
-/// Serializes writes to one lake within this process.
-pub(crate) fn write_lock(location: &str) -> Arc<Mutex<()>> {
+/// Serializes writes to one lake within this process. Fails in a forked child, where the
+/// lock may be held by a thread that was not copied.
+pub(crate) fn write_lock(location: &str) -> Result<Arc<Mutex<()>>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS
+    crate::runtime::check_not_forked()?;
+    Ok(LOCKS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .entry(location.to_string())
         .or_default()
-        .clone()
+        .clone())
 }
 
 /// A lock on the tables of a lake, keyed by [`TableStore::table_location`].

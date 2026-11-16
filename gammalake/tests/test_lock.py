@@ -76,29 +76,29 @@ def annotate(lake: GammaFeatureLake) -> None:
     lake.annotate(metadata.with_columns(comment=pl.lit("note"), tags=pl.lit(["x"])))
 
 
-# The tables each operation changes: "features" and "targets" are the tables of f and y, "new" a table it creates.
-# Adds are transactions, which append two rows to the log, each under its own lock.
-OPERATIONS = {
-    "add_features": (lambda lake: lake.add_features(frame(keys(range(1, 3), "ab"), h=1)), ["feature_metadata", "new", "table_metadata", LOG]),
-    "add_features_on_new_keys": (
-        lambda lake: lake.add_features(frame(keys(range(4, 6), "ab"), f=1, g=2)),
-        ["features", "index", "table_metadata", LOG],
-    ),
-    "add_targets": (lambda lake: lake.add_targets(frame(keys(range(1, 3), "ab"), z=1)), ["feature_metadata", "new", "table_metadata", LOG]),
-    "add_index_rows": (lambda lake: lake.add_index_rows(frame(keys([5], "ab"))), ["index", LOG]),
-    "add_index_rows_inside_coverage": (lambda lake: lake.add_index_rows(frame(keys([2], "c"))), ["features", "index", "targets", LOG]),
-    "annotate": (annotate, ["features"]),
-    "consolidate_feature_groups": (
-        lambda lake: lake.consolidate_feature_groups(["f", "y"]),
-        ["feature_metadata", "new", "table_metadata"],
-    ),
-    "add_runtime_computed_features": (lambda lake: lake.add_runtime_computed_features([(pl.col("f") * 2).alias("rc")]), ["feature_metadata"]),
-}
+def operations():
+    """The tables each operation changes, using ``new`` for a table it creates."""
+    return {
+        "add_features": (lambda lake: lake.add_features(frame(keys(range(1, 3), "ab"), h=1)), ["feature_metadata", "new", "table_metadata", LOG]),
+        "add_features_on_new_keys": (
+            lambda lake: lake.add_features(frame(keys(range(4, 6), "ab"), f=1, g=2)),
+            ["features", "index", "table_metadata", LOG],
+        ),
+        "add_targets": (lambda lake: lake.add_targets(frame(keys(range(1, 3), "ab"), z=1)), ["feature_metadata", "new", "table_metadata", LOG]),
+        "add_index_rows": (lambda lake: lake.add_index_rows(frame(keys([5], "ab"))), ["index", LOG]),
+        "add_index_rows_inside_coverage": (lambda lake: lake.add_index_rows(frame(keys([2], "c"))), ["features", "index", "targets", LOG]),
+        "annotate": (annotate, ["features"]),
+        "consolidate_feature_groups": (
+            lambda lake: lake.consolidate_feature_groups(["f", "y"]),
+            ["feature_metadata", "new", "table_metadata"],
+        ),
+        "add_runtime_computed_features": (lambda lake: lake.add_runtime_computed_features([(pl.col("f") * 2).alias("rc")]), ["feature_metadata"]),
+    }
 
 
-@pytest.mark.parametrize("operation", list(OPERATIONS))
+@pytest.mark.parametrize("operation", list(operations()))
 def test_writes_commit_under_locks_on_exactly_the_tables_they_change(tmp_path, operation):
-    run, expected = OPERATIONS[operation]
+    run, expected = operations()[operation]
     lake = populated(tmp_path)
     metadata = lake.feature_metadata_frame().collect()
     roles = {metadata.filter(pl.col("feature_name") == name)["table_addr"].item(): role for name, role in (("f", "features"), ("y", "targets"))}
@@ -195,11 +195,7 @@ class FalsyError(Exception):
         return False
 
 
-# Arrow exceptions and falsy exceptions must not be mistaken for errors of the core.
-LOCK_ERRORS = [OSError, pa.ArrowInvalid, FalsyError]
-
-
-@pytest.mark.parametrize("error_type", LOCK_ERRORS)
+@pytest.mark.parametrize("error_type", [OSError, pa.ArrowInvalid, FalsyError])
 @pytest.mark.parametrize("raised_by", ["factory", "enter"])
 def test_a_lock_error_before_any_commit_propagates_unchanged(tmp_path, raised_by, error_type):
     lake = populated(tmp_path)
@@ -219,7 +215,7 @@ def test_a_lock_error_before_any_commit_propagates_unchanged(tmp_path, raised_by
 
 
 @pytest.mark.parametrize("rollback_fails", [False, True])
-@pytest.mark.parametrize("error_type", LOCK_ERRORS)
+@pytest.mark.parametrize("error_type", [OSError, pa.ArrowInvalid, FalsyError])
 @pytest.mark.parametrize("raised_by", ["factory", "enter"])
 def test_a_lock_error_after_a_commit_rolls_the_write_back(tmp_path, raised_by, error_type, rollback_fails):
     lake = populated(tmp_path)

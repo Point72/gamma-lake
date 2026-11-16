@@ -1,9 +1,14 @@
+import contextlib
 import datetime as dt
 import gc
 import itertools
 import json
+import os
 import random
 import shutil
+import signal
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
 
@@ -22,6 +27,16 @@ from gammalake.gamma_feature_lake import ArrowSchema
 from gammalake.native import NativeLake
 from gammalake.tests._model import KEYS, ts
 
+EQ = "=="
+GE = ">="
+GT = ">"
+IN = "in"
+IS_NULL = "is_null"
+LE = "<="
+LT = "<"
+NE = "!="
+NOT_IN = "not_in"
+PUSHDOWN_SCHEMA = pl.Schema({"x": pl.Int64, "i": pl.Int32, "f": pl.Float64})
 SYMBOLS = ["A", "B", "C"]
 
 
@@ -124,8 +139,11 @@ def test_predicate_import_errors(lake_path):
         lake.read(["f1"], None, [[("symbol", "==", ["A"])]])
     with pytest.raises(ValueError):
         lake.read(["f1"], None, [[("symbol", "~", pa.array(["A"]))]])
-    with pytest.raises(ValueError):
-        lake.read(["f1"], None, [[("f1", "==", pa.array([1.0]))]])
+
+
+def test_native_read_rejects_feature_predicates_before_scanning_tables(lake_path):
+    with pytest.raises(ValueError, match=r'column "f1" is not a sort key'):
+        native.Lake(lake_path).read(["f1"], None, [[("f1", "==", pa.array([1.0]))]])
 
 
 def test_reads_release_the_gil(lake_path):
@@ -135,6 +153,53 @@ def test_reads_release_the_gil(lake_path):
         results = list(pool.map(lambda _: lake.read(["f1", "f3"]), range(20), timeout=120))
     for result in results:
         assert_frame_equal(result, expected)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def assert_fails_in_forked_child(op):
+    pid = os.fork()
+    if pid == 0:
+        try:
+            op()
+        except RuntimeError as error:
+            os._exit(0 if "forked" in str(error) else 1)
+        os._exit(2)
+    deadline = time.monotonic() + 60
+    while (status := os.waitpid(pid, os.WNOHANG))[0] == 0:
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            pytest.fail("the forked call hung")
+        time.sleep(0.1)
+    assert os.waitstatus_to_exitcode(status[1]) == 0
+
+
+def test_reads_in_a_forked_child_fail(lake_path):
+    lake = NativeLake(lake_path)
+    lake.read(["f1"])
+    assert_fails_in_forked_child(lambda: lake.read(["f1"]))
+
+
+def test_writes_in_a_forked_child_fail_while_the_parent_writes(tmp_path):
+    """The child inherits the in-process write lock held by a parent thread that it lacks."""
+    locked, release = threading.Event(), threading.Event()
+
+    @contextlib.contextmanager
+    def lock(path):
+        locked.set()
+        release.wait()
+        yield
+
+    path = str(tmp_path / "lake")
+    GammaFeatureLake(base_path=path).initialize()
+    lake = NativeLake(path, lock=lock)
+    writer = threading.Thread(target=lake.add_features, args=(frame([1], ["A"], f=1),))
+    writer.start()
+    try:
+        assert locked.wait(60)
+        assert_fails_in_forked_child(lambda: lake.add_features(frame([1], ["A"], g=1)))
+    finally:
+        release.set()
+        writer.join()
 
 
 # --------------------------------------------------------------------- errors
@@ -148,10 +213,27 @@ def test_error_mapping(lake_path, tmp_path):
         lake.read(["f1"], ["f2"])
     with pytest.raises(UninitializedDeltaLakeException):
         NativeLake(str(tmp_path / "missing"))
-    with pytest.raises(ValueError, match="unknown filter column"):
-        lake.read(["f1"], filters=[("nope", "=", 1)])
     with pytest.raises(UnsupportedError):
         lake.read(["f1"], start="2024-01-02")
+
+
+@pytest.mark.parametrize(
+    "url, store, options",
+    [
+        ("foo://bucket/lake", "Cannot infer storage location", {}),
+        ("az://container/lake", "MicrosoftAzure", {"azure_storage_use_emulator": "true", "max_retries": "0"}),
+        (
+            "abfss://container@devstoreaccount1.dfs.core.windows.net/lake",
+            "MicrosoftAzure",
+            {"azure_storage_use_emulator": "true", "max_retries": "0"},
+        ),
+        ("gs://bucket/lake", "GCS", {"google_service_account_key": "{}"}),
+    ],
+)
+def test_object_stores_are_registered(url, store, options):
+    # An unregistered scheme fails to resolve; a registered one fails in its store's client.
+    with pytest.raises(RuntimeError, match=store):
+        NativeLake(url, delta_options=DeltaOptions(storage_options=options))
 
 
 @pytest.mark.parametrize("table", ["index", "feature_metadata", "table_metadata"])
@@ -185,6 +267,70 @@ def test_validate_reports_misaligned_tables(tmp_path):
 # --------------------------------------------------------------------- literals
 
 
+@pytest.mark.parametrize(
+    "dtype,value,expected",
+    [
+        (pl.Datetime("us", "UTC"), dt.datetime(2024, 1, 2, tzinfo=dt.UTC), dt.datetime(2024, 1, 2, tzinfo=dt.UTC)),
+        (pl.Datetime("us", "UTC"), dt.date(2024, 1, 2), dt.datetime(2024, 1, 2, tzinfo=dt.UTC)),
+        (pl.Datetime("us"), dt.date(2024, 1, 2), dt.datetime(2024, 1, 2)),
+        (pl.Datetime("ms"), dt.datetime(2024, 1, 2, 0, 0, 0, 1000), dt.datetime(2024, 1, 2, 0, 0, 0, 1000)),
+        (pl.Datetime("us"), np.datetime64("2024-01-02"), dt.datetime(2024, 1, 2)),
+        (pl.Datetime("us"), np.datetime64("2024-01-02T00:00:00.000000000"), dt.datetime(2024, 1, 2)),
+        (pl.Date, dt.date(2024, 1, 2), dt.date(2024, 1, 2)),
+        (pl.String, "A", "A"),
+        (pl.Boolean, np.bool_(True), True),
+        (pl.Int64, np.int64(3), 3),
+        (pl.Float64, 3, 3),
+        (pl.Float64, np.float32(1.5), 1.5),
+    ],
+)
+def test_coerce_accepts_compatible_literals(dtype, value, expected):
+    assert gammalake.native._coerce("x", dtype, value) == expected
+
+
+@pytest.mark.parametrize(
+    "dtype,value",
+    [
+        (pl.Datetime("us", "UTC"), dt.datetime(2024, 1, 2)),
+        (pl.Datetime("us"), dt.datetime(2024, 1, 2, tzinfo=dt.UTC)),
+        (pl.Datetime("us", "UTC"), dt.datetime(2024, 1, 2, tzinfo=ZoneInfo("America/New_York"))),
+        (pl.Datetime("ms"), dt.datetime(2024, 1, 2, 0, 0, 0, 1)),
+        (pl.Datetime("us"), np.datetime64("2024-01-02T00:00:00.000000001")),
+        (pl.Date, dt.datetime(2024, 1, 2)),
+        (pl.String, 1),
+        (pl.Boolean, 1),
+        (pl.Int64, True),
+        (pl.Int64, 1.5),
+        (pl.Float64, True),
+        (pl.Binary, b"A"),
+    ],
+)
+def test_coerce_rejects_incompatible_literals(dtype, value):
+    with pytest.raises(UnsupportedError, match="cannot compare 'x'"):
+        gammalake.native._coerce("x", dtype, value)
+
+
+def test_encode_rejects_values_outside_the_dtype_range():
+    with pytest.raises(UnsupportedError, match=r"cannot represent \[128\] as 'x' \(Int8\)"):
+        gammalake.native._encode("x", pl.Int8, [128])
+
+
+def test_encode_uses_arrow_utf8_for_polars_strings():
+    assert gammalake.native._encode("x", pl.String, ["A", "B"]).type == pa.string()
+
+
+def test_predicates_with_too_many_clauses_are_not_expanded(monkeypatch):
+    def expand(*_):
+        raise AssertionError("expanded")
+
+    monkeypatch.setattr(gammalake.native, "convert_expr_to_dnf", expand)
+    # 2 ** 30 clauses as an AND of ORs, and 2 ** 7 as the NOT of a 7-clause OR of ANDs.
+    wide = pl.all_horizontal(*[(pl.col("x") == i) | (pl.col("i") == i) for i in range(30)])
+    negated = ~pl.any_horizontal(*[(pl.col("x") == i) & (pl.col("i") == i) for i in range(7)])
+    for predicate in (wide, negated):
+        assert gammalake.native._pushdown(predicate, PUSHDOWN_SCHEMA, ["x", "i"]) == [[]]
+
+
 def test_date_bounds_compare_as_midnight_utc(lake):
     result = lake.read(["f1"], start=dt.date(2024, 1, 2), end=dt.date(2024, 1, 4))
     assert_frame_equal(by_columns(result, result.columns), reference_read(lake, latest(lake, ["f1"]), ts(2), ts(4)))
@@ -210,11 +356,12 @@ def test_literals_in_another_time_zone_are_unsupported(lake):
 # --------------------------------------------------------------------- runtime-computed
 
 
-RC_EXPRESSIONS = [
-    (pl.col("f1") + pl.col("f2")).alias("s"),
-    pl.col("s").shift(1).over("symbol").alias("lag_s"),
-    pl.col("f2").rolling_mean(2).over("symbol").alias("roll"),
-]
+def rc_expressions():
+    return [
+        (pl.col("f1") + pl.col("f2")).alias("s"),
+        pl.col("s").shift(1).over("symbol").alias("lag_s"),
+        pl.col("f2").rolling_mean(2).over("symbol").alias("roll"),
+    ]
 
 
 @pytest.fixture
@@ -224,27 +371,28 @@ def rc_fs(tmp_path) -> GammaFeatureLake:
     fs.add_features(frame(range(1, 7), SYMBOLS, f1=1, f2=2))
     fs.add_targets(frame(range(1, 7), SYMBOLS, t1=-1))
     fs.add_features(frame(range(4, 9), SYMBOLS, f1=10))
-    fs.add_runtime_computed_features(RC_EXPRESSIONS)
+    fs.add_runtime_computed_features(rc_expressions())
     return fs
 
 
 def rc_reference(fs: GammaFeatureLake, roots: pl.DataFrame, start=None, end=None) -> pl.DataFrame:
     """Runtime-computed features over a reference read of their roots, computed after the bounds apply."""
     result = reference_read(fs, roots, start, end)
-    for expression in RC_EXPRESSIONS:
+    for expression in rc_expressions():
         result = result.with_columns(expression)
     return result
 
 
-RC_READS = [
-    (["s"], {}),
-    (["roll", "f1"], {"targets": ["t1"], "start": ts(2), "end": ts(7)}),
-    (["f2", "s"], {"start": ts(5)}),
-]
+def rc_reads():
+    return [
+        (["s"], {}),
+        (["roll", "f1"], {"targets": ["t1"], "start": ts(2), "end": ts(7)}),
+        (["f2", "s"], {"start": ts(5)}),
+    ]
 
 
 @pytest.mark.parametrize("materialized", [True, False])
-@pytest.mark.parametrize("features,kwargs", RC_READS)
+@pytest.mark.parametrize("features,kwargs", rc_reads())
 def test_runtime_computed_reads_match_polars(rc_fs, features, kwargs, materialized):
     got = rc_fs.read(features, materialized=materialized, **kwargs)
     got = got if materialized else got.collect()
@@ -360,19 +508,20 @@ def test_registrations_written_by_polars_read_and_extend(tmp_path):
 # --------------------------------------------------------------------- parity
 
 
-READS = [
-    (["f1"], {}),
-    (["f3", "f1", "f4"], {"targets": ["t1"]}),
-    (["f2", "f3"], {"start": ts(3), "end": ts(5)}),
-    (["f4", "f1"], {"start": ts(6)}),
-    (["f3"], {"end": dt.date(2024, 1, 4)}),
-    (["f1"], {"start": dt.datetime(2024, 1, 3, 1, tzinfo=dt.timezone(dt.timedelta(hours=2)))}),
-    (["f1", "f2", "f3", "f4"], {"targets": ["t1"], "start": ts(2), "end": ts(8)}),
-]
+def reads():
+    return [
+        (["f1"], {}),
+        (["f3", "f1", "f4"], {"targets": ["t1"]}),
+        (["f2", "f3"], {"start": ts(3), "end": ts(5)}),
+        (["f4", "f1"], {"start": ts(6)}),
+        (["f3"], {"end": dt.date(2024, 1, 4)}),
+        (["f1"], {"start": dt.datetime(2024, 1, 3, 1, tzinfo=dt.timezone(dt.timedelta(hours=2)))}),
+        (["f1", "f2", "f3", "f4"], {"targets": ["t1"], "start": ts(2), "end": ts(8)}),
+    ]
 
 
 @pytest.mark.parametrize("materialized", [True, False])
-@pytest.mark.parametrize("features,kwargs", READS)
+@pytest.mark.parametrize("features,kwargs", reads())
 def test_reads_match_polars(lake, features, kwargs, materialized):
     bounds = {key: kwargs[key] for key in ("start", "end") if key in kwargs}
     expected = reference_read(lake, latest(lake, [*features, *kwargs.get("targets", [])]), **bounds)
@@ -382,18 +531,19 @@ def test_reads_match_polars(lake, features, kwargs, materialized):
     assert_frame_equal(by_columns(result, expected.columns), expected)
 
 
-SCANS = [
-    lambda f: f.filter(pl.col("symbol") == "B"),
-    lambda f: f.filter(pl.col("symbol").is_in(["A", "D"])).select("f4", "symbol"),
-    lambda f: f.filter(pl.col("f3") > 6.0),
-    lambda f: f.filter((pl.col("symbol") == "C") & (pl.col("timestamp") >= ts(5))),
-    lambda f: f.select(pl.len()),
-    lambda f: f.select("timestamp", "symbol"),
-    lambda f: f.sort("timestamp", "symbol").head(4),
-]
+def scans():
+    return [
+        lambda f: f.filter(pl.col("symbol") == "B"),
+        lambda f: f.filter(pl.col("symbol").is_in(["A", "D"])).select("f4", "symbol"),
+        lambda f: f.filter(pl.col("f3") > 6.0),
+        lambda f: f.filter((pl.col("symbol") == "C") & (pl.col("timestamp") >= ts(5))),
+        lambda f: f.select(pl.len()),
+        lambda f: f.select("timestamp", "symbol"),
+        lambda f: f.sort("timestamp", "symbol").head(4),
+    ]
 
 
-@pytest.mark.parametrize("query", SCANS)
+@pytest.mark.parametrize("query", scans())
 def test_scan_queries_match_polars(lake, query):
     features = ["f1", "f3", "f4"]
     expected = query(reference_read(lake, latest(lake, features)).lazy()).collect()
@@ -433,27 +583,27 @@ def pushed(spy: Spy) -> list[list[tuple[str, str]]]:
     return [sorted((c, op) for c, op, _ in clause) for clause in args[-1]]
 
 
-EQ, NE, LT, LE, GT, GE, IN, NOT_IN, IS_NULL = "==", "!=", "<", "<=", ">", ">=", "in", "not_in", "is_null"
-PUSHDOWNS = [
-    ((pl.col("symbol") == "B") & (pl.col("f3") > 6.0), [[("symbol", EQ)]]),
-    (pl.col("timestamp").is_between(ts(3), ts(5)), [[("timestamp", GE), ("timestamp", LE)]]),
-    (pl.col("timestamp").is_between(ts(3), ts(5), closed="none"), [[("timestamp", GT), ("timestamp", LT)]]),
-    ((pl.col("timestamp") > ts(2)) & pl.col("symbol").is_in(["A", "C"]), [[("timestamp", GT), ("symbol", IN)]]),
-    ((pl.col("symbol") == "A") | (pl.col("timestamp") >= ts(8)), [[("symbol", EQ)], [("timestamp", GE)]]),
-    (pl.lit(ts(4)) >= pl.col("timestamp"), [[("timestamp", LE)]]),
-    (~pl.col("symbol").is_in(["A"]), [[("symbol", NOT_IN)]]),
-    (~pl.col("timestamp").is_between(ts(3), ts(5)), [[("timestamp", LT)], [("timestamp", GT)]]),
-    (~((pl.col("symbol") == "A") | (pl.col("f3") > 6.0)), [[("symbol", NE)]]),
-    (pl.col("symbol").is_null(), [[("symbol", IS_NULL)]]),
-    (pl.col("symbol").ne_missing("A"), [[("symbol", NE)], [("symbol", IS_NULL)]]),
-    # Pushing a part of these would drop rows they select.
-    (~((pl.col("symbol") == "A") & (pl.col("f3") > 6.0)), []),
-    ((pl.col("symbol") == "A") | (pl.col("f3") > 6.0), []),
-    (pl.col("timestamp").dt.day() == 3, []),
-]
+def pushdowns():
+    return [
+        ((pl.col("symbol") == "B") & (pl.col("f3") > 6.0), [[("symbol", EQ)]]),
+        (pl.col("timestamp").is_between(ts(3), ts(5)), [[("timestamp", GE), ("timestamp", LE)]]),
+        (pl.col("timestamp").is_between(ts(3), ts(5), closed="none"), [[("timestamp", GT), ("timestamp", LT)]]),
+        ((pl.col("timestamp") > ts(2)) & pl.col("symbol").is_in(["A", "C"]), [[("timestamp", GT), ("symbol", IN)]]),
+        ((pl.col("symbol") == "A") | (pl.col("timestamp") >= ts(8)), [[("symbol", EQ)], [("timestamp", GE)]]),
+        (pl.lit(ts(4)) >= pl.col("timestamp"), [[("timestamp", LE)]]),
+        (~pl.col("symbol").is_in(["A"]), [[("symbol", NOT_IN)]]),
+        (~pl.col("timestamp").is_between(ts(3), ts(5)), [[("timestamp", LT)], [("timestamp", GT)]]),
+        (~((pl.col("symbol") == "A") | (pl.col("f3") > 6.0)), [[("symbol", NE)]]),
+        (pl.col("symbol").is_null(), [[("symbol", IS_NULL)]]),
+        (pl.col("symbol").ne_missing("A"), [[("symbol", NE)], [("symbol", IS_NULL)]]),
+        # Pushing a part of these would drop rows they select.
+        (~((pl.col("symbol") == "A") & (pl.col("f3") > 6.0)), []),
+        ((pl.col("symbol") == "A") | (pl.col("f3") > 6.0), []),
+        (pl.col("timestamp").dt.day() == 3, []),
+    ]
 
 
-@pytest.mark.parametrize("predicate,expected", PUSHDOWNS)
+@pytest.mark.parametrize("predicate,expected", pushdowns())
 def test_scan_pushes_sort_key_predicates(lake_path, predicate, expected):
     lake = NativeLake(lake_path)
     reference = lake.read(["f1", "f3"]).filter(predicate).select("f3", "timestamp", "symbol")
@@ -481,9 +631,6 @@ def test_index_and_metadata_frames_push_predicates(lake_path):
     tables = fs.table_metadata_frame().filter(pl.col("table_addr") == addr).collect()
     assert pushed(spy) == [[("table_addr", EQ)]]
     assert tables["table_addr"].to_list() == [addr]
-
-
-PUSHDOWN_SCHEMA = pl.Schema({"x": pl.Int64, "i": pl.Int32, "f": pl.Float64})
 
 
 @pytest.mark.parametrize(
@@ -542,14 +689,15 @@ def test_scans_take_row_aligned_predicates(lake_path):
     assert_frame_equal(lake.scan_index().filter(predicate).collect(), index.filter(pl.col("symbol") != "A"))
 
 
-JOIN_PARAMS = [
-    {},
-    {"strategy": "forward"},
-    {"strategy": "nearest"},
-    {"strategy": "backward", "tolerance": "2d"},
-    {"strategy": "forward", "tolerance": "1d"},
-    {"strategy": "nearest", "tolerance": "36h"},
-]
+def join_params():
+    return [
+        {},
+        {"strategy": "forward"},
+        {"strategy": "nearest"},
+        {"strategy": "backward", "tolerance": "2d"},
+        {"strategy": "forward", "tolerance": "1d"},
+        {"strategy": "nearest", "tolerance": "36h"},
+    ]
 
 
 def rows_frame(rows, name: str, scale: float) -> pl.DataFrame:
@@ -562,7 +710,7 @@ def joined_writes(seed: int):
     rng = random.Random(seed)
     keys = list(itertools.product(range(1, 12), SYMBOLS))
     writes = [("add_features", frame(range(1, 6), SYMBOLS, d1=1), {})]
-    for i, params in enumerate(JOIN_PARAMS):
+    for i, params in enumerate(join_params()):
         writes.append(("add_as_of_features", rows_frame(rng.sample(keys, rng.randint(1, 8)), f"a{i}", i + 1), {"params": params}))
     writes.append(("add_sparse_features", rows_frame(rng.sample(keys, 6), "s0", 10), {}))
     rng.shuffle(writes)
@@ -572,13 +720,17 @@ def joined_writes(seed: int):
     return writes
 
 
-JOINED_NAMES = ["d1", "s0", *(f"a{i}" for i in range(len(JOIN_PARAMS)))]
-JOINED_QUERIES = [
-    lambda f: f,
-    lambda f: f.filter(pl.col("symbol") == "B"),
-    lambda f: f.filter(pl.col("timestamp") >= ts(5)),
-    lambda f: f.filter(pl.col("symbol").is_in(["A", "C"]) & (pl.col("timestamp") < ts(7))),
-]
+def joined_names():
+    return ["d1", "s0", *(f"a{i}" for i in range(len(join_params())))]
+
+
+def joined_queries():
+    return [
+        lambda f: f,
+        lambda f: f.filter(pl.col("symbol") == "B"),
+        lambda f: f.filter(pl.col("timestamp") >= ts(5)),
+        lambda f: f.filter(pl.col("symbol").is_in(["A", "C"]) & (pl.col("timestamp") < ts(7))),
+    ]
 
 
 @pytest.mark.parametrize("seed", range(4))
@@ -586,13 +738,13 @@ def test_as_of_and_sparse_match_polars(tmp_path, seed):
     lake = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     for method, df, kwargs in joined_writes(seed):
         getattr(lake, method)(df, **kwargs)
-    selected = latest(lake, JOINED_NAMES)
-    assert selected["signal_type"].to_list() == ["feature", "sparse_feature", *["as_of_feature"] * len(JOIN_PARAMS)]
+    selected = latest(lake, joined_names())
+    assert selected["signal_type"].to_list() == ["feature", "sparse_feature", *["as_of_feature"] * len(join_params())]
     for window in [{}, {"start": ts(3)}, {"end": ts(6)}, {"start": ts(4), "end": ts(9)}]:
         expected = reference_read(lake, selected, **window)
-        assert_frame_equal(lake.read(JOINED_NAMES, **window).sort(KEYS).select(expected.columns), expected)
-        for query in JOINED_QUERIES:
-            result = query(lake.read(JOINED_NAMES, **window, materialized=False)).collect().sort(KEYS)
+        assert_frame_equal(lake.read(joined_names(), **window).sort(KEYS).select(expected.columns), expected)
+        for query in joined_queries():
+            result = query(lake.read(joined_names(), **window, materialized=False)).collect().sort(KEYS)
             assert_frame_equal(result.select(expected.columns), query(expected.lazy()).collect())
 
 
@@ -601,10 +753,10 @@ def test_memory_limit_reads_the_same(tmp_path, seed):
     lake = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     for method, df, kwargs in joined_writes(seed):
         getattr(lake, method)(df, **kwargs)
-    expected = lake.read(JOINED_NAMES).sort(KEYS)
+    expected = lake.read(joined_names()).sort(KEYS)
     bounded = GammaFeatureLake(base_path=str(tmp_path), memory_limit=1 << 20).initialize()
-    assert_frame_equal(bounded.read(JOINED_NAMES).sort(KEYS), expected)
-    scan = NativeLake(str(tmp_path), batch_size=3, memory_limit=1 << 20).scan(JOINED_NAMES)
+    assert_frame_equal(bounded.read(joined_names()).sort(KEYS), expected)
+    scan = NativeLake(str(tmp_path), batch_size=3, memory_limit=1 << 20).scan(joined_names())
     assert_frame_equal(scan.collect().sort(KEYS).select(expected.columns), expected)
 
 
@@ -705,14 +857,21 @@ def test_a_table_once_as_of_is_never_padded(tmp_path):
 
 
 def test_native_handle_follows_lake_location(lake_path, tmp_path):
-    fs = GammaFeatureLake(base_path=lake_path).initialize()
+    fs = GammaFeatureLake(base_path=lake_path)
+    assert fs._native is None
     first = fs._native_lake()
     assert fs._native_lake() is first
     other = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     other.add_features(frame([1, 2], ["A"], g1=1))
     moved = fs.model_copy(update={"base_path": str(tmp_path)})
+    assert moved._native is None
     assert moved._native_lake() is not first
     assert moved.read(["g1"]).height == 2
+
+
+def test_lake_configuration_is_frozen(lake):
+    with pytest.raises(ValidationError, match="Instance is frozen"):
+        lake.memory_limit = 1
 
 
 @pytest.mark.parametrize("update", [{"base_path": "s3://bucket/lake%41"}, {"index_path": "../index"}, {"feature_metadata_path": "/abs"}])
@@ -741,4 +900,7 @@ def test_validation_errors_hide_storage_options(tmp_path, bad):
     secret = {"AWS_SECRET_ACCESS_KEY": "hunter2"}
     with pytest.raises(ValueError) as error:
         GammaFeatureLake(base_path=str(tmp_path), delta_options=DeltaOptions(storage_options=secret), **bad)
+    assert "hunter2" not in str(error.value)
+    with pytest.raises(ValidationError) as error:
+        DeltaOptions(storage_options={"AWS_SECRET_ACCESS_KEY": ["hunter2"]})
     assert "hunter2" not in str(error.value)

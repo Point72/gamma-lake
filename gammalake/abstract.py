@@ -20,6 +20,9 @@ __all__ = (
     "UploadMergeModes",
 )
 
+DefaultUploadMergeMode = "increment"
+UploadMergeModes = Literal["append", "upsert", "overwrite", "increment"]
+
 
 class Comparable(Protocol):
     """A class which allows for comparisons with itself"""
@@ -54,10 +57,6 @@ class MissingOrMisregisteredSignalsException(ValueError):
     def __init__(self, message: str):
         self.message = message
         super().__init__(self.message)
-
-
-UploadMergeModes = Literal["append", "upsert", "overwrite", "increment"]
-DefaultUploadMergeMode = "increment"
 
 
 class BaseFeatureLake(abc.ABC):

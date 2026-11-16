@@ -9,22 +9,19 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from datetime import datetime
 from functools import singledispatchmethod, wraps
-from typing import Literal
+from typing import Any, Literal
 
 import polars as pl
 import pyarrow as pa
 from ccflow import ArrowSchema, BaseModel
 from ccflow.exttypes.polars import PolarsExpression
 from packaging import version
-from pydantic import ConfigDict, Field, model_validator, validate_call
+from pydantic import ConfigDict, Field, PrivateAttr, model_validator, validate_call
 
 from gammalake.abstract import BaseFeatureLake, Comparable, UninitializedDeltaLakeException
 from gammalake.native import ConflictError, DeltaOptions, NativeLake, PartialWriteError, UnsupportedError
 
 __all__ = ("ConflictError", "DeltaOptions", "GammaFeatureLake", "PartialWriteError", "UnsupportedError")
-
-DEFAULT_INDEX_SCHEMA = ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())]))
-_MOVED_DELTA_OPTIONS = ("compression", "target_file_size")
 
 
 class GammaFeatureLake(BaseFeatureLake, BaseModel):
@@ -70,19 +67,18 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         description="Called with the absolute path or URL of each table a write commits to; the context manager it returns is held "
         "around that commit. Writers in several processes on an object store without atomic commits need one. Reads take no lock.",
     )
-    _is_initialized: bool = False
-    _sort_keys: list[str] = None
-    _native: tuple | None = None
+    _native: NativeLake | None = PrivateAttr(default=None)
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, hide_input_in_errors=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True, hide_input_in_errors=True)
 
     @model_validator(mode="before")
     @classmethod
     def move_delta_options(cls, values):
         """Accept 0.2's ``compression`` and ``target_file_size`` fields, now in ``delta_options``."""
-        if not isinstance(values, dict) or not values.keys() & _MOVED_DELTA_OPTIONS:
+        moved_options = ("compression", "target_file_size")
+        if not isinstance(values, dict) or not values.keys() & set(moved_options):
             return values
-        moved = {k: values[k] for k in _MOVED_DELTA_OPTIONS if k in values}
+        moved = {k: values[k] for k in moved_options if k in values}
         delta = values.get("delta_options") or {}
         if isinstance(delta, DeltaOptions):
             delta = delta.model_dump(exclude_unset=True)
@@ -91,25 +87,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         warnings.warn(f"{sorted(moved)} moved to delta_options", DeprecationWarning, stacklevel=2)
         return {**{k: v for k, v in values.items() if k not in moved}, "delta_options": {**delta, **moved}}
 
-    @model_validator(mode="after")
-    def check(self) -> GammaFeatureLake:
-        """Open the lake if its tables exist; :meth:`initialize` creates them."""
-        try:
-            native = self._native_lake()
-        except UninitializedDeltaLakeException:
-            self._is_initialized = False
-            return self
-        self._is_initialized = True
-        self._sort_keys = native.sort_keys
-        return self
-
     def ensure_deltalake_is_initialized(func):
         """A decorator that delegates to an overridable method, and verifies that the proper initialization steps took place"""
 
         @wraps(func)
         def wrapper(self, *args, **kwargs):
-            if not self._is_initialized:
-                raise UninitializedDeltaLakeException("Please call '.initialize(...)' on your feature store before using this method!")
+            try:
+                self._native_lake()
+            except UninitializedDeltaLakeException:
+                raise UninitializedDeltaLakeException("Please call '.initialize(...)' on your feature store before using this method!") from None
             return func(self, *args, **kwargs)
 
         return wrapper
@@ -117,7 +103,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     @property
     def sort_keys(self) -> list[str]:
         """Returns the index table's columm schema."""
-        return self._sort_keys
+        return self._native_lake().sort_keys
 
     @property
     def index(self) -> str:
@@ -212,15 +198,14 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         described = metadata.join(annotations, on=["feature_name", "table_addr"], how="left")
         return described.with_columns(pl.col("tags").fill_null(pl.lit([], dtype=pl.List(pl.String))))
 
-    def initialize(self, schema: ArrowSchema = DEFAULT_INDEX_SCHEMA) -> GammaFeatureLake:
+    def initialize(self, schema: ArrowSchema | None = None) -> GammaFeatureLake:
         """
         Create the index and metadata tables with the provided index schema, where they do not exist yet.
         """
+        schema = schema or ArrowSchema.make(pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())]))
         if self.primary_sort_key not in schema.schema.names:
             raise ValueError(f"The provided primary sort key: {self.primary_sort_key} does not exist in the schema keys: {schema.schema.names}")
-        native = self._native_lake(index_schema=schema.schema)
-        self._is_initialized = True
-        self._sort_keys = native.sort_keys
+        self._native = NativeLake.create(self.base_path, schema.schema, **self._native_options())
         return self
 
     @ensure_deltalake_is_initialized
@@ -256,8 +241,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             raise ValueError(
                 f"feature_metadata DataFrame contains the same feature at multiple versions: {duplicates}. Make separate read() calls per version."
             )
-        native = self._native_lake()
-        return native.read_selected(features, start, end) if materialized else native.scan_selected(features, start, end)
+        return self._native_lake().read_selected(features, start, end) if materialized else self._native_lake().scan_selected(features, start, end)
 
     @read.register
     @ensure_deltalake_is_initialized
@@ -276,8 +260,7 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         carry-forward context, while runtime-computed reads apply downstream filters after computation so
         neighbouring-row semantics are preserved.
         """
-        native = self._native_lake()
-        return native.read(features, targets, start, end) if materialized else native.scan(features, targets, start, end)
+        return self._native_lake().read(features, targets, start, end) if materialized else self._native_lake().scan(features, targets, start, end)
 
     @ensure_deltalake_is_initialized
     def feature_table(self, features: list[str], targets: list[str] | None = None):
@@ -299,12 +282,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             state = {**state, "__pydantic_private__": {**private, "_native": None}}
         return state
 
-    def _native_lake(self, index_schema: pa.Schema | None = None) -> NativeLake:
-        """The native lake for this lake's configuration, reopened when it changes.
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> GammaFeatureLake:
+        copied = super().model_copy(update=update, deep=deep)
+        copied._native = None
+        return copied
 
-        With ``index_schema``, the lake's tables are created first where missing.
-        """
-        options = {
+    def _native_options(self) -> dict[str, Any]:
+        return {
             "index_path": self.index_path,
             "feature_metadata_path": self.feature_metadata_path,
             "table_metadata_path": self.table_metadata_path,
@@ -314,14 +298,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             "delta_options": self.delta_options,
             "memory_limit": self.memory_limit,
             "runtime_computed_features": self.enable_runtime_computed_features,
+            "lock": self.lock,
         }
-        config = (self.base_path, *options.values(), id(self.lock))
-        if index_schema is None and self._native is not None and self._native[0] == config:
-            return self._native[1]
-        options["lock"] = self.lock
-        lake = NativeLake(self.base_path, **options) if index_schema is None else NativeLake.create(self.base_path, index_schema, **options)
-        self._native = (config, lake)
-        return lake
+
+    def _native_lake(self) -> NativeLake:
+        """The native lake for this lake's immutable configuration, opened once on demand."""
+        if self._native is not None:
+            return self._native
+        self._native = NativeLake(self.base_path, **self._native_options())
+        return self._native
 
     def _get_latest_feature_tables(self, feature_columns, feature_metadata: pl.DataFrame):
         pure_feature_columns = pl.Series("feature_name", list(set(feature_columns) - set(self.sort_keys)), dtype=pl.String)

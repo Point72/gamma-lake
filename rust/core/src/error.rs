@@ -46,6 +46,13 @@ pub enum Error {
     InvalidArgument(String),
     #[error("integrity check failed for table {table_addr}: {kind}")]
     Integrity { table_addr: String, kind: String },
+    /// The process was forked after the core started its runtime, whose threads the child
+    /// does not have.
+    #[error(
+        "gamma-lake was used before this process was forked, and cannot be used in the child; \
+         start child processes with the 'spawn' or 'forkserver' method instead"
+    )]
+    Forked,
     /// An error of the [`TableStore`](crate::TableStore), such as a failed commit or an
     /// unreachable object store.
     #[error(transparent)]
@@ -70,6 +77,7 @@ impl Error {
             Error::InvalidPredicate(_) => "invalid_predicate",
             Error::InvalidArgument(_) => "invalid_argument",
             Error::Integrity { .. } => "integrity",
+            Error::Forked => "forked",
             Error::Store(_) | Error::DataFusion(_) | Error::Arrow(_) => "engine",
         }
     }

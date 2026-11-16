@@ -458,7 +458,7 @@ impl ExecutionPlan for FeatureTableExec {
         let (lake, features, dnf) = (self.lake.clone(), self.features.clone(), self.dnf.clone());
         let (columns, out) = (self.columns.clone(), schema.clone());
         let (mut sender, receiver) = mpsc::channel(2);
-        let task = runtime::handle().spawn(async move {
+        let task = runtime::handle()?.spawn(async move {
             let mut stream = match lake.read_selected_async(&features, &dnf, true).await {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -650,7 +650,7 @@ mod tests {
             let (mut sender, receiver) = mpsc::channel(2);
             let (alive, aborted) = oneshot::channel::<()>();
             let (sent_tx, sent_rx) = std::sync::mpsc::channel();
-            let task = runtime::handle().spawn(async move {
+            let task = runtime::handle().unwrap().spawn(async move {
                 let _alive = alive;
                 for sent in 0..batches {
                     sent_tx.send(sent).unwrap();
@@ -682,7 +682,7 @@ mod tests {
     fn a_panicking_read_ends_the_stream_with_an_error() {
         for batches in [0, 1] {
             let (mut sender, receiver) = mpsc::channel(2);
-            let task = runtime::handle().spawn(async move {
+            let task = runtime::handle().unwrap().spawn(async move {
                 for _ in 0..batches {
                     let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
                     sender.send(Ok(batch)).await.unwrap();

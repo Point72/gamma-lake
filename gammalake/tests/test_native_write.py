@@ -13,17 +13,19 @@ from polars.testing import assert_frame_equal
 
 from gammalake import GammaFeatureLake, UnsupportedError
 from gammalake.native import NativeLake
-from gammalake.tests._model import KEYS, SCENARIOS, Model, frame, keys
+from gammalake.tests._model import KEYS, Model, frame, keys, scenarios
+
+SCHEMA = pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())])
 
 
 def lake_at(path) -> GammaFeatureLake:
     return GammaFeatureLake(base_path=str(path)).initialize()
 
 
-@pytest.mark.parametrize("scenario", list(SCENARIOS))
+@pytest.mark.parametrize("scenario", list(scenarios()))
 def test_writes_match_the_model(tmp_path, scenario):
     lake, model = lake_at(tmp_path), Model()
-    for rows, mode, scales in SCENARIOS[scenario]:
+    for rows, mode, scales in scenarios()[scenario]:
         lake.add_features(frame(rows, **scales), overlap_mode=mode)
         model.add(rows, **scales)
     names = sorted(model.values)
@@ -71,9 +73,6 @@ def test_nested_columns_round_trip(tmp_path, column):
     got = lake.read(["n", "f"]).sort(KEYS)
     expected = pl.concat([written, frame(keys([4], "a"))], how="diagonal").with_columns(f=pl.col("timestamp").dt.day().cast(pl.Float64))
     assert_frame_equal(got, expected, check_column_order=False)
-
-
-SCHEMA = pa.schema([("timestamp", pa.timestamp("us", tz="UTC")), ("symbol", pa.string())])
 
 
 def test_create_add_and_read(tmp_path):

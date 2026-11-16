@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from typing import Any
@@ -21,9 +22,19 @@ from typing import Any
 import numpy as np
 import polars as pl
 import pyarrow as pa
-from polars_io_tools.io_sources.base import BaseExprNode, ErrorNode, FunctionNode, UnknownNode, get_parsed_expr
+from polars_io_tools.io_sources.base import (
+    AliasNode,
+    BaseExprNode,
+    BinaryExprNode,
+    CastNode,
+    ErrorNode,
+    FunctionNode,
+    TernaryNode,
+    UnknownNode,
+    get_parsed_expr,
+)
 from polars_io_tools.io_sources.dnf_visitor import convert_expr_to_dnf
-from polars_io_tools.io_sources.enum import BooleanFunctionType
+from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
 from polars_io_tools.io_sources.util import register_io_source_with_is_pure
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -33,8 +44,25 @@ from gammalake.abstract import MissingFeaturesException
 
 __all__ = ("ConflictError", "DeltaOptions", "NativeLake", "PartialWriteError", "UnsupportedError")
 
-_OPS = {"=": "==", "==": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=", "in": "in", "not in": "not_in"}
-_COMPRESSIONS = ("uncompressed", "snappy", "gzip", "brotli", "lz4", "lz4_raw", "zstd")
+Row = tuple[str, str | None, str, str | None]
+"""``(feature_name, table_addr, signal_type, feature_params)``, as the core reads a feature."""
+
+Term = tuple[str, str, pa.Array | None]
+
+_MAX_CLAUSES = 64
+
+_PUSHED_OPS = {
+    "=": "==",
+    "==": "==",
+    "!=": "!=",
+    "<": "<",
+    "<=": "<=",
+    ">": ">",
+    ">=": ">=",
+    "!in": "not_in",
+    "in": "in",
+    "not in": "not_in",
+}
 
 
 class DeltaOptions(BaseModel):
@@ -44,13 +72,14 @@ class DeltaOptions(BaseModel):
     target_file_size: int = Field(128 * 1024 * 1024, gt=0)
     storage_options: dict[str, str] = Field(default_factory=dict, repr=False)
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     @field_validator("compression")
     @classmethod
     def validate_compression(cls, value: str) -> str:
-        if value.lower() not in _COMPRESSIONS:
-            raise ValueError(f"expected one of {_COMPRESSIONS}, got {value!r}")
+        compressions = ("uncompressed", "snappy", "gzip", "brotli", "lz4", "lz4_raw", "zstd")
+        if value.lower() not in compressions:
+            raise ValueError(f"expected one of {compressions}, got {value!r}")
         return value
 
 
@@ -89,10 +118,6 @@ class PartialWriteError(RuntimeError):
         self.committed = committed
 
 
-LockFactory = Callable[[str], AbstractContextManager]
-"""Takes the absolute path or URL of a table and returns a context manager holding a lock on it."""
-
-
 def _coerce(column: str, dtype: pl.DataType, value: Any) -> Any:
     """``value`` as a Python object of ``dtype``, compared as Polars would compare it."""
     if isinstance(value, np.datetime64) and np.datetime_data(value.dtype)[0] in ("ns", "ps", "fs", "as"):
@@ -127,7 +152,7 @@ def _encode(column: str, dtype: pl.DataType, values: Sequence[Any]) -> pa.Array:
     coerced = [_coerce(column, dtype, v) for v in values]
     try:
         series = pl.Series(column, coerced, dtype=dtype, strict=True)
-    except (OverflowError, pl.exceptions.PolarsError) as error:
+    except (OverflowError, TypeError, pl.exceptions.PolarsError) as error:
         raise UnsupportedError(f"cannot represent {values!r} as {column!r} ({dtype})") from error
     if dtype == pl.String:
         # The core compares Utf8 literals with any string column.
@@ -135,41 +160,8 @@ def _encode(column: str, dtype: pl.DataType, values: Sequence[Any]) -> pa.Array:
     return series.to_arrow()
 
 
-Term = tuple[str, str, pa.Array | None]
-
-
-def _terms(filters, schema: pl.Schema) -> list[list[Term]]:
-    """pyarrow-style ``filters`` as the core's DNF: a list of OR-ed lists of AND-ed terms."""
-    if not filters:
-        return [[]]
-    clauses = [filters] if isinstance(filters[0], tuple) else filters
-    result = []
-    for clause in clauses:
-        terms = []
-        for column, op, value in clause:
-            if column not in schema:
-                raise ValueError(f"unknown filter column {column!r}; expected one of {list(schema)}")
-            op = op.lower() if isinstance(op, str) else op
-            if value is None and op in ("=", "==", "is"):
-                terms.append((column, "is_null", None))
-            elif value is None and op in ("!=", "is not"):
-                terms.append((column, "is_not_null", None))
-            elif op in ("in", "not in"):
-                terms.append((column, _OPS[op], _encode(column, schema[column], list(value))))
-            elif op in _OPS:
-                terms.append((column, _OPS[op], _encode(column, schema[column], [value])))
-            else:
-                raise ValueError(f"unsupported filter operator {op!r}")
-        result.append(terms)
-    return result
-
-
 def _and(left: list[list[Term]], right: list[list[Term]]) -> list[list[Term]]:
     return [a + b for a in left for b in right]
-
-
-_MAX_CLAUSES = 64
-_PUSHED_OPS = {**_OPS, "!in": _OPS["not in"]}
 
 
 def _pushdown(predicate: pl.Expr | None, schema: pl.Schema, columns: Iterable[str]) -> list[list[Term]]:
@@ -183,11 +175,56 @@ def _pushdown(predicate: pl.Expr | None, schema: pl.Schema, columns: Iterable[st
     node = _parse(predicate)
     if node is None or _row_aligned(node):
         return [[]]
+    if _dnf_size(node)[0] > _MAX_CLAUSES:
+        return [[]]
     dnf = convert_expr_to_dnf(node, schema)
     if not dnf or len(dnf) > _MAX_CLAUSES:
         return [[]]
     pushable = {c for c in columns if not schema[c].is_float()}
     return [[t for c, op, v in clause if c in pushable and (t := _pushed_term(c, op, v, schema[c])) is not None] for clause in dnf]
+
+
+def _dnf_size(node: BaseExprNode) -> tuple[int, int]:
+    """Upper bounds on the clauses, and on their width, of ``convert_expr_to_dnf(node)``.
+
+    The expansion is exponential: an AND of ORs multiplies their clauses, and a NOT of ``n``
+    clauses of width ``w`` gives ``w ** n``, so ``_pushdown`` bounds it before expanding.
+    Counts past ``_MAX_CLAUSES`` are capped.
+    """
+    cap = _MAX_CLAUSES + 1
+    match node:
+        case AliasNode() | CastNode():
+            return _dnf_size(node.input)
+        case BinaryExprNode(op=OperatorType.AND | OperatorType.LOGICAL_AND):
+            return _dnf_and([_dnf_size(node.left), _dnf_size(node.right)])
+        case BinaryExprNode(op=OperatorType.OR | OperatorType.LOGICAL_OR):
+            return _dnf_or([_dnf_size(node.left), _dnf_size(node.right)])
+        case BinaryExprNode(op=OperatorType.NOT_EQ_VALIDITY):
+            return 2, 1
+        case FunctionNode(function_type=BooleanFunctionType.ALL_HORIZONTAL):
+            return _dnf_and([_dnf_size(n) for n in node.inputs])
+        case FunctionNode(function_type=BooleanFunctionType.ANY_HORIZONTAL):
+            return _dnf_or([_dnf_size(n) for n in node.inputs])
+        case FunctionNode(function_type=BooleanFunctionType.IS_IN):
+            return 2, 1
+        case FunctionNode(function_type=BooleanFunctionType.IS_BETWEEN):
+            return 1, 2
+        case FunctionNode(function_type=BooleanFunctionType.NOT, inputs=[inner, *_]):
+            clauses, width = _dnf_size(inner)
+            return min(width**clauses, cap), clauses
+        case TernaryNode():
+            # (P & T) | ((~P | P's columns are null) & F)
+            (p, pw), (t, tw), (f, fw) = map(_dnf_size, (node.predicate, node.truthy, node.falsy))
+            return min(p * t + (min(pw**p, cap) + p * pw) * f, cap), max(pw + tw, p + fw)
+    return 1, 1
+
+
+def _dnf_and(sizes: list[tuple[int, int]]) -> tuple[int, int]:
+    return min(math.prod(c for c, _ in sizes), _MAX_CLAUSES + 1), sum(w for _, w in sizes)
+
+
+def _dnf_or(sizes: list[tuple[int, int]]) -> tuple[int, int]:
+    return min(sum(c for c, _ in sizes), _MAX_CLAUSES + 1), max((w for _, w in sizes), default=1)
 
 
 def _pushed_term(column: str, op: str, value: Any, dtype: pl.DataType) -> Term | None:
@@ -281,18 +318,8 @@ def _schema(exported) -> pl.Schema:
     return pl.from_arrow(pa.schema(exported).empty_table()).schema
 
 
-_RUNTIME_COMPUTED = "runtime_computed"
-_RUNTIME_DISABLED = (
-    "Runtime-computed features are disabled. Enable them (runtime_computed_features=True on NativeLake, "
-    "enable_runtime_computed_features=True on GammaFeatureLake) only when feature metadata is trusted."
-)
-
-Row = tuple[str, str | None, str, str | None]
-"""``(feature_name, table_addr, signal_type, feature_params)``, as the core reads a feature."""
-
-
 def _row(name: str, addr: str | None, signal_type: str | None, params: str | None) -> Row:
-    if addr is None and signal_type != _RUNTIME_COMPUTED:
+    if addr is None and signal_type != "runtime_computed":
         raise UnsupportedError(f"feature {name!r} has no table", name, signal_type)
     return (name, addr, signal_type or "", params)
 
@@ -304,7 +331,7 @@ def _selected_rows(features: pl.DataFrame) -> list[Row]:
 
 
 def _has_runtime(rows: list[Row]) -> bool:
-    return any(row[2] == _RUNTIME_COMPUTED for row in rows)
+    return any(row[2] == "runtime_computed" for row in rows)
 
 
 def _by_address(rows: list[Row]) -> dict[str, Row]:
@@ -332,12 +359,10 @@ class NativeLake:
 
     Every call reads the latest version of each table. ``start`` and ``end`` are inclusive
     bounds on the primary sort key and filter the index and every feature table before
-    they are aligned. ``filters`` take the pyarrow form:
-    a list of ``(column, op, value)`` tuples, or a list of such lists OR-ed together.
-    Read filters may only reference sort keys.
+    they are aligned.
 
     ``base_path`` is a local directory or a ``file://``, ``s3://``, ``az://``, ``abfss://`` or
-    ``gs://`` URL. ``storage_options`` are delta-rs object store options such as
+    ``gs://`` URL. ``delta_options.storage_options`` are delta-rs object store options such as
     ``AWS_REGION`` or ``AWS_ENDPOINT_URL``; credentials they omit come from the environment.
 
     ``lock`` is called with the absolute path or URL of each table a write commits to, and
@@ -374,7 +399,7 @@ class NativeLake:
         table_name_prefix: str = "",
         delta_options: DeltaOptions | None = None,
         runtime_computed_features: bool = False,
-        lock: LockFactory | None = None,
+        lock: Callable[[str], AbstractContextManager] | None = None,
         memory_limit: int | None = None,
         transaction_log_path: str = "transaction_log",
     ):
@@ -427,21 +452,25 @@ class NativeLake:
     def index_schema(self) -> pl.Schema:
         return self._index_schema
 
-    def _window(self, start, end, filters) -> list[list[Term]]:
-        bounds = [(self.primary_sort_key, op, v) for op, v in ((">=", start), ("<=", end)) if v is not None]
-        return _and(_terms(bounds, self._index_schema) if bounds else [[]], _terms(filters, self._index_schema))
+    def _window(self, start, end) -> list[list[Term]]:
+        bounds = [
+            (self.primary_sort_key, op, _encode(self.primary_sort_key, self._index_schema[self.primary_sort_key], [value]))
+            for op, value in ((">=", start), ("<=", end))
+            if value is not None
+        ]
+        return [bounds]
 
     def read_schema(self, features: list[str], targets: list[str] | None = None) -> pl.Schema:
         """Schema of :meth:`read`: resolved names in request order, then the sort keys."""
         return self._scan_rows(self._lake.resolve(features, targets)).collect_schema()
 
-    def read_arrow(self, features: list[str], targets: list[str] | None = None, start=None, end=None, filters=None):
+    def read_arrow(self, features: list[str], targets: list[str] | None = None, start=None, end=None):
         """The result of :meth:`read` as an Arrow C stream (``__arrow_c_stream__``), consumable once."""
-        return self._read_rows(self._lake.resolve(features, targets), start, end, filters)
+        return self._read_rows(self._lake.resolve(features, targets), start, end)
 
-    def read(self, features: list[str], targets: list[str] | None = None, start=None, end=None, filters=None) -> pl.DataFrame:
+    def read(self, features: list[str], targets: list[str] | None = None, start=None, end=None) -> pl.DataFrame:
         """Features and targets aligned to the index, sorted by the sort keys."""
-        return _from_stream(self.read_arrow(features, targets, start, end, filters))
+        return _from_stream(self.read_arrow(features, targets, start, end))
 
     def feature_table(self, features: list[str], targets: list[str] | None = None):
         """The latest versions of ``features`` and ``targets`` as a DataFusion table.
@@ -455,57 +484,57 @@ class NativeLake:
         """
         return self._lake.feature_table(features, targets)
 
-    def scan(self, features: list[str], targets: list[str] | None = None, start=None, end=None, filters=None) -> pl.LazyFrame:
+    def scan(self, features: list[str], targets: list[str] | None = None, start=None, end=None) -> pl.LazyFrame:
         """A lazy :meth:`read`.
 
         Only the selected features are read. Predicates added to the returned lazy frame are
         pushed into the native scan where they constrain the sort keys, and are applied again
         after it.
         """
-        return self._scan_rows(self._lake.resolve(features, targets), start, end, filters)
+        return self._scan_rows(self._lake.resolve(features, targets), start, end)
 
     def read_versions_schema(self, features: Mapping[str, int]) -> pl.Schema:
         """Schema of :meth:`read_versions`."""
         return self._scan_rows(self._lake.resolve_versions(list(features.items()))).collect_schema()
 
-    def read_versions(self, features: Mapping[str, int], start=None, end=None, filters=None) -> pl.DataFrame:
+    def read_versions(self, features: Mapping[str, int], start=None, end=None) -> pl.DataFrame:
         """Each feature at the version it maps to, read as :meth:`read` reads the latest versions.
 
         The features a runtime-computed feature reads are taken at their latest versions.
         """
-        return _from_stream(self._read_rows(self._lake.resolve_versions(list(features.items())), start, end, filters))
+        return _from_stream(self._read_rows(self._lake.resolve_versions(list(features.items())), start, end))
 
-    def scan_versions(self, features: Mapping[str, int], start=None, end=None, filters=None) -> pl.LazyFrame:
+    def scan_versions(self, features: Mapping[str, int], start=None, end=None) -> pl.LazyFrame:
         """A lazy :meth:`read_versions`."""
-        return self._scan_rows(self._lake.resolve_versions(list(features.items())), start, end, filters)
+        return self._scan_rows(self._lake.resolve_versions(list(features.items())), start, end)
 
     def read_selected_schema(self, features: pl.DataFrame) -> pl.Schema:
         """Schema of :meth:`read_selected`."""
         return self._scan_rows(_selected_rows(features)).collect_schema()
 
-    def read_selected(self, features: pl.DataFrame, start=None, end=None, filters=None) -> pl.DataFrame:
+    def read_selected(self, features: pl.DataFrame, start=None, end=None) -> pl.DataFrame:
         """The features that rows of :meth:`feature_metadata` describe, one row per name.
 
         Uses the ``feature_name``, ``table_addr``, ``signal_type`` and ``feature_params``
         columns. The rows are not checked against the stored metadata. Features that
         runtime-computed rows read and the rows do not select are taken at their latest versions.
         """
-        return _from_stream(self._read_rows(_selected_rows(features), start, end, filters))
+        return _from_stream(self._read_rows(_selected_rows(features), start, end))
 
-    def scan_selected(self, features: pl.DataFrame, start=None, end=None, filters=None) -> pl.LazyFrame:
+    def scan_selected(self, features: pl.DataFrame, start=None, end=None) -> pl.LazyFrame:
         """A lazy :meth:`read_selected`."""
-        return self._scan_rows(_selected_rows(features), start, end, filters)
+        return self._scan_rows(_selected_rows(features), start, end)
 
-    def _read_rows(self, rows: list[Row], start, end, filters):
+    def _read_rows(self, rows: list[Row], start, end):
         """An Arrow C stream of the features ``rows`` describe."""
         if _has_runtime(rows):
-            return self._runtime(rows, start, end, filters).collect().to_arrow()
-        return self._lake.read_selected(rows, _dnf(self._window(start, end, filters)))
+            return self._runtime(rows, start, end).collect().to_arrow()
+        return self._lake.read_selected(rows, _dnf(self._window(start, end)))
 
-    def _scan_rows(self, rows: list[Row], start=None, end=None, filters=None) -> pl.LazyFrame:
+    def _scan_rows(self, rows: list[Row], start=None, end=None) -> pl.LazyFrame:
         """A lazy read of the features ``rows`` describe."""
         if _has_runtime(rows):
-            return self._runtime(rows, start, end, filters)
+            return self._runtime(rows, start, end)
         schema = _schema(self._lake.read_selected_schema(rows))
         by_name = _by_address(rows)
 
@@ -515,17 +544,16 @@ class NativeLake:
             wanted = [row for name, row in by_name.items() if columns is None or name in columns]
             return self._lake.read_selected(wanted or list(by_name.values()), dnf)
 
-        return _scan(schema, open_stream, self._window(start, end, filters), self._index_schema, self.sort_keys)
+        return _scan(schema, open_stream, self._window(start, end), self._index_schema, self.sort_keys)
 
-    def _runtime(self, rows: list[Row], start, end, filters) -> pl.LazyFrame:
+    def _runtime(self, rows: list[Row], start, end) -> pl.LazyFrame:
         """A lazy read of ``rows`` that computes the runtime-computed ones.
 
         Stored features the expressions read are added at their latest versions, as are
         runtime-computed ones, transitively; the result holds the selected names, then the
         added ones in the order found, then the sort keys.
         """
-        if not self._runtime_computed_features:
-            raise ValueError(_RUNTIME_DISABLED)
+        self._ensure_runtime_enabled()
         selected: dict[str, Row] = {}
         for row in rows:
             selected.setdefault(row[0], row)
@@ -534,7 +562,7 @@ class NativeLake:
         expressions = []
         # Rows found while iterating are appended to ``rows`` and visited in turn.
         for name, _, signal_type, params in rows:
-            if signal_type != _RUNTIME_COMPUTED:
+            if signal_type != "runtime_computed":
                 continue
             expression = deserialize_expression(params)
             expressions.append(expression)
@@ -548,45 +576,49 @@ class NativeLake:
                 found = latest[root]
                 selected[root] = _row(root, found["table_addr"], found["signal_type"], found["feature_params"])
                 rows.append(selected[root])
-        frame = self._scan_rows([row for row in rows if row[2] != _RUNTIME_COMPUTED], start, end, filters)
+        frame = self._scan_rows([row for row in rows if row[2] != "runtime_computed"], start, end)
         return with_columns_topo(frame, expressions).select([row[0] for row in rows] + self.sort_keys)
 
-    def index(self, start=None, end=None, filters=None) -> pl.DataFrame:
-        """Rows of the index, in no particular order."""
-        return _from_stream(self._lake.index(_dnf(self._window(start, end, filters))))
+    def _ensure_runtime_enabled(self) -> None:
+        if not self._runtime_computed_features:
+            raise ValueError(
+                "Runtime-computed features are disabled. Enable them (runtime_computed_features=True on NativeLake, "
+                "enable_runtime_computed_features=True on GammaFeatureLake) only when feature metadata is trusted."
+            )
 
-    def scan_index(self, start=None, end=None, filters=None) -> pl.LazyFrame:
+    def index(self, start=None, end=None) -> pl.DataFrame:
+        """Rows of the index, in no particular order."""
+        return _from_stream(self._lake.index(_dnf(self._window(start, end))))
+
+    def scan_index(self, start=None, end=None) -> pl.LazyFrame:
         """:meth:`index` as a ``LazyFrame``. Filters applied to it later are pushed into the scan."""
         schema = self._index_schema
-        return _scan(schema, lambda _, dnf: self._lake.index(dnf), self._window(start, end, filters), schema, list(schema))
+        return _scan(schema, lambda _, dnf: self._lake.index(dnf), self._window(start, end), schema, list(schema))
 
-    def feature_metadata(self, filters=None) -> pl.DataFrame:
-        schema = _schema(self._lake.feature_metadata_schema())
-        return _from_stream(self._lake.feature_metadata(_dnf(_terms(filters, schema))))
+    def feature_metadata(self) -> pl.DataFrame:
+        return _from_stream(self._lake.feature_metadata([]))
 
-    def scan_feature_metadata(self, filters=None) -> pl.LazyFrame:
+    def scan_feature_metadata(self) -> pl.LazyFrame:
         """:meth:`feature_metadata` as a ``LazyFrame``. Filters applied to it later are pushed into the scan."""
         schema = _schema(self._lake.feature_metadata_schema())
-        return _scan(schema, lambda _, dnf: self._lake.feature_metadata(dnf), _terms(filters, schema), schema, list(schema))
+        return _scan(schema, lambda _, dnf: self._lake.feature_metadata(dnf), [[]], schema, list(schema))
 
-    def table_metadata(self, filters=None) -> pl.DataFrame:
-        schema = _schema(self._lake.table_metadata_schema())
-        return _from_stream(self._lake.table_metadata(_dnf(_terms(filters, schema))))
+    def table_metadata(self) -> pl.DataFrame:
+        return _from_stream(self._lake.table_metadata([]))
 
-    def scan_table_metadata(self, filters=None) -> pl.LazyFrame:
+    def scan_table_metadata(self) -> pl.LazyFrame:
         """:meth:`table_metadata` as a ``LazyFrame``. Filters applied to it later are pushed into the scan."""
         schema = _schema(self._lake.table_metadata_schema())
-        return _scan(schema, lambda _, dnf: self._lake.table_metadata(dnf), _terms(filters, schema), schema, list(schema))
+        return _scan(schema, lambda _, dnf: self._lake.table_metadata(dnf), [[]], schema, list(schema))
 
-    def transaction_log(self, filters=None) -> pl.DataFrame:
+    def transaction_log(self) -> pl.DataFrame:
         """Rows of the transaction log; none when the lake has no log yet."""
-        schema = _schema(self._lake.transaction_log_schema())
-        return _from_stream(self._lake.transaction_log(_dnf(_terms(filters, schema))))
+        return _from_stream(self._lake.transaction_log([]))
 
-    def scan_transaction_log(self, filters=None) -> pl.LazyFrame:
+    def scan_transaction_log(self) -> pl.LazyFrame:
         """:meth:`transaction_log` as a ``LazyFrame``. Filters applied to it later are pushed into the scan."""
         schema = _schema(self._lake.transaction_log_schema())
-        return _scan(schema, lambda _, dnf: self._lake.transaction_log(dnf), _terms(filters, schema), schema, list(schema))
+        return _scan(schema, lambda _, dnf: self._lake.transaction_log(dnf), [[]], schema, list(schema))
 
     def latest_features(self) -> pl.DataFrame:
         """The latest version of every feature, one metadata row each."""
@@ -642,7 +674,9 @@ class NativeLake:
         ``comments`` and ``tags`` map written features to the comment and tags of the versions
         written, as :meth:`annotate` sets them; features left out keep theirs.
 
-        Raises :class:`PartialWriteError` if a table fails to commit after others did.
+        Raises :class:`ConflictError` if another writer committed to a table first. Any other
+        failure rolls the write back and raises its exception, or :class:`PartialWriteError` if
+        the rollback cannot undo every commit.
         """
         self._add(df, "feature", owner, overlap_mode, feature_params, comments, tags, allow_new_index_values)
 
@@ -699,8 +733,7 @@ class NativeLake:
         the lake or another of ``exprs``, other than itself. Requires
         ``runtime_computed_features=True``.
         """
-        if not self._runtime_computed_features:
-            raise ValueError(_RUNTIME_DISABLED)
+        self._ensure_runtime_enabled()
         rows = []
         for expr in exprs:
             name, roots = expr.meta.output_name(), expr.meta.root_names()

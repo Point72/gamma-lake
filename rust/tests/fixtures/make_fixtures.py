@@ -170,7 +170,8 @@ def term(column, op, *values):
     return {"column": column, "op": op, "values": list(values)}
 
 
-READS = [
+def reads():
+    return [
     # name, lake, features, targets, dnf[, expected outcome with validate=True]
     ("basic_all", "basic", ["f1", "f2", "f3", "f4"], ["t1"], []),
     ("basic_order", "basic", ["f3", "f1"], [], []),
@@ -201,9 +202,11 @@ READS = [
     ("joined_or", "joined", ["f1", "back", "fwd", "sp"], [], [[term("timestamp", "lt", T(3))], [term("symbol", "eq", S("B")), term("timestamp", "gt", T(6))]]),
     ("joined_not_eq", "joined", ["back", "fwd", "near"], [], [[term("timestamp", "not_eq", T(5))]]),
     ("joined_gt", "joined", ["back", "late"], [], [[term("timestamp", "gt", T(7))]]),
-]
+    ]
 
-ERRORS = [
+
+def errors():
+    return [
     ("err_missing", "basic", ["nope"], [], [], "missing_features"),
     ("err_target_not_target", "basic", ["f1"], ["f2"], [], "misregistered_targets"),
     ("err_feature_predicate", "basic", ["f1"], [], [[term("f1", "gt", {"type": "float64", "value": 1.0})]], "invalid_predicate"),
@@ -211,16 +214,18 @@ ERRORS = [
     ("err_lossy_literal", "basic", ["f1"], [], [[term("timestamp", "gt", {"type": "timestamp_ns_utc", "value": "2024-01-02T00:00:00.000000001+00:00"})]], "invalid_predicate"),
     ("err_bad_literal_type", "basic", ["f1"], [], [[term("symbol", "eq", {"type": "int64", "value": 1})]], "invalid_predicate"),
     ("err_runtime", "unsupported", ["rt1"], [], [], "unsupported"),
-]
+    ]
 
-METADATA = [
+
+def metadata():
+    return [
     # name, lake, kind, dnf, sort_by
     ("meta_feature_metadata", "basic", "feature_metadata", [], ["feature_name", "version"]),
     ("meta_feature_metadata_filtered", "overlap_copy", "feature_metadata", [[term("feature_name", "eq", S("f1")), term("version", "gt_eq", {"type": "int64", "value": 1})]], ["feature_name", "version"]),
     ("meta_latest_features", "overlap_copy", "latest_features", [], ["feature_name"]),
     ("meta_table_metadata", "basic", "table_metadata", [], ["table_addr", "last_updated"]),
     ("meta_index", "basic", "index", [[term("symbol", "eq", S("C"))]], ["timestamp", "symbol"]),
-]
+    ]
 
 
 def write_ipc(df: pl.DataFrame, path: Path) -> None:
@@ -236,7 +241,7 @@ def main() -> None:
     lakes = build_lakes()
     queries = []
 
-    for name, lake_name, features, targets, dnf, *validate_expect in READS:
+    for name, lake_name, features, targets, dnf, *validate_expect in reads():
         lake = lakes[lake_name]
         write_ipc(reference_read(lake, features, targets, dnf), EXPECTED / f"{name}.arrow")
         query = {"name": name, "kind": "read", "lake": lake_name, "features": features, "targets": targets, "dnf": dnf, "expect": "ok"}
@@ -244,10 +249,10 @@ def main() -> None:
             query["validate_expect"] = validate_expect[0]
         queries.append(query)
 
-    for name, lake_name, features, targets, dnf, error in ERRORS:
+    for name, lake_name, features, targets, dnf, error in errors():
         queries.append({"name": name, "kind": "read", "lake": lake_name, "features": features, "targets": targets, "dnf": dnf, "expect": f"error:{error}"})
 
-    for name, lake_name, kind, dnf, sort_by in METADATA:
+    for name, lake_name, kind, dnf, sort_by in metadata():
         lake = lakes[lake_name]
         source = {
             "feature_metadata": lambda: lake.feature_metadata_frame().collect(),

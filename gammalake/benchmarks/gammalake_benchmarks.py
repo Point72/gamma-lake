@@ -15,16 +15,22 @@ import polars as pl
 from gammalake import GammaFeatureLake
 from gammalake.tests.base import generate_test_data
 
-N_SYMBOLS = 200
-N_FEATURES = 50
 N_DAYS = 30
+N_FEATURES = 50
+N_SYMBOLS = 200
 
-_ORIGIN = datetime(2024, 1, 1, tzinfo=UTC)
-_SYMBOLS = [f"SYM_{i:04d}" for i in range(N_SYMBOLS)]
-_ALL_DAYS = [_ORIGIN + timedelta(days=day) for day in range(N_DAYS)]
 _GENERATED_DIR = "gammalake-asv"
-_SCOPES = {"overlap-write", "read", "write"}
+_ORIGIN = datetime(2024, 1, 1, tzinfo=UTC)
 _RUN_NAME = re.compile(r"^\d{8}T\d{6}_[0-9a-f]{8}$")
+_SCOPES = {"overlap-write", "read", "write"}
+
+
+def _all_days() -> list[datetime]:
+    return [_ORIGIN + timedelta(days=day) for day in range(N_DAYS)]
+
+
+def _symbols() -> list[str]:
+    return [f"SYM_{i:04d}" for i in range(N_SYMBOLS)]
 
 
 def _local_root() -> Path:
@@ -48,8 +54,8 @@ def _make_feature_df(group_idx: int, n_features: int) -> pl.DataFrame:
     n_rows = N_DAYS * N_SYMBOLS
     rng = np.random.default_rng(group_idx)
     data = {
-        "timestamp": [day for day in _ALL_DAYS for _ in range(N_SYMBOLS)],
-        "symbol": _SYMBOLS * N_DAYS,
+        "timestamp": [day for day in _all_days() for _ in range(N_SYMBOLS)],
+        "symbol": _symbols() * N_DAYS,
         **{f"g{group_idx}_feat_{feature}": rng.standard_normal(n_rows) for feature in range(n_features)},
     }
     return pl.DataFrame(data).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
@@ -320,8 +326,8 @@ class GammaLakeReadSuite:
             _delete_generated_path(self._storage_path)
             raise
         self._features = features[: n_groups * N_FEATURES]
-        self._start = _ALL_DAYS[0]
-        self._end = _ALL_DAYS[n_days - 1]
+        self._start = _all_days()[0]
+        self._end = _all_days()[n_days - 1]
 
     def time_read(self, n_days: int, n_groups: int) -> None:
         self._lake.read(self._features, start=self._start, end=self._end)
@@ -357,7 +363,7 @@ class GammaLakeQuerySuite:
     def time_query(self, _cache: dict[str, str], query: str) -> None:
         frame = self._lake.read(self._features, materialized=False)
         if query == "symbol":
-            frame = frame.filter(pl.col("symbol") == _SYMBOLS[7])
+            frame = frame.filter(pl.col("symbol") == _symbols()[7])
         elif query == "projection":
             frame = frame.select(self._features[::25] + ["timestamp", "symbol"])
         else:

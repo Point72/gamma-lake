@@ -53,48 +53,49 @@ class Model:
         return pl.DataFrame(data, schema={**dict.fromkeys(features, pl.Float64), "timestamp": pl.Datetime("us", "UTC"), "symbol": pl.String})
 
 
-# Each step is (rows, overlap_mode, scales).
-SCENARIOS = {
-    "append": [
-        (keys(range(1, 4), "ab"), "copy", {"f": 1}),
-        (keys(range(4, 6), "ab"), "copy", {"f": 1}),
-    ],
-    "new_feature_on_new_keys": [
-        (keys(range(1, 4), "a"), "copy", {"f": 1}),
-        (keys(range(2, 6), "ab"), "copy", {"g": 2}),
-    ],
-    # Point72/gamma-lake#45: appending only new keys skips padding the tail of f.
-    "all_new_keys_after_coverage": [
-        (keys(range(1, 4), "a"), "copy", {"f": 1}),
-        (keys(range(1, 6), "a"), "copy", {"g": 2}),
-        (keys([6], "a"), "copy", {"f": 1}),
-    ],
-    # New keys inside the coverage of g are padded into it.
-    "all_new_keys_inside_coverage": [
-        (keys(range(1, 4), "a"), "copy", {"f": 1}),
-        (keys(range(1, 4), "a"), "copy", {"g": 2}),
-        ([(2, "b"), (3, "b")], "copy", {"f": 1}),
-    ],
-    # Point72/gamma-lake#46: copy mode drops the rows of f after the window.
-    "overlap_copy": [
-        (keys(range(1, 7), "a"), "copy", {"f": 1}),
-        (keys(range(1, 7), "ab"), "copy", {"g": 2}),
-        (keys(range(2, 4), "a"), "copy", {"f": 10}),
-    ],
-    "overlap_merge": [
-        (keys(range(1, 5), "ab"), "copy", {"f": 1, "h": 3}),
-        ([(2, "a"), (3, "a"), (5, "a")], "merge", {"f": 10}),
-    ],
-    # Tables that a merge left untouched are still padded by the next write.
-    "write_after_overlap_merge": [
-        (keys(range(1, 5), "ab"), "copy", {"f": 1, "h": 3}),
-        (keys(range(2, 4), "a"), "merge", {"f": 10}),
-        (keys(range(5, 6), "ab"), "copy", {"g": 1}),
-    ],
-    # A new key whose primary key equals the coverage of f must be padded into f.
-    "new_key_at_coverage_end": [
-        (keys(range(1, 4), "a"), "copy", {"f": 1}),
-        ([(3, "b")], "copy", {"g": 1}),
-        (keys([4], "a"), "copy", {"f": 1}),
-    ],
-}
+def scenarios():
+    """Write scenarios, with each step holding ``(rows, overlap_mode, scales)``."""
+    return {
+        "append": [
+            (keys(range(1, 4), "ab"), "copy", {"f": 1}),
+            (keys(range(4, 6), "ab"), "copy", {"f": 1}),
+        ],
+        "new_feature_on_new_keys": [
+            (keys(range(1, 4), "a"), "copy", {"f": 1}),
+            (keys(range(2, 6), "ab"), "copy", {"g": 2}),
+        ],
+        # Point72/gamma-lake#45: appending only new keys skips padding the tail of f.
+        "all_new_keys_after_coverage": [
+            (keys(range(1, 4), "a"), "copy", {"f": 1}),
+            (keys(range(1, 6), "a"), "copy", {"g": 2}),
+            (keys([6], "a"), "copy", {"f": 1}),
+        ],
+        # New keys inside the coverage of g are padded into it.
+        "all_new_keys_inside_coverage": [
+            (keys(range(1, 4), "a"), "copy", {"f": 1}),
+            (keys(range(1, 4), "a"), "copy", {"g": 2}),
+            ([(2, "b"), (3, "b")], "copy", {"f": 1}),
+        ],
+        # Point72/gamma-lake#46: copy mode drops the rows of f after the window.
+        "overlap_copy": [
+            (keys(range(1, 7), "a"), "copy", {"f": 1}),
+            (keys(range(1, 7), "ab"), "copy", {"g": 2}),
+            (keys(range(2, 4), "a"), "copy", {"f": 10}),
+        ],
+        "overlap_merge": [
+            (keys(range(1, 5), "ab"), "copy", {"f": 1, "h": 3}),
+            ([(2, "a"), (3, "a"), (5, "a")], "merge", {"f": 10}),
+        ],
+        # Tables that a merge left untouched are still padded by the next write.
+        "write_after_overlap_merge": [
+            (keys(range(1, 5), "ab"), "copy", {"f": 1, "h": 3}),
+            (keys(range(2, 4), "a"), "merge", {"f": 10}),
+            (keys(range(5, 6), "ab"), "copy", {"g": 1}),
+        ],
+        # A new key whose primary key equals the coverage of f must be padded into f.
+        "new_key_at_coverage_end": [
+            (keys(range(1, 4), "a"), "copy", {"f": 1}),
+            ([(3, "b")], "copy", {"g": 1}),
+            (keys([4], "a"), "copy", {"f": 1}),
+        ],
+    }
