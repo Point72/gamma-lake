@@ -40,8 +40,8 @@ lint-rs:  ## run rust linter
 	cargo fmt -- --check
 
 lint-docs:  ## lint docs with mdformat and codespell
-	python -m mdformat --check README.md $(wildcard docs/src) docs/wiki/
-	python -m codespell_lib README.md $(wildcard docs/src) docs/wiki/
+	python -m mdformat --check README.md docs/wiki/
+	python -m codespell_lib README.md docs/wiki/
 
 lint: lint-rs lint-py lint-docs  ## run project linters
 
@@ -57,8 +57,8 @@ fix-rs:  ## fix rust formatting
 	cargo fmt
 
 fix-docs:  ## autoformat docs with mdformat and codespell
-	python -m mdformat README.md $(wildcard docs/src) docs/wiki/
-	python -m codespell_lib --write README.md $(wildcard docs/src) docs/wiki/
+	python -m mdformat README.md docs/wiki/
+	python -m codespell_lib --write README.md docs/wiki/
 
 fix: fix-rs fix-py fix-docs  ## run project autoformatters
 

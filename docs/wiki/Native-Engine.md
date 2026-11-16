@@ -15,13 +15,29 @@ Python exchanges Arrow record batch streams with Rust through the
 in Python with Polars over columns the core reads; Rust callers see them in the metadata but cannot read them.
 Requests the core cannot serve raise `UnsupportedError`.
 
-`NativeLake` exposes the core directly. The `start`, `end` and `filters` arguments of its read methods are pushed into
-the index and feature table scans. `scan()` returns a `LazyFrame`. Filters applied to it later that compare sort keys
+`NativeLake` exposes the core directly. The `start` and `end` arguments of its read methods are pushed into the index
+and feature table scans. `scan()` returns a `LazyFrame`. Filters applied to it later that compare sort keys
 with literals, test membership with `is_in`, use `is_between` or test for nulls, combined with `&`, `|` and `~`, reach the
 scans, for example `pl.col("timestamp") >= start` or `pl.col("symbol").is_in(symbols)`. The rest, and filters on float
 columns, run after alignment. `scan_index()`, `scan_feature_metadata()`, `scan_table_metadata()` and
 `scan_transaction_log()` push the same filters, on any of their columns, into their scans. `read_arrow()` returns a single-use Arrow C stream, which `pyarrow.RecordBatchReader.from_stream` and
 `polars.DataFrame` accept.
+
+### `GammaFeatureLake` or `NativeLake`
+
+Both read and write the same lakes through the core, with different contracts:
+
+|                   | `GammaFeatureLake`                                                                      | `NativeLake`                                                                                      |
+| ----------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Intended use      | Configuration-driven use from Polars; the 0.2 API                                       | Direct access to the core, including from producers of any Arrow data                             |
+| Object            | Frozen pydantic model; picklable; opens the lake on first use                           | Plain object; not picklable; opens the lake when constructed and raises if it is not initialized  |
+| Creating a lake   | `initialize(schema=None)`, defaulting to `timestamp` and `symbol` sort keys             | `NativeLake.create(base_path, index_schema)`                                                      |
+| Write input       | `polars.DataFrame`                                                                      | Any object with `__arrow_c_stream__`                                                              |
+| `add_*` arguments | `(df, owner, overlap_mode, comments, tags)`                                             | `(df, owner, overlap_mode, feature_params, comments, tags)`; pass arguments after `df` by keyword |
+| Reads             | `read(features or metadata frame, materialized=...)`                                    | `read`, `scan`, `read_arrow`, `read_versions` and `read_selected`, with matching `scan_*` methods |
+| Metadata          | `index`, `feature_metadata`, ... are table paths; `*_frame()` methods return LazyFrames | `index()`, `feature_metadata()`, ... return DataFrames; `scan_*()` methods return LazyFrames      |
+| Annotations       | `annotate(polars.DataFrame)`, `describe(metadata frame)`                                | `annotate(rows)`, `describe(feature names)`                                                       |
+| Options only here | `enable_runtime_computed_features`; deprecated `compression` and `target_file_size`     | `runtime_computed_features`, `batch_size`, `validate`                                             |
 
 ## How reads work
 

@@ -11,10 +11,10 @@ used only when necessary.
 The versioning model makes re-appending cheap and safe:
 
 ```python
-# Add an updated version of your features — old version is preserved
-lake.add_features(updated_feature_df, owner="my-team")
+# Rewrite rows that overlap existing ones as a new version; the old version is preserved
+lake.add_features(updated_feature_df, owner="my-team", overlap_mode="copy")
 
-# You now have two versions — the old one is still readable
+# The overlapping features now have two versions, and the old one is still readable
 print(lake.feature_metadata_frame().collect())
 ```
 

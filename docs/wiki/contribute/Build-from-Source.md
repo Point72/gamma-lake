@@ -10,22 +10,24 @@
 
 ## Make commands
 
-As a convenience, `gamma-lake` uses a `Makefile` for commonly used commands. You can print the main available commands by running `make` with no arguments
+As a convenience, `gamma-lake` uses a `Makefile` for commonly used commands. Running `make` with no arguments prints every command; the main ones are
 
 ```bash
 > make
 
-build                          build the library
+build                          build the project
 clean                          clean the repository
-fix                            run autofixers
-install                        install library
-lint                           run lints
-test                           run the tests
+develop                        setup project for development
+fix                            run project autoformatters
+install                        install python library
+lint                           run project linters
+test                           run all tests
+test-compat                    compare reads and written files with the pure-Python engine of COMPAT_REF
 ```
 
 ## Prerequisites
 
-`gamma-lake` has a few system-level dependencies which you can install from your machine package manager. Other package managers like `conda`, `nix`, etc, should also work fine.
+Building `gamma-lake` needs Python 3.11 or later and a Rust toolchain; see [Install Rust](#install-rust).
 
 ## Clone
 

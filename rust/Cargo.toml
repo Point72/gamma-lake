@@ -54,7 +54,6 @@ gcs = ["gamma_lake_delta/gcs"]
 
 [dev-dependencies]
 async-trait.workspace = true
-datafusion.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -69,5 +68,3 @@ strip = "symbols"
 [profile.dev.package."*"]
 debug = false
 
-[profile.test.junit]
-path = "junit.xml"

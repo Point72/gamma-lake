@@ -1,7 +1,7 @@
 # Gamma Lake Performance vs Collections of Parquet Files
 
-**TL;DR:** Gamma Lake uses O(1) write cost per feature group addition (vs O(N) for wide Parquet rewrites) and
-sub-10-second reads for datasets up to 250 GB using parallel Ray reads. It also provides versioning, time-travel,
+**TL;DR:** Gamma Lake uses O(1) write cost per feature group addition (vs O(N) for wide Parquet rewrites) and,
+measured with 0.2 on a Ray cluster, sub-10-second reads for datasets up to 250 GB. It also provides versioning, time-travel,
 as-of features, and runtime-computed features that are impractical with raw Parquet.
 
 The benchmarks on this page were measured with Gamma Lake 0.2, which ran on Ray. To time the current release on your
@@ -85,7 +85,7 @@ ______________________________________________________________________
 ## Large Dataset Read Performance
 
 **Benchmark: 1-day read latency at scale**
-_(Ray cluster, parallel reads with `run_on_ray_cluster=True`)_
+_(Gamma Lake 0.2 on a Ray cluster, with `run_on_ray_cluster=True`; Ray support has since been removed)_
 
 | Dataset size | Features | Symbols | Periods | Gamma Lake 1-day read |
 | -----------: | -------: | ------: | ------: | --------------------: |
@@ -108,7 +108,7 @@ Beyond raw I/O performance, Gamma Lake addresses requirements that pure Parquet 
 | Capability                          | Parquet files | Gamma Lake |
 | ----------------------------------- | :-----------: | :--------: |
 | O(1) feature group addition         |      ❌       |     ✅     |
-| Concurrent team writes              |      ❌       |     ✅     |
+| Concurrent team writes (see note)   |      ❌       |     ✅     |
 | Feature versioning                  |      ❌       |     ✅     |
 | Time-travel queries                 |      ❌       |     ✅     |
 | As-of (point-in-time safe) features |      ❌       |     ✅     |
@@ -117,3 +117,6 @@ Beyond raw I/O performance, Gamma Lake addresses requirements that pure Parquet 
 | Granular owner/permission metadata  |      ❌       |     ✅     |
 | Parallel reads                      |      ❌       |     ✅     |
 | ACID transactions                   |      ❌       |     ✅     |
+
+Concurrent writes are safe: a write that conflicts with another fails cleanly and can be retried. Writers conflict
+whenever their commits overlap, even when they add different features; see "Concurrent writers" in the README.

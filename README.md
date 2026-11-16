@@ -24,13 +24,13 @@ storage: expensive column additions, no versioning, and painful cross-team colla
 
 The most common alternative — storing features in per-day Parquet files — breaks down quickly:
 
-| Problem                                                  | Gamma Lake's answer                                                                             |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Adding a new feature group rewrites *all* existing files | Gamma Lake writes each new feature group to its own Delta table and leaves existing files alone |
-| Multiple teams can't write features in parallel          | Each feature group is an independent Delta table; see [concurrent writers](#concurrent-writers) |
-| No versioning or audit trail                             | Delta Lake's transaction log provides full time-travel and version history                      |
-| Cross-group reads require expensive joins                | Gamma Lake maintains a master index; reads are aligned horizontal concatenations                |
-| Experimental features pollute production data            | Features carry `owner` and `version` metadata; `read()` accepts a filtered metadata frame       |
+| Problem                                                  | Gamma Lake's answer                                                                                                                               |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Adding a new feature group rewrites *all* existing files | Gamma Lake writes each new feature group to its own Delta table and leaves existing files alone                                                   |
+| Multiple teams can't write features in parallel          | Feature groups are separate Delta tables, and a conflicting write fails cleanly and can be retried; see [concurrent writers](#concurrent-writers) |
+| No versioning or audit trail                             | Delta Lake's transaction log provides full time-travel and version history                                                                        |
+| Cross-group reads require expensive joins                | Gamma Lake maintains a master index; reads are aligned horizontal concatenations                                                                  |
+| Experimental features pollute production data            | Features carry `owner` and `version` metadata; `read()` accepts a filtered metadata frame                                                         |
 
 See [performance](https://github.com/Point72/gamma-lake/wiki/Performance) for how Gamma Lake compares with per-day Parquet files.
 
@@ -42,7 +42,7 @@ See [performance](https://github.com/Point72/gamma-lake/wiki/Performance) for ho
   filtering the metadata frame
 - **Multiple signal types** — standard features, as-of features, sparse features, and runtime-computed features
 - **Native Delta Lake storage** — ACID transactions, schema enforcement, and time-travel out of the box
-- **Local or cloud** — `base_path` accepts a local directory, an on-prem object store path, or an `s3://` URI
+- **Local or cloud** — `base_path` accepts a local directory or a `file://`, `s3://`, `az://`, `abfss://` or `gs://` URL
 - **Configurable compression** — `zstd` by default, configured through `delta_options`
 
 ## Quick Start
@@ -206,8 +206,9 @@ feature version.
 
 ### Lazy reads
 
-`read(..., materialized=False)` returns a LazyFrame. Explicit `start`, `end` and filter arguments are applied by the
-Rust read. Predicates added later to the LazyFrame are applied by Polars after the native scan.
+`read(..., materialized=False)` returns a LazyFrame. Explicit `start` and `end` arguments are applied by the Rust
+read. Predicates added later to the LazyFrame on sort keys (comparisons, `is_in`, `is_between` and null tests) are
+pushed into the native scan; Polars applies every predicate to the result.
 
 ### Querying with DataFusion
 
@@ -236,7 +237,8 @@ A write commits to a table only if the table has not changed since the write rea
 it in between, the write stops there and the tables it already committed to are
 [rolled back](#transactions-and-rollback): it raises `ConflictError`, and the lake is unchanged, so the write can be
 run again. If the rollback cannot complete, it raises `PartialWriteError` instead, and the lake holds part of the
-write.
+write. Every write commits to the shared metadata tables, so concurrent writers conflict even when they add different
+features, and the one that loses must retry.
 
 For writers in several processes, pass `lock`: a callable that takes the absolute path or URL of a table and returns
 a context manager. Gamma Lake enters it around each commit to that table, so commits to one table from different
@@ -307,6 +309,9 @@ write cannot be undone without removing another writer's changes, no table is re
 | [Migrating from 0.2](https://github.com/Point72/gamma-lake/wiki/Migrating-from-0.2)  | Removed and moved options, methods and modules              |
 
 ## Core API
+
+`gammalake.native.NativeLake` exposes the same core with a different contract, for example accepting any Arrow data;
+see [Native Engine](https://github.com/Point72/gamma-lake/wiki/Native-Engine#gammafeaturelake-or-nativelake).
 
 ```python
 from datetime import date

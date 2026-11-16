@@ -2517,7 +2517,6 @@ name = "gamma_lake"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "datafusion",
  "futures",
  "gamma_lake_core",
  "gamma_lake_delta",

@@ -127,26 +127,10 @@ docs/src/_build/
 docs/superpowers
 index.md
 
-# JS
-js/coverage
-js/dist
-js/lib
-js/node_modules
-js/test-results
-js/playwright-report
-js/*.tgz
-
 # Jupyter
 .ipynb_checkpoints
 .autoversion
 Untitled*.ipynb
-gammalake/extension
-gammalake/nbextension
-gammalake/labextension
-
-# Emscripten SDK (locally installed)
-emsdk
-.pyodide_build/
 
 # Mac
 .DS_Store
