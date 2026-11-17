@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is a build-time dependency of deltalake with no maintained replacement yet" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml < 0.41 is pinned by object_store 0.13 (deltalake 1.1); it parses responses from the configured object store" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml < 0.41 is pinned by object_store 0.13 (deltalake 1.1); it parses responses from the configured object store" },
+]

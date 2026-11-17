@@ -15,16 +15,22 @@ import polars as pl
 from gammalake import GammaFeatureLake
 from gammalake.tests.base import generate_test_data
 
-N_SYMBOLS = 200
-N_FEATURES = 50
 N_DAYS = 30
+N_FEATURES = 50
+N_SYMBOLS = 200
 
-_ORIGIN = datetime(2024, 1, 1, tzinfo=UTC)
-_SYMBOLS = [f"SYM_{i:04d}" for i in range(N_SYMBOLS)]
-_ALL_DAYS = [_ORIGIN + timedelta(days=day) for day in range(N_DAYS)]
 _GENERATED_DIR = "gammalake-asv"
-_SCOPES = {"overlap-write", "read", "write"}
+_ORIGIN = datetime(2024, 1, 1, tzinfo=UTC)
 _RUN_NAME = re.compile(r"^\d{8}T\d{6}_[0-9a-f]{8}$")
+_SCOPES = {"overlap-write", "read", "write"}
+
+
+def _all_days() -> list[datetime]:
+    return [_ORIGIN + timedelta(days=day) for day in range(N_DAYS)]
+
+
+def _symbols() -> list[str]:
+    return [f"SYM_{i:04d}" for i in range(N_SYMBOLS)]
 
 
 def _local_root() -> Path:
@@ -48,8 +54,8 @@ def _make_feature_df(group_idx: int, n_features: int) -> pl.DataFrame:
     n_rows = N_DAYS * N_SYMBOLS
     rng = np.random.default_rng(group_idx)
     data = {
-        "timestamp": [day for day in _ALL_DAYS for _ in range(N_SYMBOLS)],
-        "symbol": _SYMBOLS * N_DAYS,
+        "timestamp": [day for day in _all_days() for _ in range(N_SYMBOLS)],
+        "symbol": _symbols() * N_DAYS,
         **{f"g{group_idx}_feat_{feature}": rng.standard_normal(n_rows) for feature in range(n_features)},
     }
     return pl.DataFrame(data).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
@@ -133,14 +139,14 @@ class GammaLakeWriteSuite:
     def setup_cache(cls) -> dict[str, str]:
         storage_path = _new_run_path("write")
         try:
-            GammaFeatureLake(base_path=storage_path, run_on_ray_cluster=False).initialize()
+            GammaFeatureLake(base_path=storage_path).initialize()
         except Exception:
             _delete_generated_path(storage_path)
             raise
         return {"storage_path": storage_path}
 
     def setup(self, cache: dict[str, str]) -> None:
-        self._lake = GammaFeatureLake(base_path=cache["storage_path"], run_on_ray_cluster=False)
+        self._lake = GammaFeatureLake(base_path=cache["storage_path"])
 
     def time_step_01_initial_write(self, _cache: dict[str, str]) -> None:
         frame = generate_test_data(
@@ -222,17 +228,17 @@ class GammaLakeOverlapWriteSuite:
     def setup_cache(cls) -> dict[str, str]:
         storage_path = _new_run_path("overlap-write")
         try:
-            GammaFeatureLake(base_path=storage_path, run_on_ray_cluster=False).initialize()
+            GammaFeatureLake(base_path=storage_path).initialize()
         except Exception:
             _delete_generated_path(storage_path)
             raise
         return {"storage_path": storage_path}
 
     def setup(self, cache: dict[str, str]) -> None:
-        self._lake = GammaFeatureLake(base_path=cache["storage_path"], run_on_ray_cluster=False)
+        self._lake = GammaFeatureLake(base_path=cache["storage_path"])
 
-    def _add_features(self, **kwargs) -> None:
-        self._lake.add_features(generate_test_data(**kwargs), owner="benchmark", overlap_mode="merge")
+    def _add_features(self, overlap_mode: str = "merge", **kwargs) -> None:
+        self._lake.add_features(generate_test_data(**kwargs), owner="benchmark", overlap_mode=overlap_mode)
 
     def time_step_01_initial_write(self, _cache: dict[str, str]) -> None:
         self._add_features(n_features=N_FEATURES, n_symbols=N_SYMBOLS, n_days=N_DAYS, start_date=self.START_DATE)
@@ -286,6 +292,15 @@ class GammaLakeOverlapWriteSuite:
             symbols_id_start=N_SYMBOLS,
         )
 
+    def time_step_09_copy_overlap(self, _cache: dict[str, str]) -> None:
+        self._add_features(
+            overlap_mode="copy",
+            n_features=N_FEATURES,
+            n_symbols=N_SYMBOLS,
+            n_days=N_DAYS,
+            start_date=self.START_DATE + timedelta(days=N_DAYS // 2),
+        )
+
     def track_zz_cleanup(self, cache: dict[str, str]) -> int:
         _delete_generated_path(cache["storage_path"])
         return 0
@@ -294,28 +309,66 @@ class GammaLakeOverlapWriteSuite:
 class GammaLakeReadSuite:
     """Benchmark reads over multiple time windows and feature-group counts."""
 
-    MAX_GROUPS = 3
-    params = ([1, 7, 30], [1, 3])
+    params = ([1, 7, 30], [1, 3, 16])
     param_names = ("n_days", "n_groups")
     timeout = 600
 
     def setup(self, n_days: int, n_groups: int) -> None:
         self._storage_path = _new_run_path("read")
         try:
-            self._lake = GammaFeatureLake(base_path=self._storage_path, run_on_ray_cluster=False).initialize()
+            self._lake = GammaFeatureLake(base_path=self._storage_path).initialize()
             features: list[str] = []
-            for group in range(self.MAX_GROUPS):
+            for group in range(n_groups):
                 self._lake.add_features(_make_feature_df(group, N_FEATURES), owner="benchmark")
                 features.extend(f"g{group}_feat_{feature}" for feature in range(N_FEATURES))
         except Exception:
             _delete_generated_path(self._storage_path)
             raise
-        self._features = features[: n_groups * N_FEATURES]
-        self._start = _ALL_DAYS[0]
-        self._end = _ALL_DAYS[n_days - 1]
+        self._features = features
+        self._start = _all_days()[0]
+        self._end = _all_days()[n_days - 1]
 
     def time_read(self, n_days: int, n_groups: int) -> None:
         self._lake.read(self._features, start=self._start, end=self._end)
 
     def teardown(self, n_days: int, n_groups: int) -> None:
         _delete_generated_path(self._storage_path)
+
+
+class GammaLakeQuerySuite:
+    """Lazy queries over three feature groups: one symbol, a projection, and a row count."""
+
+    N_GROUPS = 3
+    params = (["symbol", "projection", "count"],)
+    param_names = ("query",)
+    timeout = 600
+
+    @classmethod
+    def setup_cache(cls) -> dict[str, str]:
+        storage_path = _new_run_path("read")
+        try:
+            lake = GammaFeatureLake(base_path=storage_path).initialize()
+            for group in range(cls.N_GROUPS):
+                lake.add_features(_make_feature_df(group, N_FEATURES), owner="benchmark")
+        except Exception:
+            _delete_generated_path(storage_path)
+            raise
+        return {"storage_path": storage_path}
+
+    def setup(self, cache: dict[str, str], query: str) -> None:
+        self._lake = GammaFeatureLake(base_path=cache["storage_path"])
+        self._features = [f"g{group}_feat_{feature}" for group in range(self.N_GROUPS) for feature in range(N_FEATURES)]
+
+    def time_query(self, _cache: dict[str, str], query: str) -> None:
+        frame = self._lake.read(self._features, materialized=False)
+        if query == "symbol":
+            frame = frame.filter(pl.col("symbol") == _symbols()[7])
+        elif query == "projection":
+            frame = frame.select(self._features[::25] + ["timestamp", "symbol"])
+        else:
+            frame = frame.select(pl.len())
+        frame.collect()
+
+    def track_zz_cleanup(self, cache: dict[str, str], query: str) -> int:
+        _delete_generated_path(cache["storage_path"])
+        return 0

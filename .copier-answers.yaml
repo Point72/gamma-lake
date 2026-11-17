@@ -1,12 +1,14 @@
 # Changes here will be overwritten by Copier
-_commit: 7522e24
+_commit: faa8776
 _src_path: https://github.com/python-project-templates/base.git
+add_c_abi: false
 add_docs: false
-add_extension: python
+add_extension: rust
+add_pyodide: false
 add_wiki: true
 email: OpenSource@point72.com
 github: Point72
-project_description: High-performance feature store built on Delta Lake with optional Ray parallelism
+project_description: High-performance feature store built on Delta Lake with a Rust core
 project_name: gamma-lake
 python_version_primary: '3.11'
 team: Point72, L.P.

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+* [feature] Read and write lakes through a Rust core; `gammalake.native.NativeLake` exposes it directly to Python.
+* [feature] The `gamma_lake` Rust crate exposes the core: `Lake` reads and writes lakes over any `TableStore` backend, and `Lake::read_async` reads without blocking.
+* [breaking] `GammaFeatureLake` always uses the Rust core. The `run_on_ray_cluster` and `io` fields are removed, along with the `switch`, `wait` and `get` methods, `gammalake.io`, `gammalake.metadata`, `RayObjectReference`, the Python write-path functions (`align_feature_tables`, `update_feature_tables`, `update_index`, `write_metadata`) and the `ray` extra. See [Migrating from 0.2](https://github.com/Point72/gamma-lake/wiki/Migrating-from-0.2).
+* [breaking] `add_*` methods return `None`, accept only Polars DataFrames and no longer take `metadata`; writes go to the latest version of each feature. Their third positional argument is now `overlap_mode`.
+* [breaking] `GammaFeatureLake` is frozen; use `model_copy(update=...)`. `DEFAULT_INDEX_SCHEMA` is removed; `initialize()` without a schema uses the same default.
+* [breaking] Sort keys cannot be float, time, duration or struct columns. Unsigned integer sort keys are stored as signed integers of the same width, and dictionary sort keys as strings.
+* [breaking] Datetimes are stored with microsecond precision, zoned datetimes in UTC; arrays are stored as lists and categoricals and enums as strings. Time and duration features raise `UnsupportedError`, as does writing a value that the cast to a feature's stored type would change.
+* [breaking] Concurrent writers conflict even when they add different features, because every write commits to the shared metadata tables without retrying; the losing writer raises `ConflictError` and can be retried.
+* [breaking] Errors that 0.2 raised from Polars or `deltalake` are `UnsupportedError`, `ValueError` or `RuntimeError`. A lake used before a process forks raises `RuntimeError` in the child; use the `spawn` or `forkserver` start method.
+* [deprecation] `GammaFeatureLake` takes Delta settings as `delta_options=DeltaOptions(compression=..., target_file_size=..., storage_options=...)`; the top-level `compression` and `target_file_size` fields still work but warn, and are moved into `delta_options`. `DeltaOptions` rejects unknown fields.
+* [feature] A write commits to a table only if no other writer changed it after the write read it, and otherwise raises `ConflictError`. A failed write is rolled back and raises the exception it failed with, noting the step that failed; `PartialWriteError` is raised only when the rollback cannot undo every commit.
+* [feature] Add the `lock` option: a per-table lock factory held around every commit.
+* [feature] `add_*` methods take `allow_new_index_values=False` to reject, writing nothing, an input with keys not in the index.
+* [feature] `base_path` accepts `az://`, `abfss://` and `gs://` URLs as well as local paths and `file://` and `s3://` URLs.
+* [bugfix] Rollback undoes only the failed write's commits, preserving other writers' commits, and reverts no table unless it can revert them all.
+* [feature] Store list and struct features; copy-mode overlaps widen numeric types as Polars does.
+* [feature] With the `datafusion` extra, `GammaFeatureLake.feature_table` and `NativeLake.feature_table` return features as a DataFusion table for SQL, with filters on sort keys pushed into the scan.
+* [feature] The `GAMMA_LAKE_THREADS` environment variable sets the core's parallelism.
+* [cleanup] Lakes written by 0.2.0 read unchanged, and the core writes parquet files with the same settings as the `deltalake` writer.
+* [cleanup] `deltalake` is no longer a runtime dependency.
+
 ## 0.2.0 (09-22-26)
 * [cleanup] Remove unused validation types and stale status scaffolding.
 * [feature] Use `polars-io-tools` for native LazyFrame Delta writes.
