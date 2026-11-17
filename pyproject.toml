@@ -1,7 +1,7 @@
 [build-system]
 requires = [
     "hatchling",
-    "hatch-rs>=0.4.3",
+    "hatch-rs>=0.6.1",
 ]
 build-backend = "hatchling.build"
 
@@ -58,10 +58,10 @@ develop = [
     "codespell",
     "gamma-lake[datafusion]",
     "deltalake",
-    "hatch-rs>=0.4.3",
+    "hatch-rs>=0.6.1",
     "hatchling",
     "mdformat",
-    "mdformat-frontmatter",
+    "mdformat-myst",
     "mdformat-tables>=1",
     "moto[server]>=5",
     "pytest",
