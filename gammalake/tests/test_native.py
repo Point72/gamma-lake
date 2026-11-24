@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import datetime as dt
 import functools
 import gc
@@ -6,6 +7,7 @@ import itertools
 import json
 import operator
 import os
+import pickle
 import random
 import shutil
 import signal
@@ -17,6 +19,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from deltalake import write_deltalake
 from polars.testing import assert_frame_equal
@@ -866,20 +869,45 @@ def test_a_table_once_as_of_is_never_padded(tmp_path):
 
 def test_native_handle_follows_lake_location(lake_path, tmp_path):
     fs = GammaFeatureLake(base_path=lake_path)
-    assert fs._native is None
-    first = fs._native_lake()
-    assert fs._native_lake() is first
+    first = fs._native
+    assert first is not None and fs._native_lake() is first
     other = GammaFeatureLake(base_path=str(tmp_path)).initialize()
     other.add_features(frame([1, 2], ["A"], g1=1))
     moved = fs.model_copy(update={"base_path": str(tmp_path)})
-    assert moved._native is None
     assert moved._native_lake() is not first
     assert moved.read(["g1"]).height == 2
+    fs.base_path = str(tmp_path)
+    assert fs._native_lake() is not first
+    assert fs.read(["g1"]).height == 2
 
 
-def test_lake_configuration_is_frozen(lake):
-    with pytest.raises(ValidationError, match="Instance is frozen"):
-        lake.memory_limit = 1
+def test_copies_of_a_used_lake_open_their_own_handle_and_share_its_lock(lake):
+    expected = lake.read(["f1"])
+    lock = functools.partial(lambda guard, path: guard, threading.Lock())
+    locked = lake.model_copy(update={"lock": lock})
+    for copied in (copy.copy(locked), copy.deepcopy(locked), locked.model_copy(), locked.model_copy(deep=True)):
+        assert copied._native is None and copied.lock is lock
+        assert_frame_equal(copied.read(["f1"]), expected)
+    assert_frame_equal(pickle.loads(pickle.dumps(lake)).read(["f1"]), expected)
+
+
+def test_moved_delta_options_can_be_copied_or_assigned(tmp_path):
+    fs = GammaFeatureLake(base_path=str(tmp_path), delta_options=DeltaOptions(compression="lz4", target_file_size=1 << 20)).initialize()
+    with pytest.warns(DeprecationWarning, match="moved to delta_options") as copied:
+        snappy = fs.model_copy(update={"compression": "snappy"})
+    with pytest.warns(DeprecationWarning, match="moved to delta_options") as assigned:
+        fs.compression = "gzip"
+    assert copied[0].filename == assigned[0].filename == __file__
+    assert snappy.delta_options == DeltaOptions(compression="snappy", target_file_size=1 << 20)
+    assert fs.delta_options == DeltaOptions(compression="gzip", target_file_size=1 << 20)
+    snappy.add_features(frame([1], ["A"], s=1))
+    fs.add_features(frame([1], ["A"], g=1))
+    tables = fs.feature_metadata_frame().collect().select("feature_name", "table_addr").rows()
+    codecs = {
+        name: {pq.ParquetFile(file).metadata.row_group(0).column(0).compression for file in (tmp_path / addr).glob("*.parquet")}
+        for name, addr in tables
+    }
+    assert codecs == {"s": {"SNAPPY"}, "g": {"GZIP"}}
 
 
 @pytest.mark.parametrize("update", [{"base_path": "s3://bucket/lake%41"}, {"index_path": "../index"}, {"feature_metadata_path": "/abs"}])
@@ -894,10 +922,11 @@ def test_delta_options_reject_unknown_fields():
 
 
 def test_compression_and_target_file_size_move_to_delta_options(tmp_path):
-    with pytest.warns(DeprecationWarning, match="moved to delta_options"):
+    with pytest.warns(DeprecationWarning, match="moved to delta_options") as record:
         fs = GammaFeatureLake(
             base_path=str(tmp_path), compression="gzip", target_file_size=1024, delta_options=DeltaOptions(storage_options={"k": "v"})
         )
+    assert record[0].filename == __file__
     assert fs.delta_options == DeltaOptions(compression="gzip", target_file_size=1024, storage_options={"k": "v"})
     with pytest.raises(ValueError, match="both directly and in delta_options"):
         GammaFeatureLake(base_path=str(tmp_path), compression="gzip", delta_options={"compression": "zstd"})

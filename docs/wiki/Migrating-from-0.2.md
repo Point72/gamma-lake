@@ -12,9 +12,10 @@ and the `ray` extra is gone.
 
 ## `GammaFeatureLake` fields
 
-Passing a removed field raises a pydantic `ValidationError` (`Extra inputs are not permitted`). `GammaFeatureLake` is
-frozen: set fields when constructing it, or use `model_copy(update=...)`. `compression` and
-`target_file_size` still work, with a `DeprecationWarning`, and are moved into `delta_options`.
+Passing a removed field raises a pydantic `ValidationError` (`Extra inputs are not permitted`). `compression` and
+`target_file_size` still work, with a `DeprecationWarning`, and are moved into `delta_options`, whether they are
+passed to the constructor, assigned or passed to `model_copy(update=...)`. Unlike 0.2's, `model_copy(update=...)`
+validates the update, as the constructor validates its arguments.
 
 | 0.2                       | 0.3                                                                                                                            |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
@@ -71,5 +72,5 @@ the tables that may hold part of it. Requests the core cannot serve raise `Unsup
 `gammalake`. Errors that 0.2 raised from Polars or `deltalake` are now `UnsupportedError`, `ValueError` or
 `RuntimeError`.
 
-The core's threads do not survive `fork`, so a lake used before a process forks raises `RuntimeError` in the child.
-Start child processes with the `spawn` or `forkserver` method.
+The core's threads do not survive `fork`, so a lake constructed or used before a process forks raises `RuntimeError` in
+the child. Start child processes with the `spawn` or `forkserver` method.

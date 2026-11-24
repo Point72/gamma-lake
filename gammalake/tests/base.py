@@ -242,6 +242,7 @@ class GammaFeatureLakeTestsMixin:
 
     def _test_exceptions_uninitialized(self, fs: GammaFeatureLake):
         """Requires an *uninitialized* GammaFeatureLake instance."""
+        assert fs.sort_keys is None
         with pytest.raises(UninitializedDeltaLakeException):
             fs.read(...)
         with pytest.raises(UninitializedDeltaLakeException):
@@ -812,7 +813,7 @@ class GammaFeatureLakeTestsMixin:
         """Restore the entire store to a cutoff before a bad add batch."""
         features = [f"feature_{i}" for i in range(3)]
         start_date = datetime(2020, 6, 20, tzinfo=UTC)
-        fs = fs.model_copy(update={"enable_runtime_computed_features": True})
+        fs.enable_runtime_computed_features = True
 
         fs.add_features(generate_test_data(n_features=3, n_symbols=4, n_days=10, start_date=start_date), owner="tbg")
         fs.add_runtime_computed_features([(pl.col("feature_0") + pl.col("feature_1")).alias("runtime_sum")], owner="tbg")
@@ -2632,7 +2633,7 @@ class GammaFeatureLakeTestsMixin:
 
     def _test_runtime_computed_features(self, fs: GammaFeatureLake):
         """Register runtime-computed features and verify reads."""
-        fs = fs.model_copy(update={"enable_runtime_computed_features": True})
+        fs.enable_runtime_computed_features = True
         n_features = 3
         n_symbols = 10
         n_days = 30
@@ -2695,7 +2696,7 @@ class GammaFeatureLakeTestsMixin:
 
     def _test_runtime_transforms(self, fs: GammaFeatureLake):
         """Register the supported row-local transforms and verify their semantics."""
-        fs = fs.model_copy(update={"enable_runtime_computed_features": True})
+        fs.enable_runtime_computed_features = True
         timestamps = pl.datetime_range(
             datetime(2024, 1, 1, tzinfo=UTC),
             datetime(2024, 1, 5, tzinfo=UTC),
@@ -2759,7 +2760,7 @@ class GammaFeatureLakeTestsMixin:
 
     def _test_runtime_transform_validation(self, fs: GammaFeatureLake):
         """Reject invalid transform registrations and preserve numeric compatibility."""
-        fs = fs.model_copy(update={"enable_runtime_computed_features": True})
+        fs.enable_runtime_computed_features = True
         df = generate_test_data(n_features=1, n_symbols=2, n_days=3)
         fs.add_features(df)
 
@@ -2782,7 +2783,7 @@ class GammaFeatureLakeTestsMixin:
 
     def _test_runtime_transforms_cast_numeric_inputs(self, fs: GammaFeatureLake):
         """Cast supported numeric input types to Float64."""
-        fs = fs.model_copy(update={"enable_runtime_computed_features": True})
+        fs.enable_runtime_computed_features = True
         frame = pl.DataFrame(
             {
                 "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
@@ -2877,7 +2878,7 @@ class GammaFeatureLakeTestsMixin:
 
     def _test_consolidate_rejects_non_consolidatable_signal_types(self, fs: GammaFeatureLake):
         """Reject consolidation of runtime, as-of, and sparse signals."""
-        fs = fs.model_copy(update={"enable_runtime_computed_features": True})
+        fs.enable_runtime_computed_features = True
         n_days = 10
         start_date = datetime(2020, 6, 20, tzinfo=UTC)
         df1 = generate_test_data(n_features=3, n_symbols=5, n_days=n_days, start_date=start_date)

@@ -537,11 +537,12 @@ def test_primary_sort_key_not_in_schema_raises(tmp_path):
 
 
 def test_primary_sort_key_not_in_existing_index_raises(tmp_path):
-    """Opening an existing lake rejects a primary_sort_key absent from the on-disk index."""
-    GammaFeatureLake(base_path=str(tmp_path)).initialize()
-    lake = GammaFeatureLake(base_path=str(tmp_path), primary_sort_key="not_a_column")
-    with pytest.raises(ValueError, match="not_a_column"):
-        lake.read([])
+    """Opening an existing lake, or assigning to one, rejects a primary_sort_key absent from the on-disk index."""
+    lake = GammaFeatureLake(base_path=str(tmp_path)).initialize()
+    with pytest.raises(ValidationError, match="not_a_column"):
+        GammaFeatureLake(base_path=str(tmp_path), primary_sort_key="not_a_column")
+    with pytest.raises(ValidationError, match="not_a_column"):
+        lake.primary_sort_key = "not_a_column"
 
 
 def test_adds_take_data_frames_and_return_nothing(tmp_path):

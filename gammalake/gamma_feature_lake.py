@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import copy
 import os
+import sys
 import uuid
 import warnings
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, suppress
 from datetime import datetime
 from functools import singledispatchmethod, wraps
 from typing import Any, Literal
 
+import ccflow
 import polars as pl
 import pyarrow as pa
+import pydantic
 from ccflow import ArrowSchema, BaseModel
 from ccflow.exttypes.polars import PolarsExpression
 from packaging import version
@@ -22,6 +26,21 @@ from gammalake.abstract import BaseFeatureLake, Comparable, UninitializedDeltaLa
 from gammalake.native import ConflictError, DeltaOptions, NativeLake, PartialWriteError, UnsupportedError
 
 __all__ = ("ConflictError", "DeltaOptions", "GammaFeatureLake", "PartialWriteError", "UnsupportedError")
+
+_MOVED_DELTA_OPTIONS = ("compression", "target_file_size")
+# The files that validate GammaFeatureLake's fields, whose frames a deprecation warning skips to point at the caller.
+_VALIDATION_FILES = (__file__, *(os.path.join(os.path.dirname(module.__file__), "") for module in (ccflow, pydantic)))
+
+
+def _warn_moved(moved: Iterable[str]) -> None:
+    """Warn that the ``moved`` options belong in ``delta_options``, at the first frame outside ``_VALIDATION_FILES``.
+
+    ``warnings.warn(skip_file_prefixes=...)`` does this from Python 3.12.
+    """
+    frame, stacklevel = sys._getframe(1), 2
+    while frame.f_back is not None and frame.f_code.co_filename.startswith(_VALIDATION_FILES):
+        frame, stacklevel = frame.f_back, stacklevel + 1
+    warnings.warn(f"{sorted(moved)} moved to delta_options", DeprecationWarning, stacklevel=stacklevel)
 
 
 class GammaFeatureLake(BaseFeatureLake, BaseModel):
@@ -69,23 +88,29 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
     )
     _native: NativeLake | None = PrivateAttr(default=None)
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True, hide_input_in_errors=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, hide_input_in_errors=True)
 
     @model_validator(mode="before")
     @classmethod
     def move_delta_options(cls, values):
         """Accept 0.2's ``compression`` and ``target_file_size`` fields, now in ``delta_options``."""
-        moved_options = ("compression", "target_file_size")
-        if not isinstance(values, dict) or not values.keys() & set(moved_options):
+        if not isinstance(values, dict) or not values.keys() & _MOVED_DELTA_OPTIONS:
             return values
-        moved = {k: values[k] for k in moved_options if k in values}
+        moved = {k: values[k] for k in _MOVED_DELTA_OPTIONS if k in values}
         delta = values.get("delta_options") or {}
         if isinstance(delta, DeltaOptions):
             delta = delta.model_dump(exclude_unset=True)
         if clash := sorted(moved.keys() & delta.keys()):
             raise ValueError(f"{clash} set both directly and in delta_options; set them in delta_options only")
-        warnings.warn(f"{sorted(moved)} moved to delta_options", DeprecationWarning, stacklevel=2)
+        _warn_moved(moved)
         return {**{k: v for k, v in values.items() if k not in moved}, "delta_options": {**delta, **moved}}
+
+    @model_validator(mode="after")
+    def check(self) -> GammaFeatureLake:
+        """Open the lake if it is initialized, which checks that ``primary_sort_key`` is an index column."""
+        with suppress(UninitializedDeltaLakeException):
+            self._native_lake()
+        return self
 
     def ensure_deltalake_is_initialized(func):
         """A decorator that delegates to an overridable method, and verifies that the proper initialization steps took place"""
@@ -101,9 +126,12 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         return wrapper
 
     @property
-    def sort_keys(self) -> list[str]:
-        """Returns the index table's columm schema."""
-        return self._native_lake().sort_keys
+    def sort_keys(self) -> list[str] | None:
+        """The index table's column names, or ``None`` if the lake is not initialized."""
+        try:
+            return self._native_lake().sort_keys
+        except UninitializedDeltaLakeException:
+            return None
 
     @property
     def index(self) -> str:
@@ -274,6 +302,15 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         """
         return self._native_lake().feature_table(features, targets)
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _MOVED_DELTA_OPTIONS:
+            _warn_moved([name])
+            name, value = "delta_options", {**self.delta_options.model_dump(exclude_unset=True), name: value}
+        if name in type(self).model_fields:
+            # Validating the assignment reopens the lake with the new configuration.
+            self._native = None
+        super().__setattr__(name, value)
+
     def __getstate__(self):
         # The native handle is a cache that cannot be pickled.
         state = super().__getstate__()
@@ -282,10 +319,32 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
             state = {**state, "__pydantic_private__": {**private, "_native": None}}
         return state
 
-    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> GammaFeatureLake:
-        copied = super().model_copy(update=update, deep=deep)
+    def __copy__(self) -> GammaFeatureLake:
+        copied = super().__copy__()
         copied._native = None
         return copied
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> GammaFeatureLake:
+        # Copies what pickling would, so not the native handle. The copy shares the lock, which guards tables it shares.
+        memo = {} if memo is None else memo
+        memo[id(self.lock)] = self.lock
+        copied = type(self).__new__(type(self))
+        copied.__setstate__(copy.deepcopy(self.__getstate__(), memo))
+        return copied
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> GammaFeatureLake:
+        """A copy of the lake, which opens the lake itself rather than sharing this one's handle.
+
+        Unlike pydantic's ``model_copy``, ``update`` is validated as the constructor's arguments are, and
+        ``compression`` and ``target_file_size`` in it replace those in ``delta_options``.
+        """
+        copied = super().model_copy(deep=deep)
+        if not update:
+            return copied
+        values = {name: getattr(copied, name) for name in copied.model_fields_set}
+        if (moved := update.keys() & _MOVED_DELTA_OPTIONS) and "delta_options" not in update:
+            values["delta_options"] = copied.delta_options.model_dump(exclude_unset=True, exclude=moved)
+        return type(self).model_validate({**values, **update})
 
     def _native_options(self) -> dict[str, Any]:
         return {
@@ -302,12 +361,13 @@ class GammaFeatureLake(BaseFeatureLake, BaseModel):
         }
 
     def _native_lake(self) -> NativeLake:
-        """The native lake for this lake's immutable configuration, opened once on demand."""
+        """The native lake for this lake's configuration, opened on demand."""
         if self._native is not None:
             return self._native
         self._native = NativeLake(self.base_path, **self._native_options())
         return self._native
 
+    @ensure_deltalake_is_initialized
     def _get_latest_feature_tables(self, feature_columns, feature_metadata: pl.DataFrame):
         pure_feature_columns = pl.Series("feature_name", list(set(feature_columns) - set(self.sort_keys)), dtype=pl.String)
         latest = feature_metadata.sort("version", descending=True, nulls_last=True).unique(subset=["feature_name"], keep="first")

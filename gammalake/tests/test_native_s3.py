@@ -68,7 +68,7 @@ def test_a_lake_on_s3_is_created_written_and_reopened(s3):
     expected = lake.read(["f"])
 
     reopened = GammaFeatureLake(base_path=base_path, delta_options=delta_options)
-    assert reopened._native is None
+    assert reopened._native is not None
     assert_frame_equal(reopened.read(["f"]), expected)
     assert expected["f"].to_list() == [1.0, 2.0, 3.0]
     assert secret not in repr(reopened)
