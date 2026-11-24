@@ -75,7 +75,9 @@ commit follows it, and otherwise with one commit that removes the files they add
 keeping other writers' commits. The write is then logged `rolled_back`. If another writer removed a file the write
 added, added rows to columns the write added, or changed a schema the write changed, the undo fails and the write stays
 `failed`. Tables the write created are left unreferenced. A backend that does not number versions
-(`StoredTable::version` returns `None`) is never rolled back.
+(`StoredTable::version` returns `None`) is never rolled back. A write that failed because another writer committed to
+a table after the write read it, and was rolled back, is planned and run again as a new transaction, up to 10 times in
+all.
 
 ## Files
 

@@ -1,13 +1,13 @@
 //! Registration of runtime-computed features.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 
 use crate::error::{Error, Result};
 use crate::lake::{feature_rows, Lake};
-use crate::lock::write_lock;
+use crate::predicate::Dnf;
 use crate::runtime::block_on;
 use crate::write::{assemble, RUNTIME_COMPUTED};
 
@@ -28,25 +28,23 @@ impl Lake {
     ///
     /// Each name must be new to the lake, unique in `expressions` and not a sort key. Every
     /// root must be a registered feature or another of `expressions`, other than the
-    /// expression itself, and `expressions` must not depend on each other in a cycle.
+    /// expression itself, and `expressions` must not depend on each other in a cycle. The
+    /// feature metadata is committed to through the version checked, and the expressions are
+    /// checked and committed again when another writer committed to it first, as [`Lake::add`]
+    /// retries a write.
     pub fn add_expressions(&self, expressions: &[Expression], owner: &str) -> Result<()> {
         if expressions.is_empty() {
             return Ok(());
         }
-        let lock = write_lock(self.store.location())?;
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        block_on(self.add_expressions_locked(expressions, owner))?
+        self.retrying(|| block_on(self.add_expressions_locked(expressions, owner))?)
     }
 
     async fn add_expressions_locked(&self, expressions: &[Expression], owner: &str) -> Result<()> {
         let path = &self.options.feature_metadata_path;
-        let registered: HashSet<String> = feature_rows(&self.read_batch(path).await?)?
-            .into_iter()
-            .map(|r| r.name)
-            .collect();
+        let (table, fm) = self.read_table(path, &Dnf::default()).await?;
+        let registered: HashSet<String> = feature_rows(&fm)?.into_iter().map(|r| r.name).collect();
         check(expressions, &registered, self.sort_keys())?;
 
-        let table = self.table(path).await?;
         let schema = table.schema();
         let n = expressions.len();
         let strings = |values: Vec<&str>| -> ArrayRef { Arc::new(StringArray::from(values)) };

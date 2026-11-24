@@ -118,5 +118,6 @@ Beyond raw I/O performance, Gamma Lake addresses requirements that pure Parquet 
 | Parallel reads                      |      ❌       |     ✅     |
 | ACID transactions                   |      ❌       |     ✅     |
 
-Concurrent writes are safe: a write that conflicts with another fails cleanly and can be retried. Writers conflict
-whenever their commits overlap, even when they add different features; see "Concurrent writers" in the README.
+Concurrent writes are safe: a write that conflicts with another is rolled back and run again. Writers conflict
+whenever their commits overlap, even when they add different features, and a write that runs again writes its data
+again; see "Concurrent writers" in the README.

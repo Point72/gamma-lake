@@ -272,7 +272,7 @@ def test_a_failed_release_after_a_commit_counts_the_table_as_committed(tmp_path,
 
 
 @pytest.mark.parametrize("raced", ["feature table", "index"])
-def test_a_table_changed_after_the_write_read_it_is_not_committed_to(tmp_path, raced):
+def test_a_write_whose_table_changed_after_it_read_it_is_rolled_back_and_run_again(tmp_path, raced):
     lake = populated(tmp_path)
     features = lake.feature_metadata_frame().collect().filter(pl.col("feature_name") == "f")["table_addr"].item()
     before = table_versions(lake.base_path)
@@ -284,17 +284,41 @@ def test_a_table_changed_after_the_write_read_it_is_not_committed_to(tmp_path, r
             DeltaTable(path).alter.set_table_description("changed by another writer")
             changed.append(name)
 
-    with pytest.raises(ConflictError) as raised:
-        with_lock(lake, Recorder(on_enter=race)).add_features(frame(keys(range(4, 5), "ab"), f=1, g=2))
-    assert "changed after this write read it" in str(raised.value)
-    assert raised.value.table == changed[0]
-    expected = {**before, changed[0]: before[changed[0]] + 1, LOG: before[LOG] + 3}
+    with_lock(lake, Recorder(on_enter=race)).add_features(frame(keys(range(4, 5), "ab"), f=1, g=2))
+    log = lake.transaction_log_frame().sort("updated_at").collect()
+    assert log["status"].to_list()[-5:] == ["pending", "failed", "rolled_back", "pending", "success"]
+    assert f"table {changed[0]} changed after this write read it" in log["error"][-4]
+    # The race commits to one table, and the attempt that succeeded to the feature table, the index and the table metadata.
+    expected = {**before, LOG: before[LOG] + 5}
+    for name in (changed[0], features, "index", "table_metadata"):
+        expected[name] += 1
     if raced == "index":
-        # The feature table was appended to before the conflict, then restored.
+        # The first attempt appended to the feature table before the conflict, then restored it.
         expected[features] += 2
     assert table_versions(lake.base_path) == expected
-    assert lake.index_frame().collect().height == 6
-    assert lake.read(["f"]).height == 6
+    assert lake.index_frame().collect().height == 8
+    assert lake.read(["f"]).height == 8
+
+
+def test_a_write_that_conflicts_on_every_attempt_raises_conflict_error(tmp_path):
+    lake = populated(tmp_path)
+    before = table_versions(lake.base_path)
+
+    def race(path):
+        if os.path.basename(path) == "table_metadata":
+            DeltaTable(path).alter.set_table_description("changed by another writer")
+
+    with pytest.raises(ConflictError) as raised:
+        with_lock(lake, Recorder(on_enter=race)).add_features(frame(keys(range(1, 4), "ab"), h=1))
+    assert "changed after this write read it" in str(raised.value)
+    assert raised.value.table == "table_metadata"
+    statuses = lake.transaction_log_frame().sort("updated_at").collect()["status"].to_list()
+    assert statuses[4:] == ["pending", "failed", "rolled_back"] * 10
+    # Each attempt created a table, left unreferenced.
+    after = table_versions(lake.base_path)
+    assert len(after) == len(before) + 10
+    assert {name: after[name] for name in before} == {**before, "table_metadata": before["table_metadata"] + 10, LOG: before[LOG] + 30}
+    assert "h" not in lake.feature_metadata_frame().collect()["feature_name"]
 
 
 def test_a_thread_affine_lock_works(tmp_path):

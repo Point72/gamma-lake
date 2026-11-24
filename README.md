@@ -27,7 +27,7 @@ The most common alternative — storing features in per-day Parquet files — br
 | Problem                                                  | Gamma Lake's answer                                                                                                                               |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Adding a new feature group rewrites *all* existing files | Gamma Lake writes each new feature group to its own Delta table and leaves existing files alone                                                   |
-| Multiple teams can't write features in parallel          | Feature groups are separate Delta tables, and a conflicting write fails cleanly and can be retried; see [concurrent writers](#concurrent-writers) |
+| Multiple teams can't write features in parallel          | Feature groups are separate Delta tables, and a write that conflicts is rolled back and then rerun; see [concurrent writers](#concurrent-writers) |
 | No versioning or audit trail                             | Delta Lake's transaction log provides full time-travel and version history                                                                        |
 | Cross-group reads require expensive joins                | Gamma Lake maintains a master index; reads are aligned horizontal concatenations                                                                  |
 | Experimental features pollute production data            | Features carry `owner` and `version` metadata; `read()` accepts a filtered metadata frame                                                         |
@@ -233,12 +233,15 @@ A write commits to several Delta tables: the feature tables first, then the inde
 metadata becomes visible only after the feature and index writes succeed. Each commit is atomic, and writes to one
 lake from a single process run one at a time.
 
-A write commits to a table only if the table has not changed since the write read it. If another process committed to
-it in between, the write stops there and the tables it already committed to are
-[rolled back](#transactions-and-rollback): it raises `ConflictError`, and the lake is unchanged, so the write can be
-run again. If the rollback cannot complete, it raises `PartialWriteError` instead, and the lake holds part of the
-write. Every write commits to the shared metadata tables, so concurrent writers conflict even when they add different
-features, and the one that loses must retry.
+A write commits to a table only if the table has not changed since the write read it. If another process committed to it
+in between, the write stops there and the tables it already committed to are [rolled back](#transactions-and-rollback).
+The write is then run again, planned anew from the lake as the other process left it, up to 10 times in all, after a
+random wait of up to 50 ms that doubles with each attempt, to at most 1 s. Every write commits to the shared metadata
+tables, so concurrent writers conflict even when they add different features; the retries let them all succeed, but each
+retry writes the data again. If two writers add the same new feature, the one that runs again writes to it as any later
+write would, for example as a new version. A write that conflicts on every attempt raises `ConflictError`, and the lake
+is unchanged, so the write can be run again. If a rollback cannot complete, the write raises `PartialWriteError`
+instead, and the lake holds part of the write.
 
 For writers in several processes, pass `lock`: a callable that takes the absolute path or URL of a table and returns
 a context manager. Gamma Lake enters it around each commit to that table, so commits to one table from different
@@ -247,8 +250,9 @@ processes run one at a time, which object stores without atomic commits need. Re
 The lock serialises commits; it does not make a write atomic. A write plans where its rows go in the index before it
 commits, and a write that adds no index rows, like `consolidate_feature_groups`, reads the index without committing
 to it. If another process extends the index in between, the tables can end up misaligned, even when the two writes
-touch different keys and features. Writers in several processes must therefore coordinate each `add_*` and
-`consolidate_feature_groups` call, for example by holding one lake-wide lock. Reading through a
+touch different keys and features. So no other process may write while one adds index rows: hold one lake-wide lock
+around each `add_*` and `consolidate_feature_groups` call, or add the index rows up front with `add_index_rows` and
+pass `allow_new_index_values=False` to the writes that run at the same time. Reading through a
 `gammalake.native.NativeLake` opened with `validate=True` detects misaligned tables.
 
 ```python
@@ -290,7 +294,8 @@ Each `add_*` write of rows is recorded in the append-only `transaction_log` tabl
 transaction's current status is its row with the latest `updated_at`. If a write fails after committing to some
 tables, it is recorded as `failed`, its commits are undone on each table it committed to, and it is recorded as
 `rolled_back`; the write then fails as if it had committed nothing. Tables it created are left in place,
-unreferenced, so reads never see them.
+unreferenced, so reads never see them. A write [run again](#concurrent-writers) after a conflict records each attempt
+as a transaction of its own.
 
 Rollback identifies the failed write's commits by transaction id and preserves unrelated writers' commits. If the
 write cannot be undone without removing another writer's changes, no table is reverted; it remains `failed` and raises

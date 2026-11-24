@@ -94,9 +94,10 @@ class UnsupportedError(NotImplementedError):
 
 
 class ConflictError(RuntimeError):
-    """Another writer committed to ``table`` after this write read it, so nothing was written.
+    """Another writer committed to ``table`` after this write read it, on the last of its 10 attempts.
 
-    The lake is unchanged by the failed write, which can be run again.
+    The lake is unchanged by the failed write, apart from tables it created and left
+    unreferenced, so the write can be run again.
     """
 
     def __init__(self, message: str, table: str):
@@ -388,8 +389,9 @@ class NativeLake:
 
     ``lock`` is called with the absolute path or URL of each table a write commits to, and
     the context manager it returns is held around that commit; it serialises commits but does
-    not make a write atomic. Each write is logged at ``transaction_log_path``, and one that
-    fails after committing part of itself is rolled back or raises :class:`PartialWriteError`.
+    not make a write atomic. Each write is logged at ``transaction_log_path``; one that fails
+    after committing part of itself is rolled back or raises :class:`PartialWriteError`, and one
+    that conflicts with another writer is rolled back and run again.
     See "Concurrent writers" and "Transactions and rollback" in the README.
 
     By default a read sorts each table it reads in memory. With ``memory_limit`` set, the
@@ -695,7 +697,8 @@ class NativeLake:
         ``comments`` and ``tags`` map written features to the comment and tags of the versions
         written, as :meth:`annotate` sets them; features left out keep theirs.
 
-        Raises :class:`ConflictError` if another writer committed to a table first. Any other
+        A write that conflicts with another writer's commit is rolled back and run again, up to
+        10 times in all, and raises :class:`ConflictError` if every attempt conflicts. Any other
         failure rolls the write back and raises its exception, or :class:`PartialWriteError` if
         the rollback cannot undo every commit.
         """

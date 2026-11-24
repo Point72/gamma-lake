@@ -1,5 +1,6 @@
 """Writes through the native engine, checked against a reference model."""
 
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -53,6 +54,36 @@ def test_metadata_of_mixed_writes(tmp_path):
     ]
     assert_frame_equal(lake.index_frame().collect().sort(KEYS), model.read([]).select(KEYS))
     assert_frame_equal(lake.read(["f", "g"], targets=["y"]).select("f", "g", "y", *KEYS).sort(KEYS), model.read(["f", "g", "y"]))
+
+
+def add_in_process(path: str, rows: list, name: str, scale: int, ready) -> None:
+    lake = GammaFeatureLake(base_path=path)
+    df = frame(rows, **{name: scale})
+    ready.wait(timeout=120)
+    lake.add_features(df, owner=name)
+
+
+def test_concurrent_writers_of_different_features_all_succeed(tmp_path):
+    """Writers in other processes adding different features over existing keys conflict on the
+    metadata tables; each write that conflicts is rolled back and run again, so all succeed."""
+    lake, model = lake_at(tmp_path), Model()
+    rows = keys(range(1, 6), "abc")
+    lake.add_features(frame(rows, f=1))
+    model.add(rows, f=1)
+    scales = {f"g{i}": i + 2 for i in range(4)}
+    context = multiprocessing.get_context("spawn")
+    ready = context.Barrier(len(scales))
+    writers = [context.Process(target=add_in_process, args=(str(tmp_path), rows, name, scale, ready), daemon=True) for name, scale in scales.items()]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=300)
+    assert [writer.exitcode for writer in writers] == [0] * len(writers)
+    model.add(rows, **scales)
+    index = lake.index_frame().collect()
+    assert index.height == index.unique().height == len(rows)
+    names = ["f", *scales]
+    assert_frame_equal(lake.read(names).select(*names, *KEYS).sort(KEYS), model.read(names))
 
 
 @pytest.mark.parametrize(

@@ -100,11 +100,11 @@ impl Lake {
     ///
     /// Annotations without a comment or tags are skipped. Every annotation is checked before
     /// the first one is stored; a later failure is an [`Error::Write`]. Each annotated table
-    /// gets one commit, and annotations of one column are applied in order.
+    /// gets one commit, and annotations of one column are applied in order. When every commit
+    /// fails with a conflict, so that none is stored, the annotations are checked and stored
+    /// again, as [`Lake::add`] retries a write.
     pub fn annotate(&self, annotations: &[Annotation]) -> Result<()> {
-        let lock = write_lock(self.store.location())?;
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        block_on(self.annotate_locked(annotations, vec![], &Commits::default()))?
+        self.retrying(|| block_on(self.annotate_locked(annotations, vec![], &Commits::default()))?)
     }
 
     /// [`Lake::annotate`] with the write lock held, after `committed` tables were written,
@@ -215,7 +215,12 @@ impl Lake {
             match result {
                 Ok(()) => committed.push(addr),
                 Err(e) => {
-                    failure.get_or_insert((addr, e));
+                    // Other failures are reported ahead of conflicts, as `commit` does, so
+                    // that only a write whose every failure was a conflict is retried.
+                    let conflicted = matches!(failure, Some((_, Error::Conflict { .. })));
+                    if failure.is_none() || (conflicted && !matches!(e, Error::Conflict { .. })) {
+                        failure = Some((addr, e));
+                    }
                 }
             }
         }
@@ -377,9 +382,17 @@ impl Lake {
     /// index rows up to the newest coverage of the tables merged, and each feature keeps
     /// its comment and tags. Each feature gets a new version that differs only in its
     /// table; reads return the same values.
+    ///
+    /// The metadata tables are committed to through the versions read, as in [`Lake::add`].
+    /// When the table metadata conflicts, the new table is left unreferenced and the
+    /// consolidation is planned and run again, as [`Lake::add`] retries a write. A conflict
+    /// on the feature metadata, after the table metadata was committed, is an [`Error::Write`].
     pub fn consolidate(&self, features: &[&str]) -> Result<Option<String>> {
-        let lock = write_lock(self.store.location())?;
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.retrying(|| self.consolidate_locked(features))
+    }
+
+    /// One attempt at [`Lake::consolidate`], with the write lock held.
+    fn consolidate_locked(&self, features: &[&str]) -> Result<Option<String>> {
         let plan = block_on(self.consolidation(features))??;
         let Some(plan) = plan else {
             return Ok(None);
@@ -408,7 +421,7 @@ impl Lake {
             .collect::<Result<Vec<_>>>()?;
         let batch = RecordBatch::try_new(plan.schema.clone(), columns)?;
         let Consolidation { tm, fm, .. } = plan;
-        block_on(async {
+        let committed = block_on(async {
             let tm_batch = assemble(
                 &tm.schema(),
                 HashMap::from([
@@ -474,8 +487,17 @@ impl Lake {
                 &Commits::default(),
             )
             .await
-        })??;
-        Ok(Some(addr))
+        })?;
+        match committed {
+            Ok(_) => Ok(Some(addr)),
+            // Only the new table was written, and nothing refers to it.
+            Err(Error::Write {
+                committed, source, ..
+            }) if committed == [addr.as_str()] && matches!(*source, Error::Conflict { .. }) => {
+                Err(*source)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn consolidation(&self, features: &[&str]) -> Result<Option<Consolidation>> {

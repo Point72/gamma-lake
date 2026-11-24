@@ -11,7 +11,9 @@
 //! position, so every write keeps this true for every dense table it touches.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray,
@@ -556,6 +558,24 @@ impl Planner<'_> {
     }
 }
 
+/// Attempts at a write while it conflicts with other writers; see [`Lake::add`].
+const ATTEMPTS: u32 = 10;
+/// The longest wait before the second attempt at a write. It doubles before each later
+/// attempt, up to [`MAX_BACKOFF`].
+const BACKOFF: Duration = Duration::from_millis(50);
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The random wait after attempt number `attempt` at a write conflicted, so that writers
+/// that conflicted do not run again in step.
+fn backoff(attempt: u32) -> Duration {
+    let longest = BACKOFF
+        .saturating_mul(2u32.saturating_pow(attempt - 1))
+        .min(MAX_BACKOFF);
+    // 53 random bits, as a fraction in [0, 1).
+    let random = RandomState::new().hash_one(attempt) >> 11;
+    longest.mul_f64(random as f64 / (1u64 << 53) as f64)
+}
+
 impl Lake {
     /// Creates the index, metadata and transaction log tables of a lake in `store` where they
     /// are missing, and opens it.
@@ -654,11 +674,11 @@ impl Lake {
     /// writes them with the table's rows outside that range to a new table, and
     /// [`OverlapMode::Merge`] upserts them into the table; both record a new version.
     ///
-    /// Writes to one lake are serialized within this process. Writers in other processes
-    /// must not run at the same time, and readers may observe a write half done. A commit to
-    /// a table that another writer changed after this write read it fails with
-    /// [`Error::Conflict`]. A write that adds no index rows does not commit to the index, so
-    /// it can miss keys added by a concurrent writer without failing.
+    /// Writes to one lake are serialized within this process, and readers may observe a write
+    /// half done. A commit to a table that another writer changed after this write read it
+    /// fails with [`Error::Conflict`]. A write that adds no index rows does not commit to the
+    /// index, so it can miss keys added by a concurrent writer without failing; writers in
+    /// other processes must not add index rows while it runs.
     ///
     /// Each write that passes validation is a transaction in the transaction log: `pending`,
     /// then `success`. A write that fails after committing a
@@ -668,6 +688,13 @@ impl Lake {
     /// Restoring a table another writer committed to since would undo that commit too, so
     /// then nothing is restored and the write returns an [`Error::Write`] that says so; a
     /// restore that fails is an [`Error::Write`] too. Either leaves the transaction `failed`.
+    ///
+    /// A write that fails with [`Error::Conflict`] leaves the lake as it was, apart from the
+    /// tables it created, so it is planned and run again, as a new transaction, up to 10 times
+    /// in all, after a random wait of up to 50 ms that doubles with each attempt, to at most
+    /// 1 s. Each attempt plans from the lake as the writers it conflicted with left it, so a
+    /// feature another writer added meanwhile is written to as any later write would, for
+    /// example as a new version. The conflict is returned once every attempt has conflicted.
     pub fn add(&self, input: Vec<RecordBatch>, options: &AddOptions) -> Result<()> {
         if let Some(params) = &options.feature_params {
             if !matches!(
@@ -703,8 +730,8 @@ impl Lake {
     }
 
     /// Adds keys to the index without features.
-    /// Non-key columns of `input` are ignored. Transactions are logged and rolled back as in
-    /// [`Lake::add`], with the owner and signal type of [`AddOptions::default`].
+    /// Non-key columns of `input` are ignored. Transactions are logged, rolled back and retried
+    /// as in [`Lake::add`], with the owner and signal type of [`AddOptions::default`].
     pub fn add_index_rows(&self, input: Vec<RecordBatch>) -> Result<()> {
         let keys = self.sort_keys.clone();
         let input = input
@@ -724,24 +751,47 @@ impl Lake {
     }
 
     fn write(&self, input: Vec<RecordBatch>, options: &AddOptions) -> Result<()> {
-        let lock = write_lock(self.store.location())?;
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         // Plan (read and build every batch), commit, then annotate the committed versions, all as
         // one logged transaction that undoes its commits if it fails.
-        block_on(async {
-            let (actions, index, metadata) = self.plan(input, options).await?;
-            let commits = Commits::default();
-            let body = async {
-                let committed = commit(self, actions, Some(index), metadata, &commits).await?;
-                if !options.annotations.is_empty() {
-                    self.annotate_locked(&options.annotations, committed.clone(), &commits)
-                        .await?
-                }
-                Ok(committed)
+        self.retrying(|| {
+            block_on(async {
+                let (actions, index, metadata) = self.plan(input.clone(), options).await?;
+                let commits = Commits::default();
+                let body = async {
+                    let committed = commit(self, actions, Some(index), metadata, &commits).await?;
+                    if !options.annotations.is_empty() {
+                        self.annotate_locked(&options.annotations, committed.clone(), &commits)
+                            .await?
+                    }
+                    Ok(committed)
+                };
+                self.transaction(&options.owner, options.signal_type.as_str(), &commits, body)
+                    .await
+            })?
+        })
+    }
+
+    /// Runs `write` with the write lock held, and again while it fails with
+    /// [`Error::Conflict`], up to [`ATTEMPTS`] times in all. Between attempts it waits a
+    /// [`backoff`] without the lock, so that other writes in this process can run meanwhile.
+    /// `write` must plan anew on each attempt, and a conflict must leave the lake as it was,
+    /// apart from tables it created.
+    pub(crate) fn retrying<T>(&self, mut write: impl FnMut() -> Result<T>) -> Result<T> {
+        let lock = write_lock(self.store.location())?;
+        let mut attempt = 1;
+        loop {
+            let result = {
+                let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                write()
             };
-            self.transaction(&options.owner, options.signal_type.as_str(), &commits, body)
-                .await
-        })?
+            match result {
+                Err(Error::Conflict { .. }) if attempt < ATTEMPTS => {
+                    std::thread::sleep(backoff(attempt));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Table `name` and its rows that satisfy `dnf`, read through the handle later commits use.
@@ -1431,8 +1481,6 @@ pub(crate) async fn commit(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::*;
     use crate::store::MemoryStore;
     use crate::store::TableScan;
@@ -1524,20 +1572,35 @@ mod tests {
         assert_eq!(rows, 2);
     }
 
-    /// A store in which, once `armed`, another writer commits to table `raced` as soon as a
-    /// write reads it.
+    /// A store in which another writer commits to table `raced` as soon as a write reads it,
+    /// as many times as `races` says: it appends `rows` if given, and otherwise changes the
+    /// metadata of a column.
     #[derive(Debug)]
     struct Racing {
         inner: MemoryStore,
         raced: String,
-        armed: Arc<AtomicBool>,
+        races: Arc<Mutex<usize>>,
+        rows: Option<RecordBatch>,
     }
 
     struct RacingTable {
         inner: Box<dyn StoredTable>,
         store: MemoryStore,
         name: String,
-        armed: Option<Arc<AtomicBool>>,
+        /// For the raced table, the races left and the rows they append.
+        race: Option<(Arc<Mutex<usize>>, Option<RecordBatch>)>,
+    }
+
+    /// A lake in a [`Racing`] store, and its count of races left, at first none.
+    fn racing(raced: &str, rows: Option<RecordBatch>) -> (Lake, Arc<Mutex<usize>>) {
+        let races = Arc::new(Mutex::new(0));
+        let store = Racing {
+            inner: MemoryStore::new(),
+            raced: raced.to_string(),
+            races: races.clone(),
+            rows,
+        };
+        (lake(Arc::new(store)), races)
     }
 
     #[async_trait]
@@ -1552,7 +1615,7 @@ mod tests {
                     inner,
                     store: self.inner.clone(),
                     name: name.to_string(),
-                    armed: (name == self.raced).then(|| self.armed.clone()),
+                    race: (name == self.raced).then(|| (self.races.clone(), self.rows.clone())),
                 }) as Box<dyn StoredTable>
             }))
         }
@@ -1579,16 +1642,22 @@ mod tests {
             dnf: &Dnf,
             batch_size: usize,
         ) -> Result<TableScan> {
-            if self
-                .armed
-                .as_ref()
-                .is_some_and(|a| a.swap(false, Ordering::SeqCst))
-            {
-                let other = self.store.open(&self.name).await?.unwrap();
-                let column = other.schema().field(0).name().clone();
-                other
-                    .set_column_metadata(&column, HashMap::from([("k".into(), "v".into())]))
-                    .await?;
+            if let Some((races, rows)) = &self.race {
+                let race = {
+                    let mut left = races.lock().unwrap();
+                    left.checked_sub(1).map(|n| *left = n).is_some()
+                };
+                if race {
+                    let other = self.store.open(&self.name).await?.unwrap();
+                    match rows {
+                        Some(rows) => other.append(rows.clone()).await?,
+                        None => {
+                            let column = other.schema().field(0).name().clone();
+                            let metadata = HashMap::from([("k".into(), "v".into())]);
+                            other.set_column_metadata(&column, metadata).await?;
+                        }
+                    }
+                }
             }
             self.inner.scan(columns, dnf, batch_size).await
         }
@@ -1621,43 +1690,146 @@ mod tests {
         async fn restore(self: Box<Self>, at: i64) -> Result<bool> {
             self.inner.restore(at).await
         }
+
+        fn version(&self) -> Option<u64> {
+            self.inner.version()
+        }
+
+        fn tag_commits(&mut self, tag: &str) {
+            self.inner.tag_commits(tag)
+        }
+
+        async fn revert(self: Box<Self>, tag: &str, since: u64) -> Result<bool> {
+            self.inner.revert(tag, since).await
+        }
+
+        async fn check_revert(&self, tag: &str, since: u64) -> Result<()> {
+            self.inner.check_revert(tag, since).await
+        }
+    }
+
+    /// `frame(ts)` with a new feature `y`, so that a write commits to the metadata tables too.
+    fn with_y(ts: &[i64]) -> RecordBatch {
+        let batch = frame(ts);
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("y", DataType::Float64, true)));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(Float64Array::from_iter_values(
+            ts.iter().map(|&t| t as f64),
+        )));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    /// The status and error of each row of the transaction log.
+    fn log(lake: &Lake) -> Vec<(String, Option<String>)> {
+        let path = &lake.options.transaction_log_path;
+        let log = block_on(lake.read_batch(path)).unwrap().unwrap();
+        let statuses = string_column(&log, "status").unwrap().into_iter().flatten();
+        statuses
+            .zip(string_column(&log, "error").unwrap())
+            .collect()
+    }
+
+    /// The table of the latest version of each feature.
+    fn tables(lake: &Lake) -> HashMap<String, Option<String>> {
+        let path = &lake.options.feature_metadata_path;
+        let rows = feature_rows(&block_on(lake.read_batch(path)).unwrap().unwrap()).unwrap();
+        latest(&rows)
+            .into_iter()
+            .map(|(name, i)| (name, rows[i].table_addr.clone()))
+            .collect()
     }
 
     #[test]
-    fn a_write_commits_to_each_table_through_the_version_it_read() {
+    fn a_write_commits_to_each_table_through_the_version_it_read_and_runs_again() {
         let defaults = LakeOptions::default();
         for raced in [
             defaults.index_path,
             defaults.feature_metadata_path,
             defaults.table_metadata_path,
         ] {
-            let armed = Arc::new(AtomicBool::new(false));
-            let lake = lake(Arc::new(Racing {
-                inner: MemoryStore::new(),
-                raced: raced.clone(),
-                armed: armed.clone(),
-            }));
+            let (lake, races) = racing(&raced, None);
             lake.add(vec![frame(&[1, 2])], &AddOptions::default())
                 .unwrap();
-            // A new feature, so that the write commits to the metadata tables too.
-            let batch = frame(&[3]);
-            let mut fields = batch.schema().fields().to_vec();
-            fields.push(Arc::new(Field::new("y", DataType::Float64, true)));
-            let mut columns = batch.columns().to_vec();
-            columns.push(Arc::new(Float64Array::from(vec![3.0])));
-            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-            armed.store(true, Ordering::SeqCst);
-            let error = lake.add(vec![batch], &AddOptions::default()).unwrap_err();
-            assert!(!armed.load(Ordering::SeqCst), "{raced} was not read");
-            let conflict = match &error {
-                Error::Write { source, .. } => source.as_ref(),
-                other => other,
-            };
-            assert!(
-                matches!(conflict, Error::Conflict { table } if *table == raced),
-                "{raced}: {error}"
-            );
+            *races.lock().unwrap() = 1;
+            lake.add(vec![with_y(&[3])], &AddOptions::default())
+                .unwrap();
+            assert_eq!(*races.lock().unwrap(), 0, "{raced} was not read");
+            // The first attempt conflicted on the raced table and was rolled back.
+            let log = log(&lake);
+            let statuses: Vec<&str> = log.iter().map(|(s, _)| s.as_str()).collect();
+            let retried = ["pending", "failed", "rolled_back", "pending", "success"];
+            assert_eq!(statuses[2..], retried, "{raced}");
+            let error = log[3].1.as_deref().unwrap();
+            assert!(error.contains(&format!("table {raced} changed")), "{error}");
+            let index = block_on(lake.read_batch(&lake.options.index_path)).unwrap();
+            assert_eq!(index.unwrap().num_rows(), 3, "{raced}");
+            assert!(tables(&lake).contains_key("y"), "{raced}");
         }
+    }
+
+    #[test]
+    fn a_write_that_conflicts_on_every_attempt_returns_the_conflict() {
+        let tm = LakeOptions::default().table_metadata_path;
+        let (lake, races) = racing(&tm, None);
+        lake.add(vec![frame(&[1, 2])], &AddOptions::default())
+            .unwrap();
+        *races.lock().unwrap() = usize::MAX;
+        // A new feature over existing keys, as concurrent writers of different features write.
+        let error = lake
+            .add(vec![with_y(&[1, 2])], &AddOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Conflict { table } if *table == tm),
+            "{error}"
+        );
+        let attempts = ATTEMPTS as usize;
+        assert_eq!(usize::MAX - *races.lock().unwrap(), attempts);
+        let statuses: Vec<String> = log(&lake).into_iter().map(|(s, _)| s).collect();
+        let rolled_back = ["pending", "failed", "rolled_back"].repeat(attempts);
+        assert_eq!(statuses[2..], rolled_back);
+        assert!(!tables(&lake).contains_key("y"));
+    }
+
+    #[test]
+    fn a_consolidation_whose_table_metadata_conflicts_runs_again() {
+        let (lake, races) = racing(&LakeOptions::default().table_metadata_path, None);
+        lake.add(vec![frame(&[1, 2])], &AddOptions::default())
+            .unwrap();
+        lake.add(vec![with_y(&[3])], &AddOptions::default())
+            .unwrap();
+        *races.lock().unwrap() = 1;
+        let addr = lake.consolidate(&["x", "y"]).unwrap().unwrap();
+        assert_eq!(*races.lock().unwrap(), 0);
+        let tables = tables(&lake);
+        for name in ["x", "y"] {
+            assert_eq!(tables[name].as_deref(), Some(addr.as_str()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_runtime_computed_feature_registered_meanwhile_is_not_registered_again() {
+        // Another writer registers `c` as soon as the feature metadata is read.
+        let fm = LakeOptions::default().feature_metadata_path;
+        let schema = lake(Arc::new(MemoryStore::new()))
+            .feature_metadata_schema()
+            .unwrap();
+        let name = Arc::new(StringArray::from(vec!["c"])) as ArrayRef;
+        let row = assemble(&schema, HashMap::from([("feature_name", name)]), 1, &fm).unwrap();
+        let (lake, races) = racing(&fm, Some(row));
+        lake.add(vec![frame(&[1, 2])], &AddOptions::default())
+            .unwrap();
+        *races.lock().unwrap() = 1;
+        let expression = crate::Expression {
+            name: "c".into(),
+            expression: "{}".into(),
+            roots: vec!["x".into()],
+        };
+        let error = lake.add_expressions(&[expression], "me").unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidArgument(m) if m.contains("already registered")),
+            "{error}"
+        );
     }
 
     #[test]
