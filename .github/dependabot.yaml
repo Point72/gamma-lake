@@ -26,9 +26,7 @@ updates:
       - "part: dependencies"
 
   - package-ecosystem: "cargo"
-    directories:
-      - "/"
-      - "/rust"
+    directory: "/"
     schedule:
       interval: "monthly"
     cooldown:
