@@ -222,6 +222,16 @@ def test_error_mapping(lake_path, tmp_path):
         lake.read(["f1"], start="2024-01-02")
 
 
+def test_os_errors_raise_the_matching_os_error_subclass(tmp_path, monkeypatch):
+    fs = GammaFeatureLake(base_path=str(tmp_path / "lake"), memory_limit=1 << 16).initialize()
+    rows = list(itertools.product(range(1, 29), [f"S{i}" for i in range(100)]))
+    fs.add_features(pl.DataFrame({"timestamp": [ts(d) for d, _ in rows], "symbol": [s for _, s in rows], "f": [1.0] * len(rows)}))
+    # The read's sort spills to TMPDIR, which does not exist.
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "missing"))
+    with pytest.raises(FileNotFoundError, match="missing"):
+        fs.read(["f"])
+
+
 @pytest.mark.parametrize(
     "url, store, options",
     [

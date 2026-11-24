@@ -65,15 +65,16 @@ The core stores Arrow types that Delta supports, and converts or rejects the res
 
 A write that loses a race with another writer is rolled back, leaving the tables it created unreferenced, and is run
 again, planned anew from the lake as the other writer left it, up to 10 times in all. Every write commits to the shared
-metadata tables, so writers conflict even when they add different features; the retries let them all succeed, as in
-0.2, but each retry writes the data again. Two writers adding the same new feature both succeed too, but where 0.2
-recorded both as version 0, the one that runs again writes to the feature as any later write would, for example as a
-new version. A write that conflicts on every attempt raises `ConflictError`, and can be run again. A write that fails otherwise is
-rolled back and, as in 0.2, raises the exception it failed with; a note names the step that failed. If the rollback cannot
-undo every commit, because another writer has since rewritten a table, the write raises `PartialWriteError`, which names
-the tables that may hold part of it. Requests the core cannot serve raise `UnsupportedError`. All three are importable from
-`gammalake`. Errors that 0.2 raised from Polars or `deltalake` are now `UnsupportedError`, `ValueError` or
-`RuntimeError`.
+metadata tables, so writers conflict even when they add different features; the retries let them all succeed, as in 0.2,
+but each retry writes the data again. Two writers adding the same new feature both succeed too, but where 0.2 recorded
+both as version 0, the one that runs again writes to the feature as any later write would, for example as a new version.
+A write that conflicts on every attempt raises `ConflictError`, and can be run again. A write that fails otherwise is
+rolled back and, as in 0.2, raises the exception it failed with; a note names the step that failed. If the rollback
+cannot undo every commit, because another writer has since rewritten a table, the write raises `PartialWriteError`,
+which names the tables that may hold part of it. Requests the core cannot serve raise `UnsupportedError`. All three are
+importable from `gammalake`. Errors that 0.2 raised from Polars or `deltalake` are now `UnsupportedError`, `ValueError`
+or `RuntimeError`. I/O failures that come with an operating system error raise the matching `OSError` subclass, such as
+`PermissionError`, instead; others, such as object store errors, raise `RuntimeError`.
 
 The core's threads do not survive `fork`, so a lake constructed or used before a process forks raises `RuntimeError` in
 the child. Start child processes with the `spawn` or `forkserver` method.

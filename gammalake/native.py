@@ -5,9 +5,12 @@ which is built on it, and returns Polars frames. Feature tables are aligned to t
 row position, and writes pad every table so that this alignment holds. As-of and sparse
 features are stored unpadded and joined to the index when read.
 
-Errors raised while a stream is being consumed (for example a failed integrity check
-with ``validate=True``) surface as ``RuntimeError`` from :meth:`NativeLake.read` and as a
-Polars ``ComputeError`` from a collected :meth:`NativeLake.scan`.
+I/O failures that come with an operating system error raise the matching ``OSError``
+subclass, such as ``PermissionError``; other storage and engine errors raise
+``RuntimeError``. Errors raised while a stream is being consumed (for example a
+failed integrity check with ``validate=True``) surface as ``RuntimeError`` from
+:meth:`NativeLake.read` whatever their cause, and errors raised while a
+:meth:`NativeLake.scan` is collected surface as a Polars ``ComputeError``.
 """
 
 from __future__ import annotations
