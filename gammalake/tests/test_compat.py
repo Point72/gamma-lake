@@ -175,6 +175,52 @@ def test_core_maintenance_is_readable_by_the_old_engine(tmp_path):
     lake.agree(["f", "g"])
 
 
+# Feature types the old engine stores as longs, recording their types in the table description.
+TEMPORAL = ["dt_ms", "dt_ns", "dt_ms_tz", "dt_ns_tz", "dur_ms", "dur_us", "dur_ns", "t"]
+
+
+def _temporal(rows, shift: int = 0, zoned: bool = True) -> pl.DataFrame:
+    """``TEMPORAL`` features per key, from nanoseconds that vary with the day and ``shift``.
+
+    The old engine records no time zone for them, so it reads the ``_tz`` ones back naive, in
+    UTC; ``zoned=False`` gives them as it reads them.
+    """
+    ns = pl.Series([(1_704_067_200 + d * 3_600 + shift) * 10**9 + 123_456_789 for d, _ in rows], dtype=pl.Int64)
+    df = frame(rows).with_columns(
+        dt_ms=(ns // 10**6).cast(pl.Datetime("ms")),
+        dt_ns=ns.cast(pl.Datetime("ns")),
+        dt_ms_tz=(ns // 10**6).cast(pl.Datetime("ms")),
+        dt_ns_tz=ns.cast(pl.Datetime("ns")),
+        dur_ms=(ns // 10**6).cast(pl.Duration("ms")),
+        dur_us=(ns // 10**3).cast(pl.Duration("us")),
+        dur_ns=ns.cast(pl.Duration("ns")),
+        t=(ns % (86_400 * 10**9)).cast(pl.Time),
+    )
+    zone = pl.col("dt_ms_tz", "dt_ns_tz").dt.replace_time_zone("UTC").dt.convert_time_zone("America/New_York")
+    return df.with_columns(zone) if zoned else df
+
+
+def test_features_the_old_engine_stores_as_longs_keep_their_types(tmp_path):
+    lake = Engines(tmp_path / "lake")
+    lake.run("old", "initialize")
+    lake.run("old", "add_features", _temporal(keys(range(1, 5), "ab")), owner="compat")
+    assert lake.agree(TEMPORAL).select(TEMPORAL).schema == _temporal([], zoned=False).select(TEMPORAL).schema
+    # The new engine appends, pads, merges, copies and consolidates them; then the old engine appends.
+    lake.run("new", "add_features", _temporal(keys(range(5, 7), "ab"), zoned=False), owner="compat")
+    lake.run("new", "add_features", frame([(3, "c")], g=1), owner="compat")
+    lake.run("new", "add_features", _temporal(keys([2], "ab"), shift=1, zoned=False), owner="compat", overlap_mode="merge")
+    lake.run("new", "add_features", _temporal(keys([4], "ab"), shift=2, zoned=False), owner="compat", overlap_mode="copy")
+    lake.run("new", "consolidate_feature_groups", args=[[*TEMPORAL, "g"]])
+    lake.run("old", "add_features", _temporal(keys([7], "ab"), shift=3), owner="compat")
+    shifts = {2: 1, 4: 2, 7: 3}
+    expected = pl.concat(
+        [_temporal(keys([d], "ab"), shift=shifts.get(d, 0), zoned=False) for d in range(1, 8)] + [frame([(3, "c")], g=1)],
+        how="diagonal",
+    )
+    assert_frame_equal(lake.agree([*TEMPORAL, "g"]), canonical(expected))
+    lake.metadata_agrees()
+
+
 def _file_settings(path: Path, merged: bool) -> tuple:
     """The parquet settings, Arrow schema, row groups and row order of one file.
 

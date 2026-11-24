@@ -1146,7 +1146,9 @@ impl Planner<'_> {
                 }
                 OverlapMode::Copy => {
                     // The copy holds each feature at the supertype of its stored and incoming
-                    // types, as concatenating the two in Polars would.
+                    // types, as concatenating the two in Polars would. A stored type that new
+                    // features are not stored as, such as one 0.2 stored as a long, is kept for
+                    // incoming values of that type.
                     let mut copy_types = HashMap::new();
                     for name in features {
                         let stored = schema
@@ -1160,8 +1162,11 @@ impl Planner<'_> {
                             .field_with_name(name)?
                             .data_type()
                             .clone();
-                        let wide = storage_type(&incoming)
-                            .and_then(|incoming| promote(stored, &incoming))
+                        let wide = promote(stored, &incoming)
+                            .or_else(|| {
+                                storage_type(&incoming)
+                                    .and_then(|incoming| promote(stored, &incoming))
+                            })
                             .ok_or_else(|| {
                                 unsupported(format!(
                                     "copy mode cannot combine feature '{name}' of type {stored} \

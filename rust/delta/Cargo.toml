@@ -13,6 +13,7 @@ keywords = ["feature-store", "delta-lake", "arrow", "datafusion"]
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22"
 deltalake.workspace = true
 futures.workspace = true
 gamma_lake_core.workspace = true

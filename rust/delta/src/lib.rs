@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use deltalake::arrow::array::RecordBatch;
 use deltalake::arrow::compute::cast;
-use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use deltalake::datafusion::catalog::Session;
 use deltalake::datafusion::common::{Column, TableReference};
 use deltalake::datafusion::logical_expr::{cast as cast_expr, Expr};
@@ -34,7 +36,7 @@ use gamma_lake_core::store::{
     TableScan, TableStore,
 };
 use gamma_lake_core::{Dnf, Error, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use url::Url;
 
 /// Options of a [`DeltaStore`]. Build them from their default and set the fields to change,
@@ -81,10 +83,12 @@ fn delta_err(e: DeltaTableError) -> Error {
 }
 
 /// The frame over delta-rs's DataFusion provider that [`StoredTable::scan`] executes, and
-/// the schema of its output.
+/// the schema of its output. `longs` are the columns of `stored_schema` that the table stores
+/// as longs; they are cast to their types in `stored_schema` before `dnf` filters them.
 fn scan_frame(
     provider: Arc<dyn deltalake::datafusion::catalog::TableProvider>,
     stored_schema: SchemaRef,
+    longs: &[String],
     columns: Option<&[String]>,
     dnf: &Dnf,
     batch_size: usize,
@@ -95,6 +99,23 @@ fn scan_frame(
         batch_size.to_string(),
     )])?;
     let mut frame = ctx.read_table(provider)?.alias(relation)?;
+    if !longs.is_empty() {
+        let expressions = frame
+            .schema()
+            .fields()
+            .iter()
+            .map(|source| {
+                let value = column(relation, source.name());
+                match stored_schema.field_with_name(source.name()) {
+                    Ok(field) if longs.contains(field.name()) => {
+                        cast_expr(value, field.data_type().clone()).alias(field.name())
+                    }
+                    _ => value,
+                }
+            })
+            .collect::<Vec<_>>();
+        frame = frame.select(expressions)?.alias(relation)?;
+    }
     if let Some(predicate) = dnf.to_expr(frame.schema().as_arrow(), relation)? {
         frame = frame.filter(predicate)?;
     }
@@ -252,6 +273,11 @@ pub const DEFAULT_TARGET_FILE_SIZE: u64 = 128 * 1024 * 1024;
 /// the delta-rs object store options, such as `AWS_REGION` or `AWS_ENDPOINT_URL`. Credentials
 /// missing from them come from the environment: on S3, the AWS default credential chain,
 /// which reads `AWS_PROFILE` from the process environment and not from `storage_options`.
+///
+/// Delta stores timestamps only in microseconds and has no duration or time types. Tables hold
+/// timestamps in milliseconds or nanoseconds, durations and times as gamma-lake 0.2 did: as
+/// longs, with their types recorded in the table description as its writer, polars-io-tools,
+/// records them. Table schemas and scans have the recorded types, and writes store longs.
 #[derive(Clone)]
 pub struct DeltaStore {
     root: Url,
@@ -421,15 +447,12 @@ impl TableStore for DeltaStore {
             Err(DeltaTableError::NotATable(_)) => return Ok(None),
             Err(e) => return Err(delta_err(e)),
         };
-        let schema = table
-            .snapshot()
-            .map_err(delta_err)?
-            .snapshot()
-            .arrow_schema();
+        let (schema, longs) = table_schema(&table)?;
         Ok(Some(Box::new(DeltaStored {
             name: name.to_string(),
             table,
             schema,
+            longs,
             properties: self.properties.clone(),
             target_file_size: self.target_file_size,
             tag: None,
@@ -447,12 +470,16 @@ impl TableStore for DeltaStore {
             DeltaTable::try_from_url_with_storage_options(url, self.storage_options.clone())
                 .await
                 .map_err(delta_err)?;
+        let (batch, description) = with_longs(as_view_types(batch)?)?;
         let mut write = table
-            .write(vec![as_view_types(batch)?])
+            .write(vec![batch])
             .with_save_mode(SaveMode::ErrorIfExists)
             .with_session_state(delta_session()?)
             .with_writer_properties(self.properties.clone())
             .with_target_file_size(NonZeroU64::new(self.target_file_size));
+        if let Some(description) = description {
+            write = write.with_description(description);
+        }
         if !options.stats_columns.is_empty() {
             write = write.with_configuration([(
                 "delta.dataSkippingStatsColumns",
@@ -503,10 +530,138 @@ fn as_view_types(batch: RecordBatch) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
 }
 
+/// The marks around the record, in a table's description, of the Polars types of the columns
+/// that gamma-lake 0.2 stored as longs: datetimes in `ms` or `ns`, durations and times, which
+/// Delta has no types for. Its writer, polars-io-tools, records them as base64-encoded JSON.
+const RECORD_BEGIN: &str = "[cpl.mapping:begin]";
+const RECORD_END: &str = "[cpl.mapping:end]";
+
+/// The time units of such a record, by name.
+const UNITS: [(TimeUnit, &str); 3] = [
+    (TimeUnit::Millisecond, "Milliseconds"),
+    (TimeUnit::Microsecond, "Microseconds"),
+    (TimeUnit::Nanosecond, "Nanoseconds"),
+];
+
+/// The Arrow types of the columns that a table's `description` records, by name.
+fn recorded_types(description: Option<&str>) -> HashMap<String, DataType> {
+    let record = description
+        .and_then(|d| d.split_once(RECORD_BEGIN))
+        .and_then(|(_, rest)| rest.split_once(RECORD_END))
+        .and_then(|(block, _)| block.trim().lines().next())
+        .and_then(|payload| BASE64.decode(payload.trim()).ok())
+        .and_then(|json| serde_json::from_slice::<Value>(&json).ok());
+    let Some(record) = record else {
+        return HashMap::new();
+    };
+    let unit = |spec: &Value| match spec["unit"].as_str() {
+        // Polars' default unit.
+        None => Some(TimeUnit::Microsecond),
+        Some(name) => UNITS.iter().find(|(_, n)| *n == name).map(|(u, _)| *u),
+    };
+    record["columns"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, spec)| {
+            let data_type = match spec["dtype"].as_str()? {
+                "Datetime" => {
+                    let zone = spec["time_zone"].as_str().filter(|z| !z.is_empty());
+                    DataType::Timestamp(unit(spec)?, zone.map(Into::into))
+                }
+                "Duration" => DataType::Duration(unit(spec)?),
+                "Time" => DataType::Time64(TimeUnit::Nanosecond),
+                _ => return None,
+            };
+            Some((name.clone(), data_type))
+        })
+        .collect()
+}
+
+/// `batch` with each column of a type that gamma-lake 0.2 stored as a long converted to a long,
+/// and the table description that records those types as 0.2 did, or `None` without such a
+/// column.
+fn with_longs(batch: RecordBatch) -> Result<(RecordBatch, Option<String>)> {
+    let unit = |unit: &TimeUnit| UNITS.iter().find(|(u, _)| u == unit).map(|(_, n)| *n);
+    let mut record = serde_json::Map::new();
+    for field in batch.schema().fields() {
+        let spec = match field.data_type() {
+            DataType::Timestamp(u @ (TimeUnit::Millisecond | TimeUnit::Nanosecond), zone) => {
+                json!({"dtype": "Datetime", "unit": unit(u), "time_zone": zone.as_deref()})
+            }
+            DataType::Duration(u) if *u != TimeUnit::Second => {
+                json!({"dtype": "Duration", "unit": unit(u), "time_zone": null})
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                json!({"dtype": "Time", "unit": null, "time_zone": null})
+            }
+            _ => continue,
+        };
+        record.insert(field.name().clone(), spec);
+    }
+    if record.is_empty() {
+        return Ok((batch, None));
+    }
+    let batch = cast_to_longs(batch, |f| record.contains_key(f.name()))?;
+    let record = json!({"version": 1, "columns": record}).to_string();
+    let description = format!("\n{RECORD_BEGIN}\n{}\n{RECORD_END}", BASE64.encode(record));
+    Ok((batch, Some(description)))
+}
+
+/// `batch` with the columns that `long` selects cast to longs.
+fn cast_to_longs(batch: RecordBatch, long: impl Fn(&Field) -> bool) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if long(field) {
+            fields.push(Arc::new(
+                field.as_ref().clone().with_data_type(DataType::Int64),
+            ));
+            columns.push(cast(column, &DataType::Int64)?);
+        } else {
+            fields.push(field.clone());
+            columns.push(column.clone());
+        }
+    }
+    let schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+    Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
+}
+
+/// The schema of `table` that [`StoredTable::schema`] returns: its Arrow schema, with each long
+/// column that its description records a type for given that type, as gamma-lake 0.2 reads it.
+/// Also the names of those columns.
+fn table_schema(table: &DeltaTable) -> Result<(SchemaRef, Vec<String>)> {
+    let snapshot = table.snapshot().map_err(delta_err)?;
+    let schema = snapshot.snapshot().arrow_schema();
+    let recorded = recorded_types(snapshot.metadata().description());
+    let mut longs = vec![];
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match recorded.get(f.name()) {
+            Some(data_type) if *f.data_type() == DataType::Int64 => {
+                longs.push(f.name().clone());
+                f.as_ref().clone().with_data_type(data_type.clone())
+            }
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    if longs.is_empty() {
+        return Ok((schema, longs));
+    }
+    let schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+    Ok((Arc::new(schema), longs))
+}
+
 struct DeltaStored {
     name: String,
     table: DeltaTable,
+    /// The table's Arrow schema, with the types gamma-lake 0.2 recorded for the columns it
+    /// stored as longs.
     schema: SchemaRef,
+    /// Those columns.
+    longs: Vec<String>,
     properties: WriterProperties,
     target_file_size: u64,
     tag: Option<String>,
@@ -516,6 +671,31 @@ impl DeltaStored {
     /// [`strict`] properties marking the commit with [`DeltaStored::tag`].
     fn committing(&self) -> CommitProperties {
         strict(self.tag.as_deref().map(|tag| (TAG, tag)))
+    }
+
+    /// `batch`, whose columns have the types of [`DeltaStored::schema`], with the columns the
+    /// table stores as longs converted to longs.
+    fn to_longs(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.longs.is_empty() {
+            return Ok(batch);
+        }
+        let schema = batch.schema();
+        for field in schema
+            .fields()
+            .iter()
+            .filter(|f| self.longs.contains(f.name()))
+        {
+            let stored = self.schema.field_with_name(field.name())?.data_type();
+            if field.data_type() != stored {
+                return Err(Error::InvalidArgument(format!(
+                    "column {:?} of type {} cannot be written to table {}, which holds {stored}",
+                    field.name(),
+                    field.data_type(),
+                    self.name
+                )));
+            }
+        }
+        cast_to_longs(batch, |f| self.longs.contains(f.name()))
     }
 
     /// Upserts the metadata of each `(column, metadata)` of `updates` into its column's, in one
@@ -574,6 +754,7 @@ impl StoredTable for DeltaStored {
         let (frame, schema) = scan_frame(
             self.table.table_provider().await?,
             self.schema(),
+            &self.longs,
             columns,
             dnf,
             batch_size,
@@ -589,6 +770,7 @@ impl StoredTable for DeltaStored {
     }
 
     async fn append(self: Box<Self>, batch: RecordBatch) -> Result<()> {
+        let batch = self.to_longs(batch)?;
         let committing = self.committing();
         self.table
             .write(vec![as_view_types(batch)?])
@@ -604,6 +786,7 @@ impl StoredTable for DeltaStored {
 
     async fn append_merging(self: Box<Self>, batch: RecordBatch) -> Result<()> {
         extends(&self.schema, batch.schema_ref(), &self.name)?;
+        let batch = self.to_longs(batch)?;
         let committing = self.committing();
         self.table
             .write(vec![as_view_types(batch)?])
@@ -629,6 +812,7 @@ impl StoredTable for DeltaStored {
             .map(|k| column("target", k).eq(column("source", k)))
             .reduce(Expr::and)
             .ok_or_else(|| Error::InvalidArgument("merge needs at least one key".into()))?;
+        let source = self.to_longs(source)?;
         let schema = source.schema();
         // Scans keep plain string and binary types, so merged files record the same Arrow
         // types as files the Python `deltalake` merge writes.
@@ -686,14 +870,11 @@ impl StoredTable for DeltaStored {
             .with_commit_properties(committing)
             .await
             .map_err(|e| commit_err(&self.name, e))?;
-        let schema = table
-            .snapshot()
-            .map_err(delta_err)?
-            .snapshot()
-            .arrow_schema();
+        let (schema, longs) = table_schema(&table)?;
         Ok(Box::new(DeltaStored {
             table,
             schema,
+            longs,
             ..*self
         }))
     }
@@ -1140,7 +1321,8 @@ mod tests {
             }]]);
             for dnf in [Dnf::default(), window] {
                 let provider = table.table_provider().await.unwrap();
-                let (frame, _) = scan_frame(provider, schema.clone(), None, &dnf, 1024).unwrap();
+                let (frame, _) =
+                    scan_frame(provider, schema.clone(), &[], None, &dnf, 1024).unwrap();
                 let plan = frame.create_physical_plan().await.unwrap();
                 let text = displayable(plan.as_ref()).indent(true).to_string();
                 files.push(text.matches(".parquet").count());
@@ -1151,5 +1333,273 @@ mod tests {
                 "window scans {window} files, all scans {all}"
             );
         });
+    }
+
+    /// The description polars-io-tools gives a table whose columns `ms`, `dur`, `t` and `f` hold
+    /// Polars `Datetime("ms")`, `Duration("us")`, `Time` and `Datetime("ns")` values, which
+    /// gamma-lake 0.2 stored as longs.
+    const RECORDED: &str = "\n[cpl.mapping:begin]\neyJ2ZXJzaW9uIjogMSwgImNvbHVtbnMiOiB7Im1zIjogeyJkdHlwZSI6ICJEYXRldGltZSIsICJ1bml0IjogIk1pbGxpc2Vjb25kcyIsICJ0aW1lX3pvbmUiOiBudWxsfSwgImR1ciI6IHsiZHR5cGUiOiAiRHVyYXRpb24iLCAidW5pdCI6ICJNaWNyb3NlY29uZHMiLCAidGltZV96b25lIjogbnVsbH0sICJ0IjogeyJkdHlwZSI6ICJUaW1lIiwgInVuaXQiOiBudWxsLCAidGltZV96b25lIjogbnVsbH0sICJmIjogeyJkdHlwZSI6ICJEYXRldGltZSIsICJ1bml0IjogIk5hbm9zZWNvbmRzIiwgInRpbWVfem9uZSI6IG51bGx9fX0=\n[cpl.mapping:end]";
+
+    /// The rows of `table` that `dnf` selects, sorted by its first column.
+    async fn sorted_rows(table: &dyn StoredTable, dnf: &Dnf) -> Result<RecordBatch> {
+        use deltalake::arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+
+        let scan = table.scan(None, dnf, 1024).await?;
+        let batch = concat_batches(&scan.schema, &scan.stream.try_collect::<Vec<_>>().await?)?;
+        let order = sort_to_indices(batch.column(0), None, None)?;
+        Ok(take_record_batch(&batch, &order)?)
+    }
+
+    #[test]
+    fn long_columns_read_and_write_as_the_types_0_2_recorded() {
+        use deltalake::arrow::array::{
+            ArrayRef, DurationMicrosecondArray, Float64Array, Int64Array, Time64NanosecondArray,
+            TimestampMicrosecondArray, TimestampMillisecondArray,
+        };
+        use gamma_lake_core::{Op, Term};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = DeltaStore::new(dir.path().to_str().unwrap(), DeltaOptions::default()).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("ms", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("dur", DataType::Duration(TimeUnit::Microsecond), true),
+            Field::new("t", DataType::Time64(TimeUnit::Nanosecond), true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let rows = |k: &[i64]| {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(k.to_vec())),
+                Arc::new(TimestampMillisecondArray::from_iter_values(
+                    k.iter().map(|k| k * 1_000),
+                )),
+                Arc::new(DurationMicrosecondArray::from_iter_values(
+                    k.iter().map(|k| k * 10),
+                )),
+                Arc::new(Time64NanosecondArray::from_iter_values(
+                    k.iter().map(|k| k * 100),
+                )),
+                Arc::new(Float64Array::from_iter_values(k.iter().map(|&k| k as f64))),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        // As 0.2 stored them: `f` is not a long, so its record does not apply.
+        let stored = |batch: RecordBatch| {
+            let fields: Vec<Field> = schema
+                .fields()
+                .iter()
+                .map(|f| match f.data_type() {
+                    DataType::Float64 => f.as_ref().clone(),
+                    _ => f.as_ref().clone().with_data_type(DataType::Int64),
+                })
+                .collect();
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(&fields)
+                .map(|(c, f)| cast(c, f.data_type()).unwrap())
+                .collect();
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let term = |column: &str, op, values: ArrayRef| {
+            Dnf(vec![vec![Term {
+                column: column.into(),
+                op,
+                values,
+            }]])
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            std::fs::create_dir_all(dir.path().join("t")).unwrap();
+            let url = store.table_url("t").unwrap();
+            DeltaTable::try_from_url_with_storage_options(url.clone(), HashMap::new())
+                .await
+                .unwrap()
+                .write(vec![stored(rows(&[1, 2, 3]))])
+                .with_description(RECORDED)
+                .await
+                .unwrap();
+            let open = || async { store.open("t").await.unwrap().unwrap() };
+            let table = open().await;
+            let types = |schema: SchemaRef| {
+                let fields = schema.fields().iter();
+                fields.map(|f| f.data_type().clone()).collect::<Vec<_>>()
+            };
+            assert_eq!(types(table.schema()), types(schema.clone()));
+            let read = |dnf: Dnf| async move {
+                let rows = sorted_rows(open().await.as_ref(), &dnf).await?;
+                Ok::<_, Error>(rows.columns().to_vec())
+            };
+            assert_eq!(
+                read(Dnf::default()).await.unwrap(),
+                rows(&[1, 2, 3]).columns()
+            );
+            // Predicates compare literals cast exactly to the recorded types.
+            let after: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![1_000]));
+            let micros = |us| Arc::new(TimestampMicrosecondArray::from(vec![us])) as ArrayRef;
+            let duration: ArrayRef = Arc::new(DurationMicrosecondArray::from(vec![20]));
+            assert_eq!(
+                read(term("ms", Op::Gt, after)).await.unwrap(),
+                rows(&[2, 3]).columns()
+            );
+            assert_eq!(
+                read(term("ms", Op::LtEq, micros(2_000_000))).await.unwrap(),
+                rows(&[1, 2]).columns()
+            );
+            let inexact = read(term("ms", Op::LtEq, micros(2_000_001))).await;
+            assert!(matches!(inexact, Err(Error::InvalidPredicate(_))));
+            assert_eq!(
+                read(term("dur", Op::Eq, duration)).await.unwrap(),
+                rows(&[2]).columns()
+            );
+
+            // Writes store longs, as 0.2 did.
+            open().await.append(rows(&[4])).await.unwrap();
+            let source = RecordBatch::try_new(
+                Arc::new(schema.project(&[0, 2]).unwrap()),
+                vec![
+                    Arc::new(Int64Array::from(vec![2, 5])),
+                    Arc::new(DurationMicrosecondArray::from(vec![99, 50])),
+                ],
+            )
+            .unwrap();
+            let (keys, update) = (["k".to_string()], ["dur".to_string()]);
+            open().await.merge(source, &keys, &update).await.unwrap();
+            let expected: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(1_000),
+                    Some(2_000),
+                    Some(3_000),
+                    Some(4_000),
+                    None,
+                ])),
+                Arc::new(DurationMicrosecondArray::from(vec![10, 99, 30, 40, 50])),
+                Arc::new(Time64NanosecondArray::from(vec![
+                    Some(100),
+                    Some(200),
+                    Some(300),
+                    Some(400),
+                    None,
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    Some(2.0),
+                    Some(3.0),
+                    Some(4.0),
+                    None,
+                ])),
+            ];
+            assert_eq!(read(Dnf::default()).await.unwrap(), expected);
+            let latest = DeltaTableBuilder::from_url(url)
+                .unwrap()
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(table_schema(&latest).unwrap().1, ["ms", "dur", "t"]);
+
+            // Values of another type are not reinterpreted.
+            let mut columns = rows(&[6]).columns().to_vec();
+            columns[1] = cast(
+                &columns[1],
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            )
+            .unwrap();
+            let micro = RecordBatch::try_from_iter(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .zip(columns),
+            )
+            .unwrap();
+            let error = open().await.append(micro).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+
+            let comment = HashMap::from([("comment".to_string(), "x".to_string())]);
+            let annotated = open()
+                .await
+                .set_column_metadata("ms", comment)
+                .await
+                .unwrap();
+            assert_eq!(types(annotated.schema()), types(schema.clone()));
+        });
+    }
+
+    #[test]
+    fn a_lake_keeps_the_types_0_2_recorded_through_writes() {
+        use deltalake::arrow::array::{
+            ArrayRef, DurationMillisecondArray, Float64Array, Int64Array,
+        };
+        use deltalake::arrow::compute::concat_batches;
+        use deltalake::arrow::record_batch::RecordBatchReader;
+        use deltalake::operations::update_table_metadata::TableMetadataUpdate;
+        use gamma_lake_core::{AddOptions, Lake, LakeOptions, OverlapMode};
+
+        // A record of `d` as a Polars `Duration("ms")`, as polars-io-tools writes it.
+        const RECORDED_D: &str = "\n[cpl.mapping:begin]\neyJ2ZXJzaW9uIjogMSwgImNvbHVtbnMiOiB7ImQiOiB7ImR0eXBlIjogIkR1cmF0aW9uIiwgInVuaXQiOiAiTWlsbGlzZWNvbmRzIiwgInRpbWVfem9uZSI6IG51bGx9fX0=\n[cpl.mapping:end]";
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = DeltaStore::new(dir.path().to_str().unwrap(), DeltaOptions::default()).unwrap();
+        let store = Arc::new(store);
+        let mut options = LakeOptions::default();
+        options.primary_sort_key = "k".into();
+        options.validate = true;
+        let index = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let lake = Lake::create_with_store(store.clone(), index, options).unwrap();
+        let add = |k: &[i64], name: &str, values: ArrayRef, overlap_mode| {
+            let keys = Arc::new(Int64Array::from(k.to_vec())) as ArrayRef;
+            let batch = RecordBatch::try_from_iter([("k", keys), (name, values)]).unwrap();
+            let mut options = AddOptions::default();
+            options.overlap_mode = overlap_mode;
+            lake.add(vec![batch], &options).unwrap();
+        };
+        let ms =
+            |values: &[i64]| Arc::new(DurationMillisecondArray::from(values.to_vec())) as ArrayRef;
+        let floats = |values: &[f64]| Arc::new(Float64Array::from(values.to_vec())) as ArrayRef;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let table_of_d = || {
+            let addr = &lake.resolve_latest(&["d"], &[]).unwrap()[0].table_addr;
+            let url = store.table_url(addr).unwrap();
+            runtime.block_on(async { DeltaTableBuilder::from_url(url)?.load().await })
+        };
+
+        // 0.2 stored `d` in milliseconds as a long and recorded its type.
+        add(
+            &[2, 4, 6],
+            "d",
+            Arc::new(Int64Array::from(vec![2_000, 4_000, 6_000])) as ArrayRef,
+            OverlapMode::Copy,
+        );
+        add(&[2, 4, 6], "f", floats(&[2.0, 4.0, 6.0]), OverlapMode::Copy);
+        let update = TableMetadataUpdate {
+            name: None,
+            description: Some(RECORDED_D.into()),
+        };
+        let recording = table_of_d().unwrap().update_table_metadata();
+        runtime
+            .block_on(async { recording.with_update(update).await })
+            .unwrap();
+
+        // Appended, padded, merged, copied and consolidated, `d` stays a duration stored as 0.2
+        // stored it.
+        add(&[8], "d", ms(&[8_000]), OverlapMode::Copy);
+        add(&[3], "f", floats(&[3.0]), OverlapMode::Copy);
+        add(&[4], "d", ms(&[44]), OverlapMode::Merge);
+        add(&[6], "d", ms(&[66]), OverlapMode::Copy);
+        lake.consolidate(&["d", "f"]).unwrap().unwrap();
+        assert_eq!(table_schema(&table_of_d().unwrap()).unwrap().1, ["d"]);
+        let stream = lake.read(&["d"], &[], &Dnf::default()).unwrap();
+        let schema = stream.schema();
+        let batches = stream.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        let read = concat_batches(&schema, &batches).unwrap();
+        let expected = DurationMillisecondArray::from(vec![
+            Some(2_000),
+            None,
+            Some(44),
+            Some(66),
+            Some(8_000),
+        ]);
+        assert_eq!(read.column_by_name("d").unwrap().as_ref(), &expected);
     }
 }

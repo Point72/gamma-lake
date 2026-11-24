@@ -61,6 +61,12 @@ The core stores Arrow types that Delta supports, and converts or rejects the res
 | Feature: categorical or enum               | Stored as string                                                                                                 |
 | Feature written with a new type            | Cast to the stored type; a value the cast would change, such as `3.5` into an integer, raises `UnsupportedError` |
 
+0.2 stored `ns` and `ms` datetime, time and duration features as integers and recorded their types in the Delta table
+description. 0.3 reads them with those types, as 0.2 does, and writes them the same way, including the copies that
+`overlap_mode="copy"` and `consolidate_feature_groups` make, so each version reads what the other wrote. 0.2 recorded no
+time zone, so zoned datetimes it stored this way read back naive, in UTC, in both versions, and writing zoned values to
+them raises `UnsupportedError`.
+
 ## Errors
 
 A write that loses a race with another writer is rolled back, leaving the tables it created unreferenced, and is run
