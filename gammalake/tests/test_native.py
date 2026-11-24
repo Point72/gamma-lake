@@ -291,6 +291,8 @@ def test_validate_reports_misaligned_tables(tmp_path):
         (pl.Datetime("ms"), dt.datetime(2024, 1, 2, 0, 0, 0, 1000), dt.datetime(2024, 1, 2, 0, 0, 0, 1000)),
         (pl.Datetime("us"), np.datetime64("2024-01-02"), dt.datetime(2024, 1, 2)),
         (pl.Datetime("us"), np.datetime64("2024-01-02T00:00:00.000000000"), dt.datetime(2024, 1, 2)),
+        (pl.Datetime("us"), np.datetime64("2024-01-02T00:00:00.000000999"), dt.datetime(2024, 1, 2)),
+        (pl.Datetime("us"), np.datetime64("1969-12-31T23:59:59.999999999"), dt.datetime(1969, 12, 31, 23, 59, 59, 999999)),
         (pl.Date, dt.date(2024, 1, 2), dt.date(2024, 1, 2)),
         (pl.String, "A", "A"),
         (pl.Boolean, np.bool_(True), True),
@@ -310,7 +312,6 @@ def test_coerce_accepts_compatible_literals(dtype, value, expected):
         (pl.Datetime("us"), dt.datetime(2024, 1, 2, tzinfo=dt.UTC)),
         (pl.Datetime("us", "UTC"), dt.datetime(2024, 1, 2, tzinfo=ZoneInfo("America/New_York"))),
         (pl.Datetime("ms"), dt.datetime(2024, 1, 2, 0, 0, 0, 1)),
-        (pl.Datetime("us"), np.datetime64("2024-01-02T00:00:00.000000001")),
         (pl.Date, dt.datetime(2024, 1, 2)),
         (pl.String, 1),
         (pl.Boolean, 1),
@@ -365,6 +366,17 @@ def test_date_and_numpy_bounds_on_a_naive_index(tmp_path):
     for start in (dt.date(2024, 1, 2), np.datetime64("2024-01-02"), np.datetime64("2024-01-02T00:00:00.000000000")):
         assert fs.read(["f"], start=start)["timestamp"].to_list() == [dt.datetime(2024, 1, d) for d in range(2, 5)]
         assert fs.index_frame(start).collect().height == 3
+
+
+def test_sub_microsecond_numpy_bounds_compare_as_polars_compares_them(tmp_path):
+    """0.2 filtered with ``pl.col(primary_sort_key) >= start``, which rounds a finer literal down to the microsecond."""
+    schema = pa.schema([("timestamp", pa.timestamp("us")), ("symbol", pa.string())])
+    fs = GammaFeatureLake(base_path=str(tmp_path)).initialize(ArrowSchema.make(schema))
+    fs.add_features(pl.DataFrame({"timestamp": np.arange(-3, 3).astype("datetime64[us]"), "symbol": ["A"] * 6, "f": range(6)}))
+    everything = fs.read(["f"])
+    for bound in np.array([-1500, -1, 500, 1500], dtype="datetime64[ns]"):
+        assert_frame_equal(fs.read(["f"], start=bound), everything.filter(pl.col("timestamp") >= bound))
+        assert_frame_equal(fs.read(["f"], end=bound), everything.filter(pl.col("timestamp") <= bound))
 
 
 def test_literals_in_another_time_zone_are_unsupported(lake):
