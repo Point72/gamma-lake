@@ -11,7 +11,7 @@
 //! position, so every write keeps this true for every dense table it touches.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{BuildHasher, RandomState};
+use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ use arrow::compute::{cast, concat, concat_batches, take, take_record_batch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, Rows, SortField};
 use arrow::util::display::array_value_to_string;
+use datafusion::common::hash_utils::RandomState;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::admin::Annotation;
@@ -31,7 +32,7 @@ use crate::joined::AsOfParams;
 use crate::lake::{feature_rows, latest, string_column, FeatureRow, Lake, LakeOptions};
 use crate::lock::write_lock;
 use crate::predicate::{lossless_cast, Dnf, Op, Term};
-use crate::runtime::block_on;
+use crate::runtime::{block_on, threads};
 use crate::scan::checked_scan;
 use crate::store::{now_micros, CreateOptions, StoredTable, TableStore};
 
@@ -282,6 +283,156 @@ fn row_count(n: usize) -> Result<u32> {
     })
 }
 
+/// How many parts to split work on `rows` rows into, each done on its own thread: up to
+/// [`threads`], about one per 16384 rows, rounded up to a power of two.
+fn parts(rows: usize) -> usize {
+    threads().min(rows.div_ceil(1 << 14)).next_power_of_two()
+}
+
+/// `f` of each of `inputs`, each on its own thread when there are several. An input whose
+/// thread cannot be started is done on this thread instead.
+fn on_threads<I: Send, T: Send>(inputs: Vec<I>, f: impl Fn(I) -> T + Sync) -> Vec<T> {
+    if inputs.len() < 2 {
+        return inputs.into_iter().map(f).collect();
+    }
+    // A thread takes its input from its slot; one that fails to start leaves it there.
+    let slots: Vec<_> = inputs.into_iter().map(|i| Mutex::new(Some(i))).collect();
+    let take = |slot: &Mutex<Option<I>>| {
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.take().expect("each input is taken once")
+    };
+    std::thread::scope(|scope| {
+        let (f, take) = (&f, &take);
+        let handles: Vec<_> = slots
+            .iter()
+            .map(|slot| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, move || f(take(slot)))
+                    .ok()
+            })
+            .collect();
+        handles
+            .into_iter()
+            .zip(&slots)
+            .map(|(handle, slot)| match handle {
+                Some(h) => h
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                None => f(take(slot)),
+            })
+            .collect()
+    })
+}
+
+/// The rows of `keys` that satisfy `keep`, split by the hash of their key into `groups` groups
+/// (a power of two), so that equal keys share a group. Each group is ascending.
+fn group_by_hash(
+    keys: &Rows,
+    groups: usize,
+    state: &RandomState,
+    keep: impl Fn(usize) -> bool,
+) -> Vec<Vec<u32>> {
+    let rows = (0..keys.num_rows()).filter(|&r| keep(r));
+    if groups == 1 {
+        return vec![rows.map(|r| r as u32).collect()];
+    }
+    let mut grouped = vec![Vec::with_capacity(keys.num_rows() / groups); groups];
+    for r in rows {
+        // Middle bits of the hash: the hash tables of a group index by its low bits and tag
+        // by its top ones.
+        let group = (state.hash_one(keys.row(r).data()) >> 32) as usize & (groups - 1);
+        grouped[group].push(r as u32);
+    }
+    grouped
+}
+
+/// `n` flags, set for `rows`.
+fn flags<'a>(n: usize, rows: impl IntoIterator<Item = &'a u32>) -> Vec<bool> {
+    let mut flags = vec![false; n];
+    for &r in rows {
+        flags[r as usize] = true;
+    }
+    flags
+}
+
+/// Which rows of `keys` satisfy `keep` and hold the first occurrence of their key among those
+/// that do, hashing the keys in `groups` groups.
+fn first_of_each_key(keys: &Rows, groups: usize, keep: impl Fn(usize) -> bool) -> Vec<bool> {
+    let state = RandomState::default();
+    let grouped = group_by_hash(keys, groups, &state, keep);
+    let firsts = on_threads(grouped, |mut rows| {
+        let mut seen = HashSet::with_capacity_and_hasher(rows.len(), state.clone());
+        rows.retain(|&r| seen.insert(keys.row(r as usize).data()));
+        rows
+    });
+    flags(keys.num_rows(), firsts.iter().flatten())
+}
+
+/// Which rows of `index` have their key in `input`, and which rows of `input` have theirs in
+/// `index`, hashing the keys in `groups` groups; `None` when two index rows share a key.
+fn matching_keys(index: &Rows, input: &Rows, groups: usize) -> Option<(Vec<bool>, Vec<bool>)> {
+    let state = RandomState::default();
+    let index_groups = group_by_hash(index, groups, &state, |_| true);
+    let input_groups = group_by_hash(input, groups, &state, |_| true);
+    let grouped = index_groups.into_iter().zip(input_groups).collect();
+    let matches = on_threads(grouped, |(index_rows, input_rows)| {
+        let mut keys = HashMap::with_capacity_and_hasher(index_rows.len(), state.clone());
+        for x in index_rows {
+            if keys.insert(index.row(x as usize).data(), x).is_some() {
+                return None;
+            }
+        }
+        let pairs = input_rows
+            .into_iter()
+            .filter_map(|i| Some((*keys.get(input.row(i as usize).data())?, i)));
+        Some(pairs.collect::<Vec<_>>())
+    });
+    let matches = matches.into_iter().collect::<Option<Vec<_>>>()?;
+    let in_input = flags(index.num_rows(), matches.iter().flatten().map(|(x, _)| x));
+    let in_index = flags(input.num_rows(), matches.iter().flatten().map(|(_, i)| i));
+    Some((in_input, in_index))
+}
+
+/// The order of the rows of `rows` that sorts them, equal rows in input order, sorting up to
+/// `ranges` ranges of rows each on its own thread.
+fn sorted_order(rows: &Rows, ranges: usize) -> Vec<u32> {
+    let row = |&r: &u32| rows.row(r as usize);
+    let n = rows.num_rows();
+    if ranges == 1 || n == 0 {
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by_key(row);
+        return order;
+    }
+    // Rows that split the input into ranges of about equal size, from a sorted sample.
+    let step = (n / (ranges * 64)).max(1);
+    let mut sample: Vec<u32> = (0..n as u32).step_by(step).collect();
+    sample.sort_by_key(row);
+    let bounds: Vec<_> = (1..ranges)
+        .map(|k| row(&sample[k * sample.len() / ranges]))
+        .collect();
+    // Each thread splits a chunk of the rows by range, so that a range gets its rows in
+    // input order.
+    let chunk = n.div_ceil(ranges);
+    let chunks = (0..n)
+        .step_by(chunk)
+        .map(|start| start..n.min(start + chunk));
+    let by_chunk = on_threads(chunks.collect(), |chunk| {
+        let mut split = vec![vec![]; ranges];
+        for r in chunk.map(|r| r as u32) {
+            split[bounds.partition_point(|b| *b <= row(&r))].push(r);
+        }
+        split
+    });
+    let split = (0..ranges)
+        .map(|k| by_chunk.iter().flat_map(|s| &s[k]).copied().collect())
+        .collect();
+    let sorted = on_threads(split, |mut range: Vec<u32>| {
+        range.sort_by_key(row);
+        range
+    });
+    sorted.concat()
+}
+
 /// `batch` sorted by its `keys` columns, ascending with nulls first as reads sort.
 fn sort_by_keys(batch: RecordBatch, keys: &[String]) -> Result<RecordBatch> {
     let columns = keys
@@ -303,8 +454,8 @@ fn sort_by_keys(batch: RecordBatch, keys: &[String]) -> Result<RecordBatch> {
     if (1..rows.num_rows()).all(|i| rows.row(i - 1) <= rows.row(i)) {
         return Ok(batch);
     }
-    let mut order: Vec<u32> = (0..row_count(rows.num_rows())?).collect();
-    order.sort_by_key(|&r| rows.row(r as usize));
+    row_count(rows.num_rows())?;
+    let order = sorted_order(&rows, parts(rows.num_rows()));
     Ok(take_record_batch(&batch, &UInt32Array::from(order))?)
 }
 
@@ -576,7 +727,7 @@ fn backoff(attempt: u32) -> Duration {
         .saturating_mul(2u32.saturating_pow(attempt - 1))
         .min(MAX_BACKOFF);
     // 53 random bits, as a fraction in [0, 1).
-    let random = RandomState::new().hash_one(attempt) >> 11;
+    let random = std::hash::RandomState::new().hash_one(attempt) >> 11;
     longest.mul_f64(random as f64 / (1u64 << 53) as f64)
 }
 
@@ -859,26 +1010,22 @@ impl Lake {
 
         let nkeys = self.sort_keys.len();
         let keys = key_converter.convert_columns(&batch.columns()[..nkeys])?;
-        let mut kept = HashSet::new();
-        let rows: Vec<u32> = (0..row_count(batch.num_rows())?)
-            .filter(|&r| {
-                batch.columns()[..nkeys]
-                    .iter()
-                    .all(|c| c.is_valid(r as usize))
-            })
-            .filter(|&r| kept.insert(keys.row(r as usize)))
-            .collect();
+        let n = row_count(batch.num_rows())?;
+        let valid = |r: usize| batch.columns()[..nkeys].iter().all(|c| c.is_valid(r));
+        let kept = first_of_each_key(&keys, parts(batch.num_rows()), valid);
+        let rows: Vec<u32> = (0..n).filter(|&r| kept[r as usize]).collect();
         if rows.is_empty() {
             return Err(Error::InvalidArgument(
                 "the input has no rows with non-null sort keys".into(),
             ));
         }
-        let batch = if rows.len() == batch.num_rows() {
-            batch
+        let (batch, keys) = if rows.len() == batch.num_rows() {
+            (batch, keys)
         } else {
-            take_record_batch(&batch, &UInt32Array::from(rows))?
+            let batch = take_record_batch(&batch, &UInt32Array::from(rows))?;
+            let keys = key_converter.convert_columns(&batch.columns()[..nkeys])?;
+            (batch, keys)
         };
-        let keys = key_converter.convert_columns(&batch.columns()[..nkeys])?;
         let pk_index = self.index_schema.index_of(&self.options.primary_sort_key)?;
         let pk = pk_converter.convert_columns(&[batch.column(pk_index).clone()])?;
         let rows = 0..pk.num_rows();
@@ -929,16 +1076,16 @@ impl Lake {
             self.read_table(&self.options.table_metadata_path, &all),
         )?;
         let index_keys = key_converter.convert_columns(index_batch.columns())?;
-        let in_index: HashSet<_> = index_keys.iter().collect();
-        let in_input: HashSet<_> = input.keys.iter().collect();
-        if in_index.len() != index_keys.num_rows() {
+        let index_rows = row_count(index_keys.num_rows())?;
+        let groups = parts(index_keys.num_rows().max(input.keys.num_rows()));
+        let Some((in_input, in_index)) = matching_keys(&index_keys, &input.keys, groups) else {
             return Err(integrity(
                 &self.options.index_path,
                 "the index holds duplicate keys",
             ));
-        }
+        };
         let new: Vec<u32> = (0..row_count(input.keys.num_rows())?)
-            .filter(|&r| !in_index.contains(&input.keys.row(r as usize)))
+            .filter(|&r| !in_index[r as usize])
             .collect();
         if let (false, Some(&r)) = (options.allow_new_index_values, new.first()) {
             let key = self
@@ -960,9 +1107,7 @@ impl Lake {
                 key.join(", ")
             )));
         }
-        let missing: Vec<u32> = (0..row_count(index_keys.num_rows())?)
-            .filter(|&r| !in_input.contains(&index_keys.row(r as usize)))
-            .collect();
+        let missing: Vec<u32> = (0..index_rows).filter(|&r| !in_input[r as usize]).collect();
         let pk_index = self.index_schema.index_of(pk_name)?;
         let index_pk = pk_converter.convert_columns(&[index_batch.column(pk_index).clone()])?;
         let planner = Planner {
@@ -1505,6 +1650,56 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn keys_are_hashed_and_sorted_the_same_in_any_number_of_parts() {
+        let converter = RowConverter::new(vec![
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Utf8),
+        ])
+        .unwrap();
+        let rows = |keys: &[(i64, String)]| {
+            let ts = Int64Array::from_iter_values(keys.iter().map(|k| k.0));
+            let sym = StringArray::from_iter_values(keys.iter().map(|k| &k.1));
+            let columns: [ArrayRef; 2] = [Arc::new(ts), Arc::new(sym)];
+            converter.convert_columns(&columns).unwrap()
+        };
+        // Index keys are distinct and out of order; input keys repeat and partly overlap them.
+        let index: Vec<(i64, String)> = (0..300)
+            .map(|i| (i * 7 % 300 / 3, format!("s{}", i * 7 % 3)))
+            .collect();
+        let input: Vec<(i64, String)> = (0..400)
+            .map(|i| (i * 13 % 160 + 50, format!("s{}", i % 2)))
+            .collect();
+        let keep = |r: usize| r % 7 != 3;
+        let mut seen = HashSet::new();
+        let firsts: Vec<bool> = (0..input.len())
+            .map(|r| keep(r) && seen.insert(&input[r]))
+            .collect();
+        let in_input: Vec<bool> = index.iter().map(|k| input.contains(k)).collect();
+        let in_index: Vec<bool> = input.iter().map(|k| index.contains(k)).collect();
+        assert!(in_input.contains(&true) && in_input.contains(&false));
+        assert!(in_index.contains(&true) && in_index.contains(&false));
+        let kept = (0..input.len()).filter(|&r| keep(r)).count();
+        assert!(firsts.iter().filter(|&&f| f).count() < kept);
+
+        let mut doubled = index.clone();
+        doubled.push(index[150].clone());
+        let (index, input, doubled) = (rows(&index), rows(&input), rows(&doubled));
+        let mut order: Vec<u32> = (0..input.num_rows() as u32).collect();
+        order.sort_by_key(|&r| input.row(r as usize));
+        for groups in [1, 2, 8, 64] {
+            assert_eq!(first_of_each_key(&input, groups, keep), firsts, "{groups}");
+            assert_eq!(
+                matching_keys(&index, &input, groups),
+                Some((in_input.clone(), in_index.clone())),
+                "{groups}"
+            );
+            assert_eq!(matching_keys(&doubled, &input, groups), None, "{groups}");
+            // Equal rows keep their input order.
+            assert_eq!(sorted_order(&input, groups), order, "{groups}");
+        }
+    }
+
     fn frame(ts: &[i64]) -> RecordBatch {
         let schema = Schema::new(vec![
             Field::new("ts", DataType::Int64, true),
@@ -1579,6 +1774,32 @@ mod tests {
         assert_eq!(committed.len(), 1);
         assert!(matches!(*source, Error::Conflict { .. }), "{source}");
         assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn a_write_over_an_index_with_duplicate_keys_fails() {
+        let store = Arc::new(MemoryStore::new());
+        let lake = lake(store.clone());
+        lake.add(vec![frame(&[1, 2])], &AddOptions::default())
+            .unwrap();
+        block_on(async {
+            let index = store.open(&lake.options.index_path).await.unwrap().unwrap();
+            index
+                .append(frame(&[1]).project(&[0, 1]).unwrap())
+                .await
+                .unwrap();
+        })
+        .unwrap();
+        // Whether or not the input holds the repeated key.
+        for ts in [1, 3] {
+            let error = lake
+                .add(vec![frame(&[ts])], &AddOptions::default())
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::Integrity { kind, .. } if kind == "the index holds duplicate keys"),
+                "{error}"
+            );
+        }
     }
 
     /// A store in which another writer commits to table `raced` as soon as a write reads it,

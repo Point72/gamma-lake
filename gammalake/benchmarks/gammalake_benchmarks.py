@@ -306,6 +306,50 @@ class GammaLakeOverlapWriteSuite:
         return 0
 
 
+class GammaLakeFeatureGroupWriteSuite:
+    """Benchmark ``add_features`` adding a new feature group over every key of a large index."""
+
+    number = 1
+    repeat = 5
+    rounds = 1
+    timeout = 600
+    warmup_time = 0
+
+    N_TIMESTAMPS = 1000
+    N_SYMBOLS = 1000
+    N_FEATURES = 4
+
+    @classmethod
+    def _group(cls, name: str) -> pl.DataFrame:
+        timestamps = pl.datetime_range(_ORIGIN, _ORIGIN + timedelta(minutes=cls.N_TIMESTAMPS - 1), "1m", time_unit="us", time_zone="UTC", eager=True)
+        symbols = pl.DataFrame({"symbol": [f"SYM_{i:04d}" for i in range(cls.N_SYMBOLS)]})
+        keys = pl.DataFrame({"timestamp": timestamps}).join(symbols, how="cross")
+        rng = np.random.default_rng(0)
+        return keys.with_columns(pl.Series(f"{name}_feat_{feature}", rng.standard_normal(keys.height)) for feature in range(cls.N_FEATURES))
+
+    @classmethod
+    def setup_cache(cls) -> dict[str, str]:
+        storage_path = _new_run_path("write")
+        try:
+            GammaFeatureLake(base_path=storage_path).initialize().add_features(cls._group("base"), owner="benchmark")
+        except Exception:
+            _delete_generated_path(storage_path)
+            raise
+        return {"storage_path": storage_path}
+
+    def setup(self, cache: dict[str, str]) -> None:
+        self._lake = GammaFeatureLake(base_path=cache["storage_path"])
+        # Every sample adds features new to the lake.
+        self._frame = self._group(f"g{uuid.uuid4().hex[:8]}")
+
+    def time_add_feature_group(self, _cache: dict[str, str]) -> None:
+        self._lake.add_features(self._frame, owner="benchmark")
+
+    def track_zz_cleanup(self, cache: dict[str, str]) -> int:
+        _delete_generated_path(cache["storage_path"])
+        return 0
+
+
 class GammaLakeReadSuite:
     """Benchmark reads over multiple time windows and feature-group counts."""
 

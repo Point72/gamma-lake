@@ -93,6 +93,7 @@ read once per process, at the first lake call. It sets:
 - the number of worker threads of the core's tokio runtime;
 - how many sorts and other CPU-bound tasks run at once;
 - DataFusion's `target_partitions` for reads, writes and merges;
+- how many threads a write hashes and sorts keys on;
 - how many column groups a wide feature table is split into for reading.
 
 When it is unset, empty or not a positive integer, the core uses the number of CPUs available to the process. It is a
