@@ -379,6 +379,12 @@ def test_sub_microsecond_numpy_bounds_compare_as_polars_compares_them(tmp_path):
         assert_frame_equal(fs.read(["f"], end=bound), everything.filter(pl.col("timestamp") <= bound))
 
 
+def test_sub_microsecond_numpy_bounds_are_exact_on_a_nanosecond_column():
+    """A sort key of an existing lake can read as ``Datetime("ns")``, which compares a nanosecond literal exactly."""
+    bound = np.datetime64("2024-01-02T00:00:00.000000999", "ns")
+    assert gammalake.native._encode("x", pl.Datetime("ns"), [bound]).cast(pa.int64()).to_pylist() == [bound.astype(np.int64)]
+
+
 def test_literals_in_another_time_zone_are_unsupported(lake):
     start = dt.datetime(2024, 1, 2, tzinfo=ZoneInfo("America/New_York"))
     for read in (lambda: NativeLake(lake.base_path).read(["f1"], start=start), lambda: lake.read(["f1"], start=start)):

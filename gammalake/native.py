@@ -125,6 +125,9 @@ class PartialWriteError(RuntimeError):
 def _coerce(column: str, dtype: pl.DataType, value: Any) -> Any:
     """``value`` as a Python object of ``dtype``, compared as Polars would compare it."""
     if isinstance(value, np.datetime64) and np.datetime_data(value.dtype)[0] in ("ns", "ps", "fs", "as"):
+        if isinstance(dtype, pl.Datetime) and dtype.time_unit == "ns" and dtype.time_zone is None:
+            # Nanoseconds since the epoch, which a nanosecond column compares exactly.
+            return int(value.astype("datetime64[ns]").astype(np.int64))
         # ``item`` gives an int for units finer than Python's microseconds. Round down to whole
         # microseconds, as Polars, and so 0.2, compares such a literal with a microsecond column.
         value = value.astype("datetime64[us]")
