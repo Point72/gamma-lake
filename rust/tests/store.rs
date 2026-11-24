@@ -146,14 +146,10 @@ fn an_opened_table_keeps_its_version() {
 fn merge_updates_matched_columns_and_inserts_the_rest() {
     for (_dir, store) in stores() {
         let result = runtime().block_on(async {
+            let mut options = CreateOptions::default();
+            options.stats_columns = vec!["k".into()];
             store
-                .create(
-                    "t",
-                    batch(&[1, 2], &[1.0, 2.0], &[10.0, 20.0]),
-                    &CreateOptions {
-                        stats_columns: vec!["k".into()],
-                    },
-                )
+                .create("t", batch(&[1, 2], &[1.0, 2.0], &[10.0, 20.0]), &options)
                 .await
                 .unwrap();
             let table = store.open("t").await.unwrap().unwrap();
@@ -317,10 +313,8 @@ fn delta_store_locations_and_secrets() {
         "{err}"
     );
 
-    let secret = DeltaOptions {
-        storage_options: HashMap::from([("AWS_SECRET_ACCESS_KEY".into(), "hunter2".into())]),
-        ..Default::default()
-    };
+    let mut secret = DeltaOptions::default();
+    secret.storage_options = HashMap::from([("AWS_SECRET_ACCESS_KEY".into(), "hunter2".into())]);
     let store = DeltaStore::new("s3://bucket/lake", secret).unwrap();
     assert_eq!(store.location(), "s3://bucket/lake/");
     assert!(!format!("{store:?}").contains("hunter2"));

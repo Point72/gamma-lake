@@ -29,8 +29,10 @@ pub struct TableScan {
     pub stream: TableStream,
 }
 
-/// Options of [`TableStore::create`].
+/// Options of [`TableStore::create`]. Build them from their default and set the fields to
+/// change, as for [`LakeOptions`](crate::LakeOptions).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct CreateOptions {
     /// Columns to collect file statistics on for data skipping. Empty means the store's
     /// default.

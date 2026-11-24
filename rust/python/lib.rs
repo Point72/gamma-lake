@@ -412,24 +412,24 @@ impl Lake {
         transaction_log_path: Option<String>,
     ) -> PyResult<Self> {
         let index_schema = index_schema.as_ref().map(import_schema).transpose()?;
-        let defaults = LakeOptions::default();
-        let options = LakeOptions {
-            primary_sort_key: primary_sort_key.unwrap_or(defaults.primary_sort_key),
-            index_path: index_path.unwrap_or(defaults.index_path),
-            feature_metadata_path: feature_metadata_path.unwrap_or(defaults.feature_metadata_path),
-            table_metadata_path: table_metadata_path.unwrap_or(defaults.table_metadata_path),
-            batch_size: batch_size.unwrap_or(defaults.batch_size),
-            validate,
-            table_name_prefix: table_name_prefix.unwrap_or(defaults.table_name_prefix),
-            lock: lock.map(|factory| Arc::new(PyLock { factory }) as Arc<dyn TableLock>),
-            memory_limit,
-            transaction_log_path: transaction_log_path.unwrap_or(defaults.transaction_log_path),
-        };
-        let delta = delta_options.map_or_else(DeltaOptions::default, |o| DeltaOptions {
-            compression: o.compression,
-            target_file_size: o.target_file_size,
-            storage_options: o.storage_options,
-        });
+        let mut options = LakeOptions::default();
+        options.primary_sort_key = primary_sort_key.unwrap_or(options.primary_sort_key);
+        options.index_path = index_path.unwrap_or(options.index_path);
+        options.feature_metadata_path =
+            feature_metadata_path.unwrap_or(options.feature_metadata_path);
+        options.table_metadata_path = table_metadata_path.unwrap_or(options.table_metadata_path);
+        options.batch_size = batch_size.unwrap_or(options.batch_size);
+        options.validate = validate;
+        options.table_name_prefix = table_name_prefix.unwrap_or(options.table_name_prefix);
+        options.lock = lock.map(|factory| Arc::new(PyLock { factory }) as Arc<dyn TableLock>);
+        options.memory_limit = memory_limit;
+        options.transaction_log_path = transaction_log_path.unwrap_or(options.transaction_log_path);
+        let mut delta = DeltaOptions::default();
+        if let Some(o) = delta_options {
+            delta.compression = o.compression;
+            delta.target_file_size = o.target_file_size;
+            delta.storage_options = o.storage_options;
+        }
         let inner = py
             .detach(|| {
                 let store = DeltaStore::new(&base_path, delta)?;
@@ -465,11 +465,9 @@ impl Lake {
         annotations: Option<Vec<AnnotationRow>>,
         allow_new_index_values: bool,
     ) -> PyResult<()> {
-        let mut options = AddOptions {
-            annotations: annotations.into_iter().flatten().map(annotation).collect(),
-            allow_new_index_values,
-            ..Default::default()
-        };
+        let mut options = AddOptions::default();
+        options.annotations = annotations.into_iter().flatten().map(annotation).collect();
+        options.allow_new_index_values = allow_new_index_values;
         if let Some(owner) = owner {
             options.owner = owner;
         }

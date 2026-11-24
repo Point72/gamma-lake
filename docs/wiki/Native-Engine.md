@@ -127,8 +127,10 @@ batch fails the read with a resources-exhausted error; for features with long st
 
 `DeltaStore::new(base, DeltaOptions)` configures the default Delta backend. Pass that store with `LakeOptions` to
 `gamma_lake::open` or `gamma_lake::create`. The crate also exposes `AddOptions` and the predicate types `Dnf`, `Term`
-and `Op`. Reads return a `BatchStream`, which implements Arrow's `RecordBatchReader`. Run
-`cargo doc --open` in `rust/` for the API documentation and an example.
+and `Op`. Reads return a `BatchStream`, which implements Arrow's `RecordBatchReader`. The option structs and the
+`Error`, `Op`, `OverlapMode` and `SignalType` enums are `#[non_exhaustive]`: build options from their default and set
+the fields to change, and match the enums with a wildcard arm. Run `cargo doc --open` in `rust/` for the API
+documentation and an example.
 
 The Rust code is split into three crates in one Cargo workspace:
 

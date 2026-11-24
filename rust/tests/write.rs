@@ -29,11 +29,10 @@ use tempfile::TempDir;
 type Key = (i64, String);
 
 fn options() -> LakeOptions {
-    LakeOptions {
-        primary_sort_key: "ts".into(),
-        validate: true,
-        ..Default::default()
-    }
+    let mut options = LakeOptions::default();
+    options.primary_sort_key = "ts".into();
+    options.validate = true;
+    options
 }
 
 fn create() -> (TempDir, Lake) {
@@ -215,14 +214,9 @@ fn memory_limit_reads_batches_that_fit_its_share() {
         OverlapMode::Copy,
     );
     // A batch of the default size takes several times a scan's share of the limit.
-    let bounded = open_delta(
-        dir.path().to_str().unwrap(),
-        LakeOptions {
-            memory_limit: Some(256 << 10),
-            ..options()
-        },
-    )
-    .unwrap();
+    let mut bounded = options();
+    bounded.memory_limit = Some(256 << 10);
+    let bounded = open_delta(dir.path().to_str().unwrap(), bounded).unwrap();
     assert_eq!(read(&bounded, "f2"), read(&lake, "f2"));
 }
 
@@ -542,14 +536,10 @@ fn input_is_cleaned_and_validated() {
     .unwrap();
     let err = lake.add_index_rows(vec![floats]).unwrap_err();
     assert!(matches!(err, Error::UnsupportedInput(_)), "{err}");
+    let mut options = AddOptions::default();
+    options.feature_params = Some("[1]".into());
     let err = lake
-        .add(
-            vec![frame(&[(1, "a")], &[("f", 1.0)])],
-            &AddOptions {
-                feature_params: Some("[1]".into()),
-                ..Default::default()
-            },
-        )
+        .add(vec![frame(&[(1, "a")], &[("f", 1.0)])], &options)
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
 }
@@ -593,10 +583,8 @@ fn new_index_values_can_be_disallowed() {
         OverlapMode::Copy,
     );
     let before = commits(dir.path());
-    let options = AddOptions {
-        allow_new_index_values: false,
-        ..Default::default()
-    };
+    let mut options = AddOptions::default();
+    options.allow_new_index_values = false;
     let err = error(lake.add(
         vec![frame(&[(2, "a"), (2, "c"), (4, "a")], &[("g", 1.0)])],
         &options,
@@ -620,23 +608,17 @@ fn new_index_values_can_be_disallowed() {
 #[test]
 fn targets_and_metadata_options_are_recorded() {
     let (dir, lake) = create();
-    let options = AddOptions {
-        owner: "me".into(),
-        signal_type: SignalType::Target,
-        overlap_mode: OverlapMode::Copy,
-        feature_params: Some("{\"w\": 1}".into()),
-        ..Default::default()
-    };
+    let mut options = AddOptions::default();
+    options.owner = "me".into();
+    options.signal_type = SignalType::Target;
+    options.overlap_mode = OverlapMode::Copy;
+    options.feature_params = Some("{\"w\": 1}".into());
     lake.add(vec![frame(&keys(1..=2, &["a"]), &[("y", 1.0)])], &options)
         .unwrap();
-    lake.add(
-        vec![frame(&keys(1..=1, &["a"]), &[("y", 5.0)])],
-        &AddOptions {
-            signal_type: SignalType::Target,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut target = AddOptions::default();
+    target.signal_type = SignalType::Target;
+    lake.add(vec![frame(&keys(1..=1, &["a"]), &[("y", 5.0)])], &target)
+        .unwrap();
     check_invariant(dir.path());
     let fm = feature_metadata(&lake);
     assert_eq!(fm[0].3, "target");
@@ -848,11 +830,9 @@ fn reads_do_not_depend_on_the_order_scans_return_rows_in() {
 }
 
 fn add_joined(lake: &Lake, batch: RecordBatch, signal_type: SignalType, params: Option<&str>) {
-    let options = AddOptions {
-        signal_type,
-        feature_params: params.map(str::to_string),
-        ..Default::default()
-    };
+    let mut options = AddOptions::default();
+    options.signal_type = signal_type;
+    options.feature_params = params.map(str::to_string);
     lake.add(vec![batch], &options).unwrap();
 }
 
@@ -1114,10 +1094,8 @@ fn addr_of(lake: &Lake, name: &str) -> String {
 #[test]
 fn annotations_belong_to_feature_versions() {
     let (dir, lake) = create();
-    let options = AddOptions {
-        annotations: vec![note("f", None, Some("first f"), Some(&["raw"]))],
-        ..Default::default()
-    };
+    let mut options = AddOptions::default();
+    options.annotations = vec![note("f", None, Some("first f"), Some(&["raw"]))];
     lake.add(
         vec![frame(&keys(1..=3, &["a"]), &[("f", 1.0), ("g", 2.0)])],
         &options,
@@ -1220,10 +1198,8 @@ fn bad_annotations_store_nothing() {
         note("g", None, Some("x"), None),
         note("f", Some(&addr), Some("x"), None),
     ] {
-        let options = AddOptions {
-            annotations: vec![annotation],
-            ..Default::default()
-        };
+        let mut options = AddOptions::default();
+        options.annotations = vec![annotation];
         let input = vec![frame(&keys(3..=3, &["a"]), &[("f", 1.0)])];
         assert!(matches!(
             error(lake.add(input, &options)),
@@ -1421,10 +1397,8 @@ fn runtime_computed_features_are_registered_and_not_read() {
 }
 
 fn memory_lake(primary_sort_key: &str) -> Lake {
-    let options = LakeOptions {
-        primary_sort_key: primary_sort_key.into(),
-        ..options()
-    };
+    let mut options = options();
+    options.primary_sort_key = primary_sort_key.into();
     Lake::create_with_store(Arc::new(MemoryStore::new()), index_schema(), options).unwrap()
 }
 
@@ -1551,10 +1525,8 @@ fn floating_point_sort_keys_are_rejected() {
     let x = Field::new("x", DataType::Float64, true);
     // A floating point primary sort key, then a floating point secondary one.
     for (fields, primary_sort_key) in [([ts.clone(), x.clone()], "x"), ([x, ts], "ts")] {
-        let options = LakeOptions {
-            primary_sort_key: primary_sort_key.into(),
-            ..options()
-        };
+        let mut options = options();
+        options.primary_sort_key = primary_sort_key.into();
         let schema = Arc::new(Schema::new(fields.to_vec()));
         let err = error(Lake::create_with_store(
             Arc::new(MemoryStore::new()),
@@ -1574,11 +1546,9 @@ fn as_of_parameters_are_checked_before_writing() {
         (r#"{"strategy": "sideways"}"#, true),
         (r#"{"by": "sym"}"#, false),
     ] {
-        let options = AddOptions {
-            signal_type: SignalType::AsOf,
-            feature_params: Some(params.into()),
-            ..Default::default()
-        };
+        let mut options = AddOptions::default();
+        options.signal_type = SignalType::AsOf;
+        options.feature_params = Some(params.into());
         let err = error(lake.add(vec![batch()], &options));
         assert_eq!(
             matches!(err, Error::InvalidArgument(_)),
@@ -1596,12 +1566,8 @@ fn as_of_parameters_are_checked_before_writing() {
 
     // A string primary key cannot be matched as of, whatever the parameters.
     let lake = memory_lake("sym");
-    let err = error(lake.add(
-        vec![batch()],
-        &AddOptions {
-            signal_type: SignalType::AsOf,
-            ..Default::default()
-        },
-    ));
+    let mut options = AddOptions::default();
+    options.signal_type = SignalType::AsOf;
+    let err = error(lake.add(vec![batch()], &options));
     assert!(matches!(err, Error::UnsupportedInput(_)), "{err}");
 }

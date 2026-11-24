@@ -80,11 +80,10 @@ fn rows(ts: impl IntoIterator<Item = i64>) -> RecordBatch {
 }
 
 fn options(lock: &Arc<RecordingLock>) -> LakeOptions {
-    LakeOptions {
-        primary_sort_key: "ts".into(),
-        lock: Some(Arc::new(Shared(lock.clone()))),
-        ..Default::default()
-    }
+    let mut options = LakeOptions::default();
+    options.primary_sort_key = "ts".into();
+    options.lock = Some(Arc::new(Shared(lock.clone())));
+    options
 }
 
 /// A Delta lake (`delta`) or an in-memory lake, with its store.

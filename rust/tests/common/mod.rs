@@ -56,10 +56,8 @@ pub fn keys(ts: impl IntoIterator<Item = i64>, syms: &[&'static str]) -> Vec<(i6
 }
 
 pub fn add(lake: &Lake, batch: RecordBatch, overlap_mode: OverlapMode) {
-    let options = AddOptions {
-        overlap_mode,
-        ..Default::default()
-    };
+    let mut options = AddOptions::default();
+    options.overlap_mode = overlap_mode;
     lake.add(vec![batch], &options).unwrap();
 }
 

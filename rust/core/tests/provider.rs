@@ -43,11 +43,9 @@ fn keys(ts: impl IntoIterator<Item = i64>) -> Vec<(i64, &'static str)> {
 }
 
 fn add(lake: &Lake, batch: RecordBatch, signal_type: SignalType, params: Option<&str>) {
-    let options = AddOptions {
-        signal_type,
-        feature_params: params.map(str::to_string),
-        ..Default::default()
-    };
+    let mut options = AddOptions::default();
+    options.signal_type = signal_type;
+    options.feature_params = params.map(str::to_string);
     lake.add(vec![batch], &options).unwrap();
 }
 
@@ -58,12 +56,10 @@ fn lake(validate: bool) -> Lake {
         Field::new("ts", DataType::Int64, true),
         Field::new("sym", DataType::Utf8, true),
     ]);
-    let options = LakeOptions {
-        primary_sort_key: "ts".into(),
-        validate,
-        batch_size: 3,
-        ..Default::default()
-    };
+    let mut options = LakeOptions::default();
+    options.primary_sort_key = "ts".into();
+    options.validate = validate;
+    options.batch_size = 3;
     let lake =
         Lake::create_with_store(Arc::new(MemoryStore::new()), Arc::new(index), options).unwrap();
     let dense = SignalType::Feature;
@@ -251,10 +247,8 @@ fn the_table_reads_its_versions_with_their_current_contents() {
     );
     assert_eq!(totals(&ctx), (56.0, 14));
     // A merge-mode overwrite also writes the same table.
-    let merge = AddOptions {
-        overlap_mode: OverlapMode::Merge,
-        ..Default::default()
-    };
+    let mut merge = AddOptions::default();
+    merge.overlap_mode = OverlapMode::Merge;
     lake.add(vec![frame(&keys(1..=1), &[("f", 101.0)])], &merge)
         .unwrap();
     assert_eq!(totals(&ctx), (256.0, 14));

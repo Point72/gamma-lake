@@ -224,12 +224,10 @@ fn queries_match_reference() {
         (true, 2, None),
         (true, 2, Some(1 << 20)),
     ] {
-        let options = LakeOptions {
-            validate,
-            batch_size,
-            memory_limit,
-            ..Default::default()
-        };
+        let mut options = LakeOptions::default();
+        options.validate = validate;
+        options.batch_size = batch_size;
+        options.memory_limit = memory_limit;
         let context =
             format!("validate {validate}, batch size {batch_size}, memory limit {memory_limit:?}");
         check_all(&queries, &options, &context);
@@ -283,13 +281,9 @@ fn memory_limit_too_small_for_a_batch_fails_the_read() {
         .into_iter()
         .find(|q| q["name"] == "basic_all")
         .unwrap();
-    let lake = open_with(
-        "basic",
-        LakeOptions {
-            memory_limit: Some(1),
-            ..Default::default()
-        },
-    );
+    let mut options = LakeOptions::default();
+    options.memory_limit = Some(1);
+    let lake = open_with("basic", options);
     let error = run(&lake, &query)
         .map_err(|e| e.to_string())
         .and_then(try_collect)
@@ -353,30 +347,24 @@ fn rejects_unknown_schemes_bad_addresses_and_unknown_primary_key() {
     assert!(matches!(err, Error::NotInitialized(_)), "{err}");
     let path = lake_path("basic");
     for index_path in ["../basic/index", "/index", "", "ind%65x"] {
-        let options = LakeOptions {
-            index_path: index_path.into(),
-            ..Default::default()
-        };
+        let mut options = LakeOptions::default();
+        options.index_path = index_path.into();
         let err = open_delta(path.to_str().unwrap(), options).unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "{index_path}: {err}"
         );
     }
-    let options = LakeOptions {
-        primary_sort_key: "nope".into(),
-        ..Default::default()
-    };
+    let mut options = LakeOptions::default();
+    options.primary_sort_key = "nope".into();
     let err = open_delta(path.to_str().unwrap(), options).unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
 }
 
 #[test]
 fn small_batches_and_stream_outlives_lake() {
-    let options = LakeOptions {
-        batch_size: 3,
-        ..Default::default()
-    };
+    let mut options = LakeOptions::default();
+    options.batch_size = 3;
     let lake = open_with("basic", options.clone());
     let stream = lake
         .read(&["f1", "f2", "f3", "f4"], &["t1"], &Dnf::default())

@@ -3,6 +3,7 @@ use datafusion::error::DataFusionError;
 
 /// Errors returned by the gamma-lake core.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("lake at {0} is not initialized: a required index or metadata table is missing")]
     NotInitialized(String),

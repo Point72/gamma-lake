@@ -3,6 +3,7 @@
 ## Unreleased
 * [feature] Read and write lakes through a Rust core; `gammalake.native.NativeLake` exposes it directly to Python.
 * [feature] The `gamma_lake` Rust crate exposes the core: `Lake` reads and writes lakes over any `TableStore` backend, and `Lake::read_async` reads without blocking.
+* [feature] The Rust `Error`, `Op`, `OverlapMode` and `SignalType` enums and the option structs (`LakeOptions`, `AddOptions`, `CreateOptions`, `DeltaOptions`) are `#[non_exhaustive]`.
 * [breaking] `GammaFeatureLake` always uses the Rust core. The `run_on_ray_cluster` and `io` fields are removed, along with the `switch`, `wait` and `get` methods, `gammalake.io`, `gammalake.metadata`, `RayObjectReference`, the Python write-path functions (`align_feature_tables`, `update_feature_tables`, `update_index`, `write_metadata`) and the `ray` extra. See [Migrating from 0.2](https://github.com/Point72/gamma-lake/wiki/Migrating-from-0.2).
 * [breaking] `add_*` methods return `None`, accept only Polars DataFrames and no longer take `metadata`; writes go to the latest version of each feature. Their third positional argument is now `overlap_mode`.
 * [breaking] `GammaFeatureLake.model_copy(update=...)` validates the update. `DEFAULT_INDEX_SCHEMA` is removed; `initialize()` without a schema uses the same default.

@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 
 /// Comparison operator of a [`Term`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Op {
     Eq,
     NotEq,

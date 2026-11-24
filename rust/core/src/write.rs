@@ -37,6 +37,7 @@ use crate::store::{now_micros, CreateOptions, StoredTable, TableStore};
 
 /// Signal type of written columns.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SignalType {
     #[default]
     Feature,
@@ -76,6 +77,7 @@ impl SignalType {
 
 /// How [`Lake::add`] writes features whose table already covers some of the input keys.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum OverlapMode {
     /// Write the features to a new table and keep the old one unchanged.
     #[default]
@@ -84,8 +86,10 @@ pub enum OverlapMode {
     Merge,
 }
 
-/// Options of [`Lake::add`].
+/// Options of [`Lake::add`]. Build them from their default and set the fields to change,
+/// as for [`LakeOptions`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct AddOptions {
     pub owner: String,
     pub signal_type: SignalType,

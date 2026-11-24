@@ -37,8 +37,10 @@ use gamma_lake_core::{Dnf, Error, Result};
 use serde_json::Value;
 use url::Url;
 
-/// Options of a [`DeltaStore`].
+/// Options of a [`DeltaStore`]. Build them from their default and set the fields to change,
+/// as for [`LakeOptions`](gamma_lake_core::LakeOptions).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct DeltaOptions {
     /// Parquet compression of written files: `uncompressed`, `snappy`, `gzip`, `brotli`,
     /// `lz4`, `lz4_raw` or `zstd`, case-insensitive.

@@ -32,7 +32,17 @@ use crate::write::SignalType;
 const INDEX: &str = "idx";
 
 /// Options for [`Lake::open_with_store`].
+///
+/// Later versions may add fields, so build the options from their default and set the
+/// fields to change:
+///
+/// ```
+/// let mut options = gamma_lake_core::LakeOptions::default();
+/// options.primary_sort_key = "ts".into();
+/// options.validate = true;
+/// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct LakeOptions {
     pub primary_sort_key: String,
     pub index_path: String,
