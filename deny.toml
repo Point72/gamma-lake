@@ -1,0 +1,9 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is a build-time dependency of deltalake with no maintained replacement yet" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml < 0.41 is pinned by object_store 0.13 (deltalake 1.1); it parses responses from the configured object store" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml < 0.41 is pinned by object_store 0.13 (deltalake 1.1); it parses responses from the configured object store" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained along with chrono; deltalake-core 1.1 and object_store 0.13 depend on it" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; arrow and parquet 59, datafusion 55, deltalake 1.1 and object_store 0.13 depend on it, and gamma-lake does not use it directly" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained along with chrono; arrow-array 59 and datafusion-functions 55 depend on it" },
+]

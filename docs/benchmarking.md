@@ -53,10 +53,15 @@ the generated path, so cleanup does not depend on read parameter order.
 
 - `GammaLakeWriteSuite`: six separately reported sequential merge writes
   covering existing and new symbols, future dates, and new feature groups.
-- `GammaLakeOverlapWriteSuite`: eight separately reported sequential writes
-  covering full and partial temporal overlaps, new feature columns, and full
-  re-merges.
-- `GammaLakeReadSuite`: 1, 7, and 30 day windows across 1 or 3 feature groups.
+- `GammaLakeOverlapWriteSuite`: nine separately reported sequential writes
+  covering full and partial temporal overlaps, new feature columns, full
+  re-merges, and a copy-mode overlap.
+- `GammaLakeFeatureGroupWriteSuite`: adds a new group of 4 features over every
+  key of a 1,000,000-row index (1,000 timestamps by 1,000 symbols), once per
+  sample.
+- `GammaLakeReadSuite`: 1, 7, and 30 day windows across 1, 3 or 16 feature groups.
+- `GammaLakeQuerySuite`: lazy reads of three feature groups filtered to one
+  symbol, projected to a few features, and counted.
 
 The sequential write scenarios use 3 features, 5 to 20 symbols, and 10-day
 windows. The overlap and read suites use 200 symbols, 50 features per group,

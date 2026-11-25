@@ -1,6 +1,6 @@
 ## Pre-requisites
 
-You need Python >=3.10 on your machine to install `gamma-lake`.
+You need Python >=3.11 on your machine to install `gamma-lake`.
 
 ## Install with `pip`
 
@@ -8,11 +8,7 @@ You need Python >=3.10 on your machine to install `gamma-lake`.
 pip install gamma-lake
 ```
 
-This installs Gamma Lake for local execution without Ray. To enable distributed execution:
-
-```bash
-pip install "gamma-lake[ray]"
-```
+The wheel contains the Rust core as a compiled extension.
 
 ## Install with `conda`
 
